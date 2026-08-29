@@ -130,9 +130,39 @@ Modelled render reduction on the recorded workloads:
 Launch rasterisation drops from 5 full + 3 preview bitmaps (22.91 Mpx, recorded)
 to 2 full + 3 preview (~10.0 Mpx modelled).
 
-Test suites: pvtest 159, pvuitest 102, soak 19, stress 14, analyzer clean, no
-Postview-owned leaks. The baseline had one failing UI test and one failing soak
-assertion; both now pass.
+### Verification
+
+`make verify-all` runs every gate in one command. Current state:
+
+| gate | result |
+|---|---|
+| Clang static analyser | clean |
+| `pvtest` (unit) | 163 passed, 0 failed |
+| `pvuitest` (drives a real controller) | 105 passed, 0 failed |
+| `pvsoak` (175 document cycles) | 19 passed, 0 failed |
+| `pvstress` | 14 passed, 0 failed |
+| `pvstress` + AddressSanitizer + UBSan | 14 passed, 0 failed |
+| `pvstress` + ThreadSanitizer | 14 passed, 0 failed, no data races |
+| leak census | no Postview-owned object leaked |
+| showdown self-test | 14 instrument checks passed |
+
+The baseline had one failing UI test and one failing soak assertion; both now
+pass. `pvtest` was run six times consecutively with identical results.
+
+Three of these tests were written to fail against the old behaviour and were
+checked against it:
+
+- the budget assertions fail if `PV_FULL_PREFETCH_PAGES` goes back to 3;
+- the cache count cap fails if the cap is removed;
+- `[5g2]` fails against the original full-render gate.
+
+`[5g2]` is the one that matters most. It drives a real `PVWindowController`,
+intercepts the single call the controller uses to hand work to the render
+queue, and asserts that a moving viewport asks for **zero** full-resolution
+bitmaps — measuring what the scheduler asked for rather than what survived the
+queue's own coalescing. Checking it against the original behaviour showed the
+fix has two independent layers, the outer motion gate and the per-page dwell
+test, either of which alone is sufficient.
 
 ## Measuring it on the Mavericks machine
 
