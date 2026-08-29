@@ -949,20 +949,33 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
     [self noteUserActivity];
 
     NSRange range = [_pageView pageRangeInRect:vis];
+    BOOL movingNow = [self viewportIsMoving];
     BOOL unchanged = (_haveRequestState &&
                       NSEqualRanges(range, _lastRequestRange) &&
-                      dir == _lastDirection);
-    _lastDirection = dir;
+                      dir == _lastDirection &&
+                      movingNow == _lastMovingState);
+    _lastDirection   = dir;
+    _lastMovingState = movingNow;
 
     [self updatePageIndicator];
 
-    // Within a live scroll the desired set genuinely only changes when the
-    // visible page range or the direction of travel changes. Rebuilding it on
-    // every bounds notification meant allocating a fresh request set and taking
-    // the render queue's lock 60-120 times a second to arrive at an identical
+    // The desired set genuinely only changes when the visible page range, the
+    // direction of travel, or the motion state changes. Rebuilding it on every
+    // bounds notification meant allocating a fresh request set and taking the
+    // render queue's lock 60-120 times a second to arrive at an identical
     // answer. Skipping that is invisible on screen and is pure main-thread and
     // battery savings during the app's most common interaction.
-    if (unchanged && _liveScrolling) return;
+    //
+    // This used to require _liveScrolling, which meant it only ever helped
+    // gestures: a keyboard scroll rebuilt on all two hundred of its events.
+    // The motion state had to join the comparison before that could be
+    // dropped. Without it, the transition from at-rest to moving -- which
+    // happens with the page range unchanged, because speed needs two samples
+    // before it registers -- would be skipped, leaving the full-resolution
+    // requests made while at rest sitting in the queue to be rendered during
+    // the scroll. Two whole-page rasterisations cost far more than the two
+    // hundred rebuilds this saves.
+    if (unchanged) return;
     [self updateVisibleContent];
 }
 

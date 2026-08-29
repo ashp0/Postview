@@ -63,6 +63,15 @@
     // full-resolution half of the prefetch waits for evidence.
     BOOL              _hasMovedViewport;
 
+    // The motion state at the last wanted-set rebuild.
+    //
+    // Part of deciding whether a rebuild would reach the same answer. The page
+    // range and the direction of travel are not sufficient on their own: the
+    // same two pages, in the same direction, produce a different request set
+    // depending on whether the document is moving, because that is what
+    // decides whether full-resolution bitmaps are asked for at all.
+    BOOL              _lastMovingState;
+
     // How fast the document is moving under the viewport, in points per
     // second, smoothed over recent scroll events. Zero when not scrolling.
     //
