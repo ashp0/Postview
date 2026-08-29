@@ -91,6 +91,24 @@ larger change to the cache key and the draw path.
    for the small-page-small-zoom case where dozens of bitmaps fit inside the same
    bytes.
 
+## Where the changes are
+
+The first git commit conflates the tree as received with the first round of
+scheduler changes, and the pre-change copies were not preserved, so there is no
+commit that diffs the original against them. Every change is listed here
+instead; commits after the first are separable in the usual way.
+
+| change | location |
+|---|---|
+| motion state (`Scrolling` / `Settled`) | `Sources/PVWindowController.m:549` `-viewportIsMoving` |
+| policy split from accounting | `Sources/PVWindowController.m:511` `-scrollSpeedAge`, `:525` `-pageSurvivesMotion:` |
+| full renders gated on motion | `Sources/PVWindowController.m:639` and the loop below it |
+| full prefetch gated and capped | `Sources/PVWindowController.m:748` |
+| deliveries pruned to the wanted window | `Sources/PVWindowController.m:850` |
+| full-bitmap count cap in the LRU | `Sources/PVImageCache.m:193`, `:212` |
+| scheduler tunables | `Sources/PVCommon.h:103` onward |
+| prefetch waits for movement | `Sources/PVWindowController.h` `_hasMovedViewport` |
+
 ## What it cost
 
 Soak test (`make soak`), settled median footprint over 175 document cycles:
