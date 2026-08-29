@@ -534,6 +534,21 @@ int main(int argc, const char *argv[])
             OK([[wc valueForKey:@"_scrollSpeed"] doubleValue] == 0,
                "a new gesture starts from rest, not from the last one's speed");
 
+            // A speed and the instant it was measured always move together:
+            // -clipBoundsChanged: writes both, and the throttle disregards a
+            // speed it cannot date (see PV_SPEED_FRESH_SECONDS, which is what
+            // stops a document that has stopped moving from staying soft
+            // forever). Setting the speed alone below therefore builds a state
+            // the app cannot actually reach -- fast, but measured never -- and
+            // the honest answer to it is the safe one: render.
+            //
+            // The gesture has just zeroed the clock, so the timestamp is
+            // restated here to stand for the first bounds change of the
+            // scroll. Without it these assertions test the staleness rule
+            // rather than the speed rule they are written for.
+            [wc setValue:[NSNumber numberWithDouble:[NSDate timeIntervalSinceReferenceDate]]
+                  forKey:@"_lastScrollTime"];
+
             // The threshold is a constant, so these hold on every machine: a
             // page held on screen for many seconds is rendered, and one gone
             // within a glance is not.
