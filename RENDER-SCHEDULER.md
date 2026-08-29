@@ -87,7 +87,14 @@ larger change to the cache key and the draw path.
    and do not keep a result that turns out to be for somewhere the user no
    longer is.
 
-5. **A count cap on full bitmaps** (`PV_MAX_FULL_IMAGES`) beside the byte budget,
+5. **The identical-rebuild early-out now covers keyboard scrolling.** It
+   required `_liveScrolling`, so only gestures benefited; a 200-event keyboard
+   scroll rebuilt the request set and took the queue's lock on every event. The
+   motion state joins the comparison so the at-rest-to-moving transition is
+   still rebuilt — skipping it would leave full-resolution requests made at rest
+   sitting in the queue to be rasterised during the scroll.
+
+6. **A count cap on full bitmaps** (`PV_MAX_FULL_IMAGES`) beside the byte budget,
    for the small-page-small-zoom case where dozens of bitmaps fit inside the same
    bytes.
 
@@ -108,6 +115,7 @@ instead; commits after the first are separable in the usual way.
 | full-bitmap count cap in the LRU | `Sources/PVImageCache.m:193`, `:212` |
 | scheduler tunables | `Sources/PVCommon.h:103` onward |
 | prefetch waits for movement | `Sources/PVWindowController.h` `_hasMovedViewport` |
+| rebuild early-out incl. motion state | `Sources/PVWindowController.m`, `-clipBoundsChanged:` |
 
 ## What it cost
 
