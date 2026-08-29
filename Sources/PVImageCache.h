@@ -1,0 +1,65 @@
+//  PVImageCache.h — byte-budgeted LRU of rendered page bitmaps.
+//
+//  Each page gets one entry holding up to two images: the "full" bitmap at the
+//  exact current pixel size, and a cheap "preview" bitmap at roughly a third of
+//  that. Previews are ~9x smaller, so they survive eviction long after fulls are
+//  gone, which is what makes scrolling back over already-visited pages instant.
+//  Main thread only.
+
+#import "PVCommon.h"
+
+@interface PVImageCache : NSObject {
+    NSMutableDictionary *_entries;    // NSNumber(page) -> PVCacheEntry
+    unsigned long long   _clock;
+    size_t               _bytes;
+    size_t               _budget;
+    // The pages currently on screen. Eviction steps over them; see -setPinnedPages:.
+    NSRange              _pinned;
+}
+- (id)initWithBudget:(size_t)budget;
+
+// The pages that are on screen right now. Eviction never touches them.
+//
+// Without this the cache and the layer above disagree about what has to be
+// resident, and the disagreement does not settle. The render queue wants a
+// full-resolution bitmap for every visible page; the cache, once the visible
+// set no longer fits the budget, evicts the one that was least recently
+// stored -- which is the other visible page. The next draw finds it missing,
+// the wanted-set names it again, rendering it evicts the first, and the queue
+// rasterises the same two heavy pages for as long as the window stays open,
+// with the pages flickering between sharp and soft the whole time.
+//
+// Pinning makes the loop impossible rather than unlikely: a bitmap the layer
+// above still wants is never the one thrown away, so every render lands
+// somewhere that stops it being asked for again. When the visible set genuinely
+// will not fit, the cache goes over budget by that much and no further --
+// bounded by the visible page count times PVMaxRenderPixels(), which is a
+// third of the budget each -- and comes straight back under as soon as the
+// user scrolls. That is strictly cheaper than rendering forever, which is what
+// it replaces. A zero-length range pins nothing.
+- (void)setPinnedPages:(NSRange)range;
+
+// Exact-size match only; NULL if the cached bitmap was rendered at another zoom.
+- (CGImageRef)fullImageForPage:(NSUInteger)page pixelSize:(CGSize)px;
+// Best bitmap available for this page at any size, for use as a placeholder.
+- (CGImageRef)placeholderImageForPage:(NSUInteger)page;
+- (BOOL)hasPreviewForPage:(NSUInteger)page;
+// Is there anything at all to draw for this page? Non-mutating: unlike
+// -placeholderImageForPage: it does not bump the LRU stamp, so it is safe to
+// call from policy code that is not actually about to draw.
+- (BOOL)hasAnyImageForPage:(NSUInteger)page;
+
+- (void)setFullImage:(CGImageRef)img pixelSize:(CGSize)px forPage:(NSUInteger)page;
+- (void)setPreviewImage:(CGImageRef)img pixelSize:(CGSize)px forPage:(NSUInteger)page;
+
+- (void)dropFullImages;   // first response to memory pressure
+- (void)removeAll;
+
+// Instrumentation for the soak and UI tests: all three must stay bounded
+// forever. -fullImageCount is the one that distinguishes "the pages on screen
+// are sharp" from "the pages on screen and the prefetched ones are sharp",
+// which is the difference memory-pressure handling turns on.
+- (size_t)byteCount;
+- (NSUInteger)entryCount;
+- (NSUInteger)fullImageCount;
+@end

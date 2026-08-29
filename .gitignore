@@ -1,0 +1,17 @@
+# Build products
+build/
+Postview.app/Contents/MacOS/
+Postview.app/Contents/Resources/*.icns
+*.o
+*.dSYM/
+
+# Distributables
+Postview.zip
+dist/
+
+# Benchmark output
+*.tsv
+Benchmarks/
+
+# macOS
+.DS_Store
