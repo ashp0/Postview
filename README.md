@@ -322,6 +322,46 @@ constraint rather than an afterthought.
 
 ## Is it actually faster than Preview?
 
+**Start here: `Postview-Showdown.command`.** One command, both apps, five
+workloads, and a winner named per metric:
+
+```
+./Postview-Showdown.command ~/Documents/something.pdf
+```
+
+Check the instruments first — it takes two seconds and has caught a silently
+broken sampler before:
+
+```
+./Postview-Showdown.command --selftest ~/Documents/something.pdf
+```
+
+It measures the three things that actually drain a battery — exact CPU seconds
+from the kernel's own counter, Mavericks' Energy Impact figure, and idle wakeups
+as a delta — plus peak memory and launch time, across `launch`, `idle`, `read`,
+`page` and `scroll`. It equalises both windows to the same size, opens a fresh
+hardlink per trial so neither app restores a page position, waits for a quiet
+machine, and alternates which app goes first so a session-long thermal trend is
+not handed to one side. A metric whose run-to-run spread is wider than the gap
+between the apps is flagged as noisy instead of being allowed to decide anything.
+
+It also reports what Postview itself rasterised — full renders, previews,
+megapixels, suppressed requests — beside the figures from before the render
+scheduler work, so you can see not just that a number moved but why.
+
+Quit both apps first and enable Terminal in **System Preferences → Security &
+Privacy → Privacy → Accessibility**. `RUNS=5 MIN_IDLE=85 WIN_W=1200 WIN_H=800`
+override the defaults. Roughly half an hour at the defaults.
+
+One thing it will tell you that looks wrong and is not: the `read` workload
+reports **zero suppressed requests**. That is correct. `read` presses Page Down
+every 2.5 seconds, which leaves the document at rest between presses, and a page
+someone is sitting and reading should be sharp. Suppression is for pages flying
+past, and `page` and `scroll` are where it shows up. See `RENDER-SCHEDULER.md`.
+
+### The older, narrower tools
+
+
 `Postview.zip` includes **`Postview-Benchmark.command`**, which measures both
 apps on the Mavericks machine rather than asking you to take anyone's word for
 it. Copy it next to `Postview.app`, then in Terminal:
