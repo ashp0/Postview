@@ -27,6 +27,8 @@ BENCHMARK_SOURCE := Tools/benchmark-preview-vs-postview.sh
 BENCHMARK := Postview-Benchmark.command
 PROFILE_SOURCE := Tools/profile-postview.sh
 PROFILE := Postview-Profile.command
+SHOWDOWN_SOURCE := Tools/showdown.sh
+SHOWDOWN := Postview-Showdown.command
 DISTDIR := $(BUILD)/dist
 
 CC       := $(shell xcrun -f clang)
@@ -89,16 +91,22 @@ $(PROFILE): $(PROFILE_SOURCE)
 	@cp "$(PROFILE_SOURCE)" "$@"
 	@chmod 755 "$@"
 
+$(SHOWDOWN): $(SHOWDOWN_SOURCE)
+	@cp "$(SHOWDOWN_SOURCE)" "$@"
+	@chmod 755 "$@"
+	@echo "  wrote    $@"
+
 run: $(BUNDLE)
 	@open $(BUNDLE)
 
-dist: $(BUNDLE) verify $(BENCHMARK) $(PROFILE)
+dist: $(BUNDLE) verify $(BENCHMARK) $(PROFILE) $(SHOWDOWN)
 	@rm -rf "$(DISTDIR)"
 	@mkdir -p "$(DISTDIR)"
 	@ditto "$(BUNDLE)" "$(DISTDIR)/$(BUNDLE)"
 	@cp README.md "$(DISTDIR)/README.md"
 	@cp "$(BENCHMARK)" "$(DISTDIR)/$(BENCHMARK)"
 	@cp "$(PROFILE)" "$(DISTDIR)/$(PROFILE)"
+	@cp "$(SHOWDOWN)" "$(DISTDIR)/$(SHOWDOWN)"
 	@xattr -cr "$(DISTDIR)" 2>/dev/null || true
 	@rm -f $(APP).zip
 	@ditto -c -k --sequesterRsrc "$(DISTDIR)" $(APP).zip
@@ -256,4 +264,4 @@ release:
 	@$(MAKE) dist
 
 clean:
-	@rm -rf $(BUILD) $(BUNDLE) $(APP).zip $(BENCHMARK) $(PROFILE)
+	@rm -rf $(BUILD) $(BUNDLE) $(APP).zip $(BENCHMARK) $(PROFILE) $(SHOWDOWN)
