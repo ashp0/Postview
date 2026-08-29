@@ -269,9 +269,17 @@ sample_power() {
     pw_peak=$hi
 }
 
+# Postview reports what it actually rasterised when asked. Preview has no such
+# switch, so these columns are diagnostics for one side rather than a metric to
+# compare -- but they are the only way to confirm on the machine that matters
+# that the scheduler is doing what the offline replays say it does.
 open_app_with() {
-    # $1 app path/name, $2 document path
-    /usr/bin/open -a "$1" "$2" >/dev/null 2>&1
+    # $1 app path/name, $2 document path, $3 statfile (Postview only)
+    if [ -n "${3:-}" ]; then
+        /usr/bin/open -n -a "$1" "$2" --args -PVStats YES -PVStatsPath "$3" >/dev/null 2>&1
+    else
+        /usr/bin/open -n -a "$1" "$2" >/dev/null 2>&1
+    fi
 }
 
 run_trial() {
@@ -280,8 +288,11 @@ run_trial() {
     doc=$(fresh_document "$app-$scen-$iter") || die "could not stage a document"
     start_idle=$(wait_for_quiet_machine) || printf '  (machine never went quiet; trial recorded with start_idle=%s)\n' "$start_idle"
 
+    statfile=""
+    [ "$app" = "Postview" ] && statfile="$WORKDIR/stat-$app-$scen-$iter.txt"
+
     t_open=$(now)
-    open_app_with "$apppath" "$doc" || die "could not open $app"
+    open_app_with "$apppath" "$doc" "$statfile" || die "could not open $app"
     CURRENT_APP=$app
     wait_for_document_window "$process" || die "$app never showed a document window"
     t_ready=$(now)
@@ -352,12 +363,24 @@ run_trial() {
     quit_app "$app" "$process" || die "$app did not quit cleanly after '$scen'"
     CURRENT_APP=""
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    rf="-"; rp="-"; mp="-"; sup="-"
+    if [ -n "$statfile" ] && [ -f "$statfile" ]; then
+        rf=$(/usr/bin/awk '/renders.full/    { print $3 }' "$statfile")
+        rp=$(/usr/bin/awk '/renders.preview/ { print $3 }' "$statfile")
+        mp=$(/usr/bin/awk '/megapixels.total/{ print $3 }' "$statfile")
+        sup=$(/usr/bin/awk '/requests.suppressed/ { print $3 }' "$statfile")
+        [ -n "$rf" ]  || rf="-";  [ -n "$rp" ]  || rp="-"
+        [ -n "$mp" ]  || mp="-";  [ -n "$sup" ] || sup="-"
+    fi
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$app" "$scen" "$iter" "$launch" "$wall" "$cpu_used" "$cpu_rate" \
-        "$pw_mean" "$pw_peak" "$wakeups" "$mean_rss" "$rss_peak" >> "$OUTPUT"
-    printf '  %-9s %-7s run %s: cpu %ss  energy %s  wakeups %s  peak rss %s MB\n' \
+        "$pw_mean" "$pw_peak" "$wakeups" "$mean_rss" "$rss_peak" \
+        "$rf" "$rp" "$mp" "$sup" >> "$OUTPUT"
+    printf '  %-9s %-7s run %s: cpu %ss  energy %s  wakeups %s  peak rss %s MB%s\n' \
         "$app" "$scen" "$iter" "$cpu_used" "$pw_mean" "$wakeups" \
-        "$(/usr/bin/awk -v k="$rss_peak" 'BEGIN { printf "%.0f", k/1024 }')"
+        "$(/usr/bin/awk -v k="$rss_peak" 'BEGIN { printf "%.0f", k/1024 }')" \
+        "$([ "$rf" = "-" ] || printf '  [%s full, %s preview, %s Mpx, %s suppressed]' "$rf" "$rp" "$mp" "$sup")"
 }
 
 # Energy Impact is a Mavericks feature and is not reported by every kernel or on
@@ -466,7 +489,7 @@ case "$probe_iw" in ''|-) ;; *) WAKEUPS_OK=yes ;; esac
 # demonstrably busy is reporting nothing useful either.
 [ "$probe_pw" = "0.0" ] && ENERGY_OK="probably not (reads 0.0 for this process)"
 
-printf 'app\tscenario\trun\tlaunch_seconds\twall_seconds\tcpu_seconds\tcpu_per_second\tenergy_mean\tenergy_peak\tidle_wakeups\tmean_rss_kb\tpeak_rss_kb\n' > "$OUTPUT"
+printf 'app\tscenario\trun\tlaunch_seconds\twall_seconds\tcpu_seconds\tcpu_per_second\tenergy_mean\tenergy_peak\tidle_wakeups\tmean_rss_kb\tpeak_rss_kb\trenders_full\trenders_preview\tmegapixels\trequests_suppressed\n' > "$OUTPUT"
 
 printf 'Postview vs Preview -- head to head\n'
 printf 'PDF:        %s\n' "$PDF"
@@ -527,6 +550,10 @@ NR == 1 { next }
     if ($10 ~ /^[0-9]+$/)  { n_iw[app,key]++;   iw[app,key,n_iw[app,key]]    = $10 + 0 }
     if ($12 ~ /^[0-9]+$/)  { n_rss[app,key]++;  rss[app,key,n_rss[app,key]]  = $12 + 0 }
     if ($4  ~ /^[0-9.]+$/) { n_l[app,key]++;    lau[app,key,n_l[app,key]]    = $4 + 0 }
+    # Postview-only diagnostics: what it actually rasterised.
+    if ($13 ~ /^[0-9.]+$/) { n_rf[app,key]++;  rf[app,key,n_rf[app,key]]    = $13 + 0 }
+    if ($15 ~ /^[0-9.]+$/) { n_mp[app,key]++;  mpx[app,key,n_mp[app,key]]   = $15 + 0 }
+    if ($16 ~ /^[0-9.]+$/) { n_sp[app,key]++;  spr[app,key,n_sp[app,key]]   = $16 + 0 }
     seen[key] = 1
 }
 END {
@@ -554,6 +581,30 @@ END {
         emit(k, "peak_rss_kb",  "Peak memory MB", rss,  n_rss, 0, "%.0f")
         if (k == "launch") emit(k, "launch_seconds", "Launch seconds", lau, n_l, 0, "%.3f")
         printf "\n"
+    }
+
+    # What Postview rasterised, for confirming the scheduler on hardware.
+    # Preview reports nothing comparable, so this is diagnosis, not a contest.
+    any = 0
+    for (s = 1; s <= nsc; s++) if ((sc[s] in seen) && n_rf["Postview",sc[s]] > 0) any = 1
+    if (any) {
+        printf "-- what Postview rasterised (Preview has no equivalent counter) ----\n"
+        for (s = 1; s <= nsc; s++) {
+            k = sc[s]
+            if (!(k in seen) || n_rf["Postview",k] == 0) continue
+            for (i = 1; i <= n_rf["Postview",k]; i++) a1[i] = rf["Postview",k,i]
+            for (i = 1; i <= n_mp["Postview",k]; i++) a2[i] = mpx["Postview",k,i]
+            for (i = 1; i <= n_sp["Postview",k]; i++) a3[i] = spr["Postview",k,i]
+            printf "  %-8s %6.0f full renders   %8.1f Mpx   %6.0f requests suppressed\n",
+                k, med(a1, n_rf["Postview",k]), med(a2, n_mp["Postview",k]),
+                med(a3, n_sp["Postview",k])
+        }
+        printf "\n  Reference, before the scheduler work (same machine, one run):\n"
+        printf "    read        51 full renders      380.7 Mpx        0 suppressed\n"
+        printf "    page        90 full renders      666.7 Mpx      323 suppressed\n"
+        printf "    scroll     126 full renders      962.2 Mpx       47 suppressed\n"
+        printf "  Zero suppression on 'read' is correct: 2.5 s between key presses\n"
+        printf "  leaves the document at rest, and a page being read wants to be sharp.\n\n"
     }
 
     printf "=========================================================================\n"
