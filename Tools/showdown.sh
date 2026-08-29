@@ -155,7 +155,7 @@ cpu_seconds_for() {
 # A machine or OS that declines to report either yields "-", which the analysis
 # treats as missing rather than as zero.
 power_sample_for() {
-    /usr/bin/top -l 1 -n 0 -pid "$1" -stats pid,power,idlew 2>/dev/null | /usr/bin/awk -v p="$1" '
+    /usr/bin/top -l 1 -n 1 -pid "$1" -stats pid,power,idlew 2>/dev/null | /usr/bin/awk -v p="$1" '
         $1 == p { pw=$2; iw=$3
                   if (pw ~ /^[0-9.]+$/ && iw ~ /^[0-9]+$/) { print pw, iw; found=1; exit } }
         END { if (!found) print "-", "-" }'
@@ -356,6 +356,23 @@ run_trial() {
         "$(/usr/bin/awk -v k="$rss_peak" 'BEGIN { printf "%.0f", k/1024 }')"
 }
 
+# Energy Impact is a Mavericks feature and is not reported by every kernel or on
+# every machine. Probing once, up front, means a run that cannot collect it says
+# so at the start rather than producing a verdict with a silently missing metric.
+# CPU seconds and idle wakeups are the metrics the battery verdict cannot do
+# without; Energy Impact is corroboration, and the analysis drops any metric
+# that both apps failed to report rather than scoring it as a zero.
+probe_pid=$$
+probe_out=$(power_sample_for "$probe_pid")
+probe_pw=$(printf '%s' "$probe_out" | /usr/bin/awk '{ print $1 }')
+probe_iw=$(printf '%s' "$probe_out" | /usr/bin/awk '{ print $2 }')
+ENERGY_OK=no; WAKEUPS_OK=no
+case "$probe_pw" in ''|-) ;; *) ENERGY_OK=yes ;; esac
+case "$probe_iw" in ''|-) ;; *) WAKEUPS_OK=yes ;; esac
+# A kernel that reports the column but pins it at zero for a process that is
+# demonstrably busy is reporting nothing useful either.
+[ "$probe_pw" = "0.0" ] && ENERGY_OK="probably not (reads 0.0 for this process)"
+
 printf 'app\tscenario\trun\tlaunch_seconds\twall_seconds\tcpu_seconds\tcpu_per_second\tenergy_mean\tenergy_peak\tidle_wakeups\tmean_rss_kb\tpeak_rss_kb\n' > "$OUTPUT"
 
 printf 'Postview vs Preview -- head to head\n'
@@ -363,7 +380,13 @@ printf 'PDF:        %s\n' "$PDF"
 printf 'Postview:   %s\n' "$POSTVIEW_APP"
 printf 'Scenarios:  %s\n' "$SCENARIOS"
 printf 'Runs each:  %s   window %sx%s   quiet threshold %s%%\n' "$RUNS" "$WIN_W" "$WIN_H" "$MIN_IDLE"
-printf 'Output:     %s\n\n' "$OUTPUT"
+printf 'Output:     %s\n' "$OUTPUT"
+printf 'Energy Impact reported by this machine: %s\n' "$ENERGY_OK"
+printf 'Idle wakeups reported by this machine:  %s\n\n' "$WAKEUPS_OK"
+if [ "$WAKEUPS_OK" != "yes" ]; then
+    printf 'NOTE: idle wakeups are unavailable here, so the battery verdict will\n'
+    printf '      rest on CPU seconds alone. That is still the dominant term.\n\n'
+fi
 printf 'Do not touch the Mac while this runs. Roughly %s minutes.\n\n' \
     "$(/usr/bin/awk -v r="$RUNS" -v s="$(printf '%s' "$SCENARIOS" | /usr/bin/wc -w)" 'BEGIN { printf "%.0f", r*s*1.1 }')"
 
