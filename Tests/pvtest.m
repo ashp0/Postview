@@ -296,6 +296,62 @@ static void TestCache(void)
 // This drives the real loop -- ask what is missing, render it, store it -- and
 // asserts it reaches a pass that renders nothing. Reverting either half of the
 // fix (the pin, or the per-bitmap ceiling) fails it.
+// The count cap, exercised where it is the binding constraint rather than the
+// byte budget: small bitmaps at a generous budget, which is the case the cap
+// exists for. A short document at a small zoom could otherwise hold every one
+// of its pages live inside the same bytes.
+static void TestCacheFullImageCountCap(void)
+{
+    printf("\n[PVImageCache: full-bitmap count cap]\n");
+
+    // 64 MB budget against 64x64 bitmaps (16 KB each): hundreds fit by bytes,
+    // so anything that limits them here is the count cap and nothing else.
+    PVImageCache *cache = [[PVImageCache alloc] initWithBudget:64 * 1024 * 1024];
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+
+    NSUInteger i;
+    for (i = 0; i < 40; i++) {
+        CGContextRef c = CGBitmapContextCreate(NULL, 64, 64, 8, 0, cs,
+            (CGBitmapInfo)kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Host);
+        CGImageRef img = CGBitmapContextCreateImage(c);
+        CGContextRelease(c);
+        // Nothing pinned: the cap is free to act on every entry.
+        [cache setPinnedPages:NSMakeRange(0, 0)];
+        [cache setFullImage:img pixelSize:CGSizeMake(64, 64) forPage:i];
+        CGImageRelease(img);
+    }
+
+    OK([cache byteCount] < 64 * 1024 * 1024,
+       "forty small bitmaps never approach the byte budget");
+    OK([cache fullImageCount] <= PV_MAX_FULL_IMAGES && [cache fullImageCount] < 40,
+       "the count cap holds where the byte budget never would");
+
+    // The cap must evict least-recently-used, so the most recent page stored
+    // is still there. Anything else and the cap would be throwing away the
+    // page the user is on.
+    OK([cache fullImageForPage:39 pixelSize:CGSizeMake(64, 64)] != NULL,
+       "the most recently stored bitmap survives the cap");
+
+    // A pinned page is never evicted, cap or no cap: the layer above will ask
+    // for it again immediately and evicting it buys nothing.
+    [cache removeAll];
+    [cache setPinnedPages:NSMakeRange(0, 2)];
+    for (i = 0; i < 40; i++) {
+        CGContextRef c = CGBitmapContextCreate(NULL, 64, 64, 8, 0, cs,
+            (CGBitmapInfo)kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Host);
+        CGImageRef img = CGBitmapContextCreateImage(c);
+        CGContextRelease(c);
+        [cache setFullImage:img pixelSize:CGSizeMake(64, 64) forPage:i];
+        CGImageRelease(img);
+    }
+    OK([cache fullImageForPage:0 pixelSize:CGSizeMake(64, 64)] != NULL &&
+       [cache fullImageForPage:1 pixelSize:CGSizeMake(64, 64)] != NULL,
+       "pinned pages survive the count cap");
+
+    CGColorSpaceRelease(cs);
+    [cache release];
+}
+
 static void TestCacheConverges(void)
 {
     printf("\n[cache reaches a steady state: no render/evict loop]\n");
@@ -1186,6 +1242,7 @@ int main(int argc, const char *argv[])
         TestDispatchConstants();
         TestRenderSpeed(src);
         TestCache();
+        TestCacheFullImageCountCap();
         TestCacheConverges();
         TestLayout(src);
         TestRenderQueue(src, url);

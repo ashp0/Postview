@@ -854,7 +854,16 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
             // and was rasterised; the cost has already been paid. Counting it
             // beside the requests the throttle genuinely prevented would
             // inflate the one number the profile uses to judge the throttle.
-            if ((NSInteger)page < lo || (NSInteger)page > hi) return;
+            if ((NSInteger)page < lo || (NSInteger)page > hi) {
+                // The promotion is spent either way. Leaving it armed for a
+                // page the viewport has left means paying raised-QoS energy
+                // again the next time that page happens to come back, for a
+                // user who navigated to it normally rather than one waiting on
+                // it cold. The sharp-delivery path below disarms it for the
+                // same reason; this is the other way that story can end.
+                if (page == _expressPage) _expressPage = NSNotFound;
+                return;
+            }
         }
         if (preview) [_pageCache setPreviewImage:image pixelSize:px forPage:page];
         else         [_pageCache setFullImage:image pixelSize:px forPage:page];
