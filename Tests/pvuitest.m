@@ -11,10 +11,48 @@
 #import "PVWelcomeWindowController.h"
 #import "PVDropView.h"
 #import "PVPageView.h"
+#import <objc/runtime.h>
 
 // Declared, not added: every one of these already exists on the class. The
 // controller has no reason to advertise them, and the test has no reason to
 // reach around them.
+// Counts what -updateVisibleContent hands to the render queue.
+//
+// -setDesiredRequests: is the only way work reaches the queue, so intercepting
+// it counts requests as the scheduler issued them -- before the queue's own
+// coalescing drops duplicates, which is what we want here: the question is what
+// the scheduler asked for, not what survived.
+static BOOL       PVCountRequests = NO;
+static NSUInteger PVFullRequestCount = 0;
+static NSUInteger PVPreviewRequestCount = 0;
+
+@interface PVRenderQueue (PVTestCounting)
+- (void)pvCountingSetDesiredRequests:(NSArray *)requests;
+@end
+
+@implementation PVRenderQueue (PVTestCounting)
+- (void)pvCountingSetDesiredRequests:(NSArray *)requests
+{
+    if (PVCountRequests) {
+        NSUInteger i, n = [requests count];
+        for (i = 0; i < n; i++) {
+            PVRenderRequest *r = [requests objectAtIndex:i];
+            if (![r isKindOfClass:[PVRenderRequest class]]) continue;
+            if (r->preview) PVPreviewRequestCount++; else PVFullRequestCount++;
+        }
+    }
+    // Swapped, so this name now reaches the original implementation.
+    [self pvCountingSetDesiredRequests:requests];
+}
+@end
+
+static void PVInstallRequestCounter(void)
+{
+    Method a = class_getInstanceMethod([PVRenderQueue class], @selector(setDesiredRequests:));
+    Method b = class_getInstanceMethod([PVRenderQueue class], @selector(pvCountingSetDesiredRequests:));
+    if (a && b) method_exchangeImplementations(a, b);
+}
+
 @interface PVWindowController (PVTestHooks)
 - (BOOL)pageIsUnrenderable:(NSUInteger)page;
 - (void)notePageFailed:(NSUInteger)page;
@@ -112,6 +150,7 @@ int main(int argc, const char *argv[])
                                  withIntermediateDirectories:YES attributes:nil error:NULL];
 
         [NSApplication sharedApplication];
+        PVInstallRequestCounter();
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
 
         NSURL *url = [NSURL fileURLWithPath:pdf];
@@ -627,6 +666,64 @@ int main(int argc, const char *argv[])
         // document view is placed at the LEFT of its clip view: zoom in, go
         // full screen, and the page sat against the left edge with all the
         // gained width empty beside it.
+        // The scheduler, end to end through the real controller: not "does the
+        // policy function return NO" but "does -updateVisibleContent actually
+        // stop asking for full-resolution bitmaps while the document moves".
+        //
+        // That distinction is the whole bug. The policy was correct and was
+        // being consulted for previews; the full-resolution branch beside it
+        // was gated on the live-scroll flags instead, which AppKit posts only
+        // for gestures. Every keyboard scroll therefore asked for a whole-page
+        // bitmap per visible page per key press, while the counter beside it
+        // reported a healthy suppression rate for the cheap half of the work.
+        //
+        // Counted by intercepting the one call the controller uses to hand
+        // work over, so this measures what was asked for rather than what
+        // happened to survive the queue's own coalescing.
+        printf("\n[5g2] the scheduler asks for no full bitmaps while the document moves\n");
+        {
+            PVRenderQueue *pq = [wc valueForKey:@"_pageQueue"];
+            [wc goToPageNumber:20];
+            PumpUntil(^{ return [pq isIdle]; }, 60.0);
+
+            // Both measurements start from an empty cache. A page already
+            // sharp is not asked for again, so measuring at rest against a
+            // warm cache would compare "nothing left to want" with
+            // "suppressed" and call them the same thing.
+            PVImageCache *pcache = [wc valueForKey:@"_pageCache"];
+
+            [pcache removeAll];
+            PVFullRequestCount = 0; PVPreviewRequestCount = 0; PVCountRequests = YES;
+
+            // At rest. The settle path states this outright, so state it here
+            // the same way rather than waiting for a timer.
+            [wc setValue:[NSNumber numberWithDouble:0.0] forKey:@"_scrollSpeed"];
+            [wc setValue:[NSNumber numberWithDouble:0.0] forKey:@"_lastScrollTime"];
+            [wc updateVisibleContent];
+            NSUInteger fullsAtRest = PVFullRequestCount;
+
+            // Moving fast, freshly measured: the flick case, same empty cache.
+            [pcache removeAll];
+            PVFullRequestCount = 0; PVPreviewRequestCount = 0;
+            [wc setValue:[NSNumber numberWithDouble:20000.0] forKey:@"_scrollSpeed"];
+            [wc setValue:[NSNumber numberWithDouble:[NSDate timeIntervalSinceReferenceDate]]
+                  forKey:@"_lastScrollTime"];
+            [wc updateVisibleContent];
+            NSUInteger fullsMoving = PVFullRequestCount;
+
+            PVCountRequests = NO;
+
+            OK(fullsMoving == 0,
+               "moving: not one full-resolution bitmap is asked for");
+            OK(fullsAtRest > 0,
+               "at rest: full-resolution bitmaps are asked for again");
+
+            // The keyboard is the case that was broken, and it never sets the
+            // live-scroll flags. Assert the decision does not depend on them.
+            OK(![[wc valueForKey:@"_liveScrolling"] boolValue],
+               "...and none of that involved a live-scroll notification");
+        }
+
         printf("\n[5g] the page stays centred at every width, in every zoom mode\n");
         {
             PVPageView   *pv = [wc valueForKey:@"_pageView"];
