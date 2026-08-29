@@ -85,7 +85,11 @@ TIE_BAND=${TIE_BAND:-0.05}
 
 die() { printf 'Showdown stopped: %s\n' "$*" >&2; exit 1; }
 
-[ "$#" -ge 1 ] || { printf '%s\n' "usage: $(basename "$0") /path/to/document.pdf" >&2; exit 2; }
+[ "$#" -ge 1 ] || { printf '%s\n' "usage: $(basename "$0") [--selftest] /path/to/document.pdf" >&2; exit 2; }
+if [ "$1" = "--selftest" ]; then
+    SELFTEST=1; shift
+    [ "$#" -ge 1 ] || { printf '%s\n' "usage: $(basename "$0") --selftest /path/to/document.pdf" >&2; exit 2; }
+fi
 PDF=$1
 [ -f "$PDF" ] || die "no such file: $PDF"
 case "$PDF" in /*) ;; *) PDF=$(pwd)/$PDF ;; esac
@@ -362,6 +366,95 @@ run_trial() {
 # CPU seconds and idle wakeups are the metrics the battery verdict cannot do
 # without; Energy Impact is corroboration, and the analysis drops any metric
 # that both apps failed to report rather than scoring it as a zero.
+# ---------------------------------------------------------------------------
+# Self-test. Run with --selftest to check the instruments without measuring
+# anything.
+#
+# This exists because a broken sampler is silent: `top -n 0` asks for zero
+# process rows, so an earlier version of power_sample_for returned no columns
+# at all and would have produced a verdict with two of its three battery
+# metrics quietly missing, after half an hour of unattended running. An
+# instrument that cannot be checked before use is not an instrument.
+# ---------------------------------------------------------------------------
+selftest() {
+    fails=0
+    ok() { if [ "$1" = "1" ]; then printf '  ok    %s\n' "$2"; else printf '  FAIL  %s\n' "$2"; fails=$((fails+1)); fi; }
+
+    printf 'Showdown self-test\n\n'
+
+    v=$(now)
+    ok "$(/usr/bin/awk -v v="$v" 'BEGIN { print (v > 1000000000) ? 1 : 0 }')" "now() returns a plausible epoch time"
+
+    v=$(elapsed 10.0 12.5)
+    ok "$(/usr/bin/awk -v v="$v" 'BEGIN { print (v > 2.49 && v < 2.51) ? 1 : 0 }')" "elapsed() subtracts correctly"
+
+    v=$(cpu_seconds_for $$)
+    ok "$(/usr/bin/awk -v v="$v" 'BEGIN { print (v ~ /^[0-9.]+$/) ? 1 : 0 }')" "cpu_seconds_for() reads the kernel counter"
+
+    v=$(cpu_seconds_for 999999)
+    ok "$([ -z "$v" ] && echo 1 || echo 0)" "cpu_seconds_for() is empty for a dead pid, not garbage"
+
+    set -- $(power_sample_for $$)
+    ok "$([ "$#" -eq 2 ] && echo 1 || echo 0)" "power_sample_for() returns two fields"
+    ok "$([ "$2" != "-" ] && echo 1 || echo 0)" "idle wakeups are reported by this machine"
+    [ "$2" = "-" ] && printf '        (the battery verdict will rest on CPU seconds alone)\n'
+    case "$1" in
+        -)   printf '        (Energy Impact is not reported here; it will be omitted)\n' ;;
+        0.0) printf '        (Energy Impact reads 0.0 for this process -- it may not be\n'
+             printf '         supported on this hardware. Mavericks on Intel does report it.)\n' ;;
+    esac
+
+    set -- $(power_sample_for 999999)
+    ok "$([ "$1" = "-" ] && echo 1 || echo 0)" "power_sample_for() degrades for a dead pid"
+
+    v=$(system_idle)
+    ok "$(/usr/bin/awk -v v="$v" 'BEGIN { print (v ~ /^[0-9.]+$/ && v >= 0 && v <= 100) ? 1 : 0 }')" "system_idle() returns a percentage"
+
+    d=$(fresh_document selftest)
+    ok "$([ -f "$d" ] && echo 1 || echo 0)" "fresh_document() stages a readable copy"
+    ok "$([ "$d" != "$PDF" ] && echo 1 || echo 0)" "...at a path neither app has opened"
+
+    ok "$([ -d "$POSTVIEW_APP" ] && echo 1 || echo 0)" "Postview.app found at $POSTVIEW_APP"
+    pv=""
+    for c in /Applications/Preview.app /System/Applications/Preview.app; do
+        [ -d "$c" ] && { pv=$c; break; }
+    done
+    ok "$([ -n "$pv" ] && echo 1 || echo 0)" "Preview.app found${pv:+ at $pv}"
+
+    /usr/bin/osascript -e 'tell application "System Events" to return name of current user' >/dev/null 2>&1
+    ok "$([ "$?" -eq 0 ] && echo 1 || echo 0)" "System Events is scriptable (Accessibility granted)"
+
+    # The analysis half, against a fixture with a known answer: Postview wins
+    # every metric, so anything other than a clean sweep means the verdict
+    # logic is miscounting.
+    fixture="$WORKDIR/selftest.tsv"
+    printf 'app\tscenario\trun\tlaunch_seconds\twall_seconds\tcpu_seconds\tcpu_per_second\tenergy_mean\tenergy_peak\tidle_wakeups\tmean_rss_kb\tpeak_rss_kb\n' > "$fixture"
+    for r in 1 2 3; do
+        printf 'Preview\tidle\t%s\t1.0\t30\t1.00\t0.03\t4.0\t9.0\t900\t150000\t160000\n' "$r" >> "$fixture"
+        printf 'Postview\tidle\t%s\t0.5\t30\t0.10\t0.00\t0.4\t1.0\t60\t60000\t70000\n' "$r" >> "$fixture"
+    done
+    sweep=$(/usr/bin/awk -F '\t' -v band=0.05 -v runs=3 -f /dev/stdin "$fixture" <<'AWKEOF'
+NR==1 { next }
+{ if ($1=="Postview") { pc[++np]=$6+0 } else { vc[++nv]=$6+0 } }
+END { print (np==3 && nv==3 && pc[1] < vc[1]) ? "1" : "0" }
+AWKEOF
+)
+    ok "$sweep" "analysis fixture parses and orders correctly"
+
+    printf '\n'
+    if [ "$fails" -eq 0 ]; then
+        printf 'Self-test passed. The instruments are working.\n'
+        return 0
+    fi
+    printf '%s check(s) failed. Fix these before trusting a measurement run.\n' "$fails"
+    return 1
+}
+
+if [ "${SELFTEST:-0}" = "1" ]; then
+    selftest
+    exit $?
+fi
+
 probe_pid=$$
 probe_out=$(power_sample_for "$probe_pid")
 probe_pw=$(printf '%s' "$probe_out" | /usr/bin/awk '{ print $1 }')
