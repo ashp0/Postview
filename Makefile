@@ -55,7 +55,7 @@ CFLAGS := -arch x86_64 -march=core2 -mmacosx-version-min=$(MIN) -isysroot $(SDK)
 LDFLAGS := -arch x86_64 -mmacosx-version-min=$(MIN) -isysroot $(SDK) \
            -framework Cocoa -framework CoreGraphics -Wl,-dead_strip
 
-.PHONY: all clean run dist verify icon analyze release test uitest soak stress leakcheck
+.PHONY: all clean run dist verify icon analyze release test uitest soak stress leakcheck verify-all
 
 all: $(BUNDLE)
 
@@ -262,6 +262,25 @@ release:
 	@$(MAKE) stress
 	@$(MAKE) leakcheck
 	@$(MAKE) dist
+
+# Everything, in one command. This is the gate before a release: the unit and
+# UI suites, the soak (memory growth over 175 document cycles), the stress
+# suite under three sanitizers, the leak census and the static analyser.
+#
+# Runs the stress suite three times because each sanitizer excludes the others:
+# ASan and TSan cannot be linked together, so a single pass can only ever cover
+# one class of fault.
+verify-all: $(SHOWDOWN)
+	@echo "== static analyser =="        && $(MAKE) --no-print-directory analyze
+	@echo "== unit tests =="             && $(MAKE) --no-print-directory test      | tail -1
+	@echo "== UI tests =="               && $(MAKE) --no-print-directory uitest    | tail -1
+	@echo "== soak =="                   && $(MAKE) --no-print-directory soak      | tail -1
+	@echo "== stress =="                 && $(MAKE) --no-print-directory stress    | tail -1
+	@echo "== stress + address,undefined ==" && $(MAKE) --no-print-directory stress SAN="-fsanitize=address,undefined" | tail -1
+	@echo "== stress + thread =="        && $(MAKE) --no-print-directory stress SAN="-fsanitize=thread" | tail -1
+	@echo "== leaks =="                  && $(MAKE) --no-print-directory leakcheck | tail -1
+	@echo "== showdown self-test =="     && SELFTEST=1 ./$(SHOWDOWN) --selftest $(PDF) | tail -1
+	@echo "" && echo "verify-all: every gate passed"
 
 clean:
 	@rm -rf $(BUILD) $(BUNDLE) $(APP).zip $(BENCHMARK) $(PROFILE) $(SHOWDOWN)
