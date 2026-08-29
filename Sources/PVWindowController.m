@@ -745,7 +745,7 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
     // resolution in the direction of a scroll is the single most expensive
     // thing to be wrong about, because the pages being guessed at are exactly
     // the ones moving fastest.
-    if (!moving && [self wantsFullPrefetch]) {
+    if (!moving && _hasMovedViewport && [self wantsFullPrefetch]) {
         NSUInteger limit = [near count];
         if (limit > PV_FULL_PREFETCH_PAGES) limit = PV_FULL_PREFETCH_PAGES;
         for (k = 0; k < limit; k++) {
@@ -900,8 +900,8 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
     NSRect vis = [[_scrollView contentView] documentVisibleRect];
     CGFloat y  = NSMinY(vis);
     int dir    = _lastDirection;
-    if (y > _lastScrollY + 0.5)      dir = 1;
-    else if (y < _lastScrollY - 0.5) dir = -1;
+    if (y > _lastScrollY + 0.5)      { dir = 1;  _hasMovedViewport = YES; }
+    else if (y < _lastScrollY - 0.5) { dir = -1; _hasMovedViewport = YES; }
 
     // Speed, from the same two numbers that already gave direction. A gap
     // longer than half a second is not a scroll, it is two separate ones, and

@@ -52,6 +52,17 @@
     CGFloat           _lastScrollY;
     int               _lastDirection;
 
+    // Has the viewport ever actually moved in this window?
+    //
+    // _lastDirection starts at 1 -- forwards -- because the prefetch has to
+    // guess something before there is any evidence. That guess is free for
+    // previews, which are a ninth the size, and expensive for full-resolution
+    // bitmaps: at launch it meant rasterising a whole extra page nobody had
+    // asked to see, at the one moment the machine is busiest. Until the user
+    // moves, there is no direction of travel to prefetch along, so the
+    // full-resolution half of the prefetch waits for evidence.
+    BOOL              _hasMovedViewport;
+
     // How fast the document is moving under the viewport, in points per
     // second, smoothed over recent scroll events. Zero when not scrolling.
     //
