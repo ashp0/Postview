@@ -950,6 +950,125 @@ static void TestRunningLocation(void)
        "an unreadable path raises nothing");
 }
 
+#pragma mark - Scheduler budget arithmetic
+
+// The render scheduler's memory arithmetic, pinned so that changing one of the
+// three numbers without the others cannot pass.
+//
+// PVMaxRenderPixels() is a third of the page-cache budget, chosen so that the
+// two pages on screen come to two thirds and the previews fit in what is left.
+// That derivation leaves NO room for a full-resolution prefetch, which is
+// exactly the bug this guards: the wanted-set used to ask for three of them.
+// Five full bitmaps against a budget sized for three meant that storing one
+// evicted a page still on screen, which was then asked for again -- 51 full
+// renders to display six pages of a document nobody was scrolling.
+static void TestSchedulerBudgetArithmetic(void)
+{
+    printf("\nScheduler budget arithmetic\n");
+
+    double maxPx    = PVMaxRenderPixels();
+    double maxBytes = maxPx * 4.0;
+    double budget   = (double)PVPageCacheBudget();
+
+    OK(maxBytes > 0 && budget > 0, "budget and per-bitmap ceiling are positive");
+    OK(fabs(maxBytes - budget / 3.0) < 1.0,
+       "one full bitmap is capped at a third of the page-cache budget");
+
+    // Two pages are on screen at any ordinary zoom. Everything the wanted-set
+    // may ask for at full resolution has to fit what the cache can hold, or
+    // the last one stored evicts one that is still wanted.
+    double fullsRequested = 2.0 + (double)PV_FULL_PREFETCH_PAGES;
+    OK(fullsRequested * maxBytes <= budget + 1.0,
+       "visible pages plus full prefetch fit the cache budget");
+
+    // Stated separately so the failure message says which number moved.
+    OK(PV_FULL_PREFETCH_PAGES <= 1,
+       "full-resolution prefetch depth stays within what the budget allows");
+    OK(PV_MAX_FULL_IMAGES >= 3,
+       "the count cap is looser than the byte budget, not a second ceiling");
+
+    // Previews are what make scrolling back instant, so the budget has to hold
+    // several of them alongside the visible pages.
+    double previewBytes = maxBytes / (PV_PREVIEW_DIVISOR * PV_PREVIEW_DIVISOR);
+    OK(previewBytes * 4.0 < budget,
+       "four previews still fit beside the full bitmaps");
+}
+
+#pragma mark - Scenario replay
+
+// The profiler's three workloads, replayed through the same speed model the
+// controller uses, so the throttle's behaviour on each is pinned without a
+// window, a clock or a PDF.
+//
+// This exists because the profile is easy to misread. `read` reports zero
+// suppressed requests, which looks like a broken throttle and is in fact the
+// correct answer: a reader sitting on a page for two and a half seconds wants
+// it sharp. Only `page` and `scroll` move fast enough for suppression to be
+// right, and the test says so in those terms.
+static double ReplaySpeed(int presses, double delay, double travel)
+{
+    double speed = 0, lastT = 0, now = 0;
+    int i;
+    for (i = 0; i < presses; i++) {
+        now += delay;
+        double dt = now - lastT;
+        // Mirrors -[PVWindowController boundsDidChange:].
+        if (lastT > 0 && dt >= 0.002 && dt < 0.5) {
+            double v = travel / dt;
+            if (v <= PV_MAX_SCROLL_SPEED)
+                speed = (speed > 0) ? (speed * 0.7 + v * 0.3) : v;
+        } else if (lastT > 0 && dt >= 0.5) {
+            speed = 0;                      // half a second of stillness ends a scroll
+        }
+        lastT = now;
+    }
+    return speed;
+}
+
+static void TestScenarioReplay(void)
+{
+    printf("\nScenario replay (profiler workloads)\n");
+
+    const double kPageTravel = 760.0;   // roughly one viewport per Page Down
+    const double kLineTravel = 24.0;    // one line per arrow key
+
+    // read: 12 Page Downs, 2.5 s apart. Every gap exceeds half a second, so
+    // each one ends the previous scroll and the speed returns to rest.
+    double readSpeed = ReplaySpeed(12, 2.5, kPageTravel);
+    OK(readSpeed == 0.0, "read: 2.5 s gaps leave the document at rest");
+    OK(PVShouldRenderWhileMoving(readSpeed, 0.0, 0.1),
+       "read: a page being read is rendered, however short its dwell looks");
+
+    // page: 80 Page Downs at 20/s. This is a flick.
+    double pageSpeed = ReplaySpeed(80, 0.05, kPageTravel);
+    OK(pageSpeed > PV_MIN_SCROLL_SPEED, "page: 20 presses/s registers as motion");
+    OK(!PVShouldRenderWhileMoving(pageSpeed, 0.0, kPageTravel / pageSpeed),
+       "page: pages flying past are skipped");
+
+    // scroll: 200 arrow keys at 50/s. Slower travel, but still real motion.
+    double scrollSpeed = ReplaySpeed(200, 0.02, kLineTravel);
+    OK(scrollSpeed > PV_MIN_SCROLL_SPEED, "scroll: 50 presses/s registers as motion");
+    OK(!PVShouldRenderWhileMoving(scrollSpeed, 0.0, kLineTravel / scrollSpeed),
+       "scroll: continuous motion suppresses too");
+
+    // The ordering that makes the throttle device-independent. A keyboard
+    // scroll posts no live-scroll notification, so anything keyed off those
+    // flags alone would treat these two as different -- which is precisely the
+    // bug that let full-resolution renders past the throttle while previews
+    // beside them were correctly suppressed.
+    OK(pageSpeed > scrollSpeed,
+       "paging travels faster than line scrolling, as the geometry says");
+    OK(!PVShouldRenderWhileMoving(pageSpeed, 0.0, 0.1) ==
+       !PVShouldRenderWhileMoving(scrollSpeed, 0.0, 0.1),
+       "both keyboard motions reach the same decision for the same dwell");
+
+    // The safety property, restated at the scenario level: whatever the speed,
+    // a measurement that has gone stale renders. A document that stops moving
+    // cannot stay soft.
+    OK(PVShouldRenderWhileMoving(pageSpeed, PV_SPEED_FRESH_SECONDS * 1.01, 0.0),
+       "a flick that ended leaves nothing suppressed behind it");
+}
+
 #pragma mark - Render-suppression policy
 
 // PVShouldRenderWhileMoving is the whole of the throttle. It is a pure
@@ -1074,6 +1193,8 @@ int main(int argc, const char *argv[])
         TestStateStoreCorruptFile();
         TestRunningLocation();
         TestRenderSuppressionPolicy();
+        TestSchedulerBudgetArithmetic();
+        TestScenarioReplay();
         if (argc > 2) TestRotation([NSString stringWithUTF8String:argv[2]]);
         if (argc > 3) TestArbitrary([NSString stringWithUTF8String:argv[3]]);
 
