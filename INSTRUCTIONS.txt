@@ -1,0 +1,169 @@
+POSTVIEW — WHAT TO DO ON THE MAVERICKS MACHINE
+==============================================
+
+You have this on a USB stick. Everything below happens on the Mavericks Mac.
+No internet needed, no other computer needed.
+
+
+STEP 0 — COPY OFF THE STICK FIRST  (do not skip)
+------------------------------------------------
+1. Copy Postview.app to /Applications  (drag it there).
+2. Copy the rest of this folder somewhere on the internal disk, e.g. your
+   Desktop. Call it ~/Desktop/Postview-Tools.
+3. You may now eject the USB stick.
+
+Why this matters: OS X reads an application's code out of its file the WHOLE
+time it is running, not just at launch. Run Postview from the USB stick and
+unplug the stick, and the next piece of code it needs cannot be read — the
+kernel kills the process instantly. That is the one crash report this project
+has. Postview will warn you at launch if it notices it is running from a disk
+that can go away.
+
+
+STEP 1 — FIRST LAUNCH
+---------------------
+RIGHT-CLICK /Applications/Postview.app and choose "Open", then confirm.
+
+Do not just double-click it the first time. The app is not signed with an Apple
+Developer ID, so double-clicking gives "can't be opened because it is from an
+unidentified developer" with no way past it. Right-click → Open gives you an
+"Open anyway" button. You only need to do this once, ever.
+
+Open a PDF, scroll around, zoom in and out, open the sidebar. If anything
+crashes or looks wrong, note what you did and move on to Step 2 anyway.
+
+
+STEP 2 — PROVE THE NEW CODE ACTUALLY RUNS ON MAVERICKS   (5 minutes)
+--------------------------------------------------------------------
+This is the important one. All of the new work was verified on a modern Mac.
+None of it has ever executed on a 2013 Mac until now.
+
+Open Terminal and run this EXACTLY:
+
+    POSTVIEW_STATS=1 /Applications/Postview.app/Contents/MacOS/Postview
+
+The app opens. Now, inside the app:
+  - press Command-O and open a real PDF (a long one you actually read)
+  - scroll with the trackpad, hold Page Down, zoom in, open the sidebar
+  - press Command-Q to quit
+
+A block of "PVSTAT ..." lines prints into the Terminal window. Check these:
+
+    PVSTAT power.source            should say  battery   (or ac if plugged in)
+    PVSTAT cost.render.samples     should be   bigger than 0
+    PVSTAT cost.ms.per.mpx         should be   some number, not 0.00
+
+Cross-check the first one by running:  pmset -g batt
+It will say "Now drawing from 'Battery Power'" or "'AC Power'". Postview's
+power.source line must agree with it.
+
+>>> IF power.source SAYS "unknown", THAT IS THE THING TO REPORT BACK. <<<
+It means the power detection did not work on 10.9. The app is still safe — it
+falls back to the battery behaviour, which is the cautious one — but the
+feature is dead and needs fixing.
+
+SAVE THE OUTPUT: select the PVSTAT lines in Terminal, copy, paste into a text
+file on the Desktop called step2-stats.txt.
+
+NOTE: do NOT use the form `open -a Postview file.pdf --args -PVStats YES`.
+Mavericks' `open` command does not understand --args; it treats the words
+after it as filenames and you get "the file ... does not exist" errors. The
+command at the top of this step avoids `open` entirely.
+
+
+STEP 3 — THE HEAD-TO-HEAD MEASUREMENT   (about 30-50 minutes, unattended)
+-------------------------------------------------------------------------
+This is the real test: Postview against Preview, same document, same window
+size, seven scenarios, five runs each, with a winner per metric.
+
+Preparation, all of it matters:
+  - Quit Preview and Postview.
+  - Quit everything else. No browser, no Mail, no Spotlight indexing.
+  - ON THE LAPTOP: UNPLUG THE CHARGER. The battery case is the case under test.
+  - Plug in the power adapter only if you are running this on the Mac Pro.
+
+Then, in Terminal:
+
+    cd ~/Desktop/Postview-Tools
+    ./Postview-Showdown.command /path/to/a/document/you/actually/read.pdf
+
+Use a real document, not a test file. Render cost varies by 59x depending on
+what is on the page, so a synthetic file measures the wrong thing entirely.
+A long text-heavy PDF (a book, a manual, a paper) is the right choice.
+
+Check the header says:
+
+    Power policy: Postview pinned to -PVPowerState battery
+
+THEN DO NOT TOUCH THE MAC UNTIL IT FINISHES. Not the trackpad, not a key. It
+waits for the machine to be quiet before each trial and any input corrupts the
+measurement.
+
+It prints a verdict at the end and writes a .tsv file next to itself.
+SAVE THAT .tsv FILE.
+
+If it says a metric is "noisy" that is fine and expected — it means the
+run-to-run spread was bigger than the gap between the apps, so it refuses to
+declare a winner on that metric rather than making one up.
+
+
+STEP 4 — THE RENDER COST PROBE   (2 minutes)
+--------------------------------------------
+    cd ~/Desktop/Postview-Tools
+    ./pvband /path/to/the/same/document.pdf 6 3
+
+If it says "permission denied", run:  chmod +x ./pvband   and try again.
+
+This measures how long this machine actually takes to rasterise a page, and how
+that changes when a page is rendered in horizontal strips instead of all at
+once. Every timing figure in the project's documentation was measured on a
+different machine; this is the one that counts.
+
+SAVE THE OUTPUT: copy the whole thing into step4-band.txt on the Desktop.
+
+
+STEP 5 — JUST USE IT
+--------------------
+Read PDFs with it for a few days. Note anything that crashes, hangs, looks
+blurry when it should not, or feels slow. That is data too.
+
+To make it your default PDF viewer (optional): select any PDF in Finder, press
+Command-I, change "Open with" to Postview, click "Change All". Postview
+registers itself as an alternate PDF handler, so installing it does not take
+the association away from Preview on its own.
+
+
+WHAT TO BRING BACK
+------------------
+  step2-stats.txt          the PVSTAT block from Step 2
+  the .tsv file            from Step 3
+  step4-band.txt           the output from Step 4
+  any crash reports        ~/Library/Logs/DiagnosticReports/Postview*
+  notes on anything odd
+
+The three files above are what determine whether this is finished or whether
+there is more work to do.
+
+
+KNOWN LIMITS — NOT BUGS, DO NOT REPORT THESE
+--------------------------------------------
+  - No text selection, no copy, no search, no printing, no annotation, no
+    export, no encrypted PDFs. It is a reader, not a PDF application.
+  - Zooming past about 1.1x on an 8 GB machine renders pages slightly soft.
+    This is a known, deliberate memory limit, recorded and pinned by tests.
+  - Peak memory use is higher than Preview's. Known, measured, being worked on.
+  - Right-click → Open being needed on first launch is normal for an unsigned
+    app. There is no way around it without a paid Apple Developer ID, and
+    Mavericks predates notarization entirely.
+
+
+IF SOMETHING GOES BADLY WRONG
+-----------------------------
+Postview stores its saved reading positions and nothing else. To reset it
+completely:
+
+    defaults delete com.postview.Postview
+    rm -rf ~/Library/Application\ Support/Postview
+
+Deleting /Applications/Postview.app removes the app. It installs nothing
+elsewhere, no background processes, no login items, no kernel extensions.

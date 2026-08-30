@@ -122,6 +122,13 @@ WORKDIR=$(/usr/bin/mktemp -d /tmp/postview-showdown.XXXXXX) || die "could not cr
 cleanup() {
     [ -n "$CURRENT_APP" ] && /usr/bin/osascript -e "tell application \"$CURRENT_APP\" to quit" >/dev/null 2>&1
     [ -n "$WORKDIR" ] && rm -rf "$WORKDIR"
+    # The three keys open_app_with() writes into Postview's preference domain.
+    # Removed here as well as after each trial so that a run killed with ^C, or
+    # one that dies inside a trial, does not leave the user's copy of Postview
+    # permanently writing a stats file to a path inside a deleted temp
+    # directory -- or, worse, permanently pinned to a power state it was never
+    # told about.
+    command -v postview_settings_clear >/dev/null 2>&1 && postview_settings_clear
 }
 trap cleanup EXIT INT TERM
 
@@ -688,29 +695,59 @@ pvstat() { /usr/bin/awk -v k="$1" '$1 == "PVSTAT" && $2 == k { print $3; exit }'
 # Which power branch Postview is pinned to for the run. See open_app_with().
 POWERSTATE="${POWERSTATE:-battery}"
 
+POSTVIEW_DOMAIN="com.postview.Postview"
+
+# Postview's settings for a trial, written to its preference domain.
+#
+# NOT `open --args`, which is what this used to do and which does not work on
+# the machine that matters. Mavericks' open(1) has no --args: it parses the
+# token as `--` (end of options) followed by a filename `args`, then treats
+# everything after it as more filenames, resolved against the working
+# directory. The symptom is an error naming files like `<cwd>/args` and
+# `<cwd>/-PVStats`, and the consequence for this harness is worse than an
+# error -- every PVSTAT column would come out empty and, far more seriously,
+# -PVPowerState would never arrive, so the Mac Pro would measure the mains
+# policy while the header claimed battery. That is the exact failure the pin
+# exists to prevent.
+#
+# The preference domain is honoured by NSUserDefaults on every OS X version
+# and, unlike an environment variable, survives being launched through
+# LaunchServices -- which both apps must be, or launch_seconds stops being
+# comparable between them.
+#
+# Written immediately before the launch and removed immediately after, with the
+# EXIT trap removing them again in case a trial dies in between. Nothing is
+# left in the user's preferences by a completed run.
+postview_settings_set() {
+    # $1 statfile
+    /usr/bin/defaults write "$POSTVIEW_DOMAIN" PVStats -bool YES        >/dev/null 2>&1
+    /usr/bin/defaults write "$POSTVIEW_DOMAIN" PVStatsPath "$1"         >/dev/null 2>&1
+    /usr/bin/defaults write "$POSTVIEW_DOMAIN" PVPowerState "$POWERSTATE" >/dev/null 2>&1
+}
+
+postview_settings_clear() {
+    /usr/bin/defaults delete "$POSTVIEW_DOMAIN" PVStats      >/dev/null 2>&1
+    /usr/bin/defaults delete "$POSTVIEW_DOMAIN" PVStatsPath  >/dev/null 2>&1
+    /usr/bin/defaults delete "$POSTVIEW_DOMAIN" PVPowerState >/dev/null 2>&1
+}
+
 open_app_with() {
     # $1 app path/name, $2 document path, $3 statfile (Postview only)
     #
-    # -PVPowerState is pinned, and the reason is specific to this harness.
-    # Postview reads the power source and runs a more expensive policy on mains
-    # power: full-resolution bitmaps during a slow scroll, and a deeper
-    # prefetch on a machine whose cache can hold it. The arbiter machine is a
-    # Mac Pro, which has no battery and therefore always reports AC -- so
-    # without this every trial recorded here would measure the mains policy and
-    # silently stop describing the battery case the project exists to optimise,
-    # while remaining directly comparable-looking against every number already
-    # recorded in ENGINEERING.md.
+    # Both apps are launched by exactly the same command, with no extra
+    # arguments on either side, so the launch path being timed is the same one
+    # for both.
     #
-    # Battery is the default because that is the case under test. Run with
-    # POWERSTATE=ac to measure the other branch deliberately; the value is
-    # recorded in the TSV header so no run is ambiguous about which policy it
-    # was measuring.
+    # POWERSTATE is battery by default because that is the case under test:
+    # Postview runs a more expensive policy on mains power (sharp pages during
+    # a slow scroll, deeper prefetch), and the arbiter machine is a desktop
+    # that always reports AC. Run with POWERSTATE=ac to measure the other
+    # branch deliberately; the value is printed in the run header and recorded
+    # in the TSV so no run is ambiguous about which policy it measured.
     if [ -n "${3:-}" ]; then
-        /usr/bin/open -n -a "$1" "$2" --args -PVStats YES -PVStatsPath "$3" \
-            -PVPowerState "$POWERSTATE" >/dev/null 2>&1
-    else
-        /usr/bin/open -n -a "$1" "$2" >/dev/null 2>&1
+        postview_settings_set "$3"
     fi
+    /usr/bin/open -n -a "$1" "$2" >/dev/null 2>&1
 }
 
 run_trial() {
@@ -815,6 +852,12 @@ run_trial() {
     # Removed after the app has quit, so nothing is reading it.
     [ -n "$doc" ] && /bin/rm -f "$doc" 2>/dev/null
     CURRENT_APP=""
+
+    # The app has quit, so its stats file is fully written and the preference
+    # keys have done their job. Removed per trial rather than once at the end,
+    # so the window in which the user's own copy of Postview would behave
+    # differently is only ever the length of one trial.
+    [ -n "$statfile" ] && postview_settings_clear
 
     rf="-"; rp="-"; mp="-"; sup="-"; supm="-"; res="-"; resu="-"; resc="-"
     if [ -n "$statfile" ] && [ -f "$statfile" ]; then
@@ -1078,6 +1121,34 @@ AWKEOF
        "a hard link is the same inode (the staging bug this replaced)"
     ok "$([ -n "$i_cpy" ] && [ "$i_cpy" != "$i_src" ] && echo 1 || echo 0)" \
        "fresh_document()'s copy is a different inode, so it is a different document"
+
+    # How Postview is told to keep a census and which power branch to run.
+    #
+    # This replaced `open --args`, which does not exist on Mavericks: open(1)
+    # there reads it as `--` plus a filename, and the settings simply never
+    # arrive. That failure is silent in the worst possible way -- the run
+    # completes, every PVSTAT column is empty, and the power branch is
+    # whatever the machine happened to report, while the header says otherwise.
+    # A measurement harness must not be able to fail that way without saying
+    # so, hence these four checks.
+    st_prev_state=$(/usr/bin/defaults read "$POSTVIEW_DOMAIN" PVPowerState 2>/dev/null || true)
+    postview_settings_set "/tmp/pv-selftest-stats.txt"
+    st_stats=$(/usr/bin/defaults read "$POSTVIEW_DOMAIN" PVStats 2>/dev/null || echo "")
+    st_path=$(/usr/bin/defaults read "$POSTVIEW_DOMAIN" PVStatsPath 2>/dev/null || echo "")
+    st_power=$(/usr/bin/defaults read "$POSTVIEW_DOMAIN" PVPowerState 2>/dev/null || echo "")
+    ok "$([ "$st_stats" = "1" ] && echo 1 || echo 0)" \
+       "the census is switched on by a route that works on 10.9 (PVStats=$st_stats)"
+    ok "$([ "$st_path" = "/tmp/pv-selftest-stats.txt" ] && echo 1 || echo 0)" \
+       "the stats path reaches the app's preference domain"
+    ok "$([ "$st_power" = "$POWERSTATE" ] && echo 1 || echo 0)" \
+       "the power branch is pinned to '$POWERSTATE' and not left to the machine"
+    postview_settings_clear
+    st_after=$(/usr/bin/defaults read "$POSTVIEW_DOMAIN" PVStats 2>/dev/null || echo "gone")
+    ok "$([ "$st_after" = "gone" ] && echo 1 || echo 0)" \
+       "and all of it is removed again, leaving the user's preferences as found"
+    # A real setting the user may have had before the self-test ran is put back.
+    [ -n "$st_prev_state" ] && \
+        /usr/bin/defaults write "$POSTVIEW_DOMAIN" PVPowerState "$st_prev_state" >/dev/null 2>&1
 
     printf '\n'
     if [ "$fails" -eq 0 ]; then

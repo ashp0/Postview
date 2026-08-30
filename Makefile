@@ -106,6 +106,7 @@ dist: $(BUNDLE) verify bandtool $(BENCHMARK) $(PROFILE) $(SHOWDOWN)
 	@mkdir -p "$(DISTDIR)"
 	@ditto "$(BUNDLE)" "$(DISTDIR)/$(BUNDLE)"
 	@cp README.md "$(DISTDIR)/README.md"
+	@cp INSTRUCTIONS.txt "$(DISTDIR)/INSTRUCTIONS.txt"
 	@cp "$(BENCHMARK)" "$(DISTDIR)/$(BENCHMARK)"
 	@cp "$(PROFILE)" "$(DISTDIR)/$(PROFILE)"
 	@cp "$(SHOWDOWN)" "$(DISTDIR)/$(SHOWDOWN)"
