@@ -17,7 +17,13 @@ Postview-Profile.command
 Postview-Showdown.command
 
 # Distributables
-Postview.zip
+#
+# Postview.zip is deliberately NOT ignored and IS committed. The machines
+# this ships to run Mavericks and cannot build it -- the Makefile needs a
+# modern clang for -Werror=unguarded-availability, which Xcode 6 lacks -- so
+# a `git clone` has to be sufficient on its own to get a working app onto the
+# target. Rebuild it with `make dist` and commit the result when the app
+# changes.
 dist/
 
 # Benchmark and profile output
