@@ -191,6 +191,10 @@ int main(int argc, const char *argv[])
 
         double *samples = (double *)calloc((size_t)cycles, sizeof(double));
         if (!samples) { fprintf(stderr, "out of memory\n"); return 2; }
+        // The warm-up's peaks say nothing about the steady state, and the
+        // high-water mark is a maximum: without a reset here it would report
+        // whatever the first twenty-five cycles happened to touch, forever.
+        PVResidentReset();
         double peak = base;
         for (i = 0; i < cycles; i++) {
             Cycle(url, warm + i);
@@ -240,6 +244,49 @@ int main(int argc, const char *argv[])
             char msg[160];
             snprintf(msg, sizeof msg, "%-20s live=%ld (expected 0)", tracked[t], n);
             OK(n == 0, msg);
+        }
+
+        // ------------------------------------------------------------------
+        // Resident rendered pixels.
+        //
+        // The footprint trend below is a proxy: it is dominated by AppKit,
+        // CoreText and CoreGraphics filling their own caches, and by an
+        // allocator that returns pages in irregular steps. This section is the
+        // part of the footprint Postview actually decides, measured directly.
+        //
+        // Two claims, and the second is the one that matters. The high-water
+        // marks say how much was resident at the worst instant of the run --
+        // the number every memory change in the render pipeline is aimed at.
+        // The totals say what is resident now, after every document has been
+        // closed and every queue shut down, and that must be exactly zero: a
+        // census that does not return to zero is not measuring what it claims
+        // to, and any peak it reports is a number about nothing.
+        // ------------------------------------------------------------------
+        printf("\n[resident rendered pixels]\n");
+        const double kMB = 1024.0 * 1024.0;
+        printf("  high water, all buckets      : %.1f MB\n",
+               (double)PVResidentHighWater() / kMB);
+        printf("    of which cache             : %.1f MB\n",
+               (double)PVResidentHighWaterForBucket(PVResidentCache) / kMB);
+        printf("    of which undelivered       : %.1f MB  (cap %d full bitmaps)\n",
+               (double)PVResidentHighWaterForBucket(PVResidentUndelivered) / kMB,
+               PV_MAX_INFLIGHT_FULL);
+        printf("    of which mid-rasterisation : %.1f MB\n",
+               (double)PVResidentHighWaterForBucket(PVResidentRender) / kMB);
+        {
+            size_t leftRender      = PVResidentBytes(PVResidentRender);
+            size_t leftUndelivered = PVResidentBytes(PVResidentUndelivered);
+            size_t leftCache       = PVResidentBytes(PVResidentCache);
+            size_t leftTotal       = PVResidentTotal();
+            char msg[200];
+            printf("  still resident after teardown: %.3f MB "
+                   "(render %.3f, undelivered %.3f, cache %.3f)\n",
+                   (double)leftTotal / kMB, (double)leftRender / kMB,
+                   (double)leftUndelivered / kMB, (double)leftCache / kMB);
+            snprintf(msg, sizeof msg,
+                     "resident bitmap census returns to zero (%lu bytes left)",
+                     (unsigned long)leftTotal);
+            OK(leftTotal == 0, msg);
         }
 
         printf("\n[footprint trend]\n");

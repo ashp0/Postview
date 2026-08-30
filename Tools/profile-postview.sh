@@ -138,15 +138,24 @@ fi
 WORKDIR=$(/usr/bin/mktemp -d /tmp/postview-profile.XXXXXX) || die "could not create a working directory"
 PDF_BASE=$(basename "$PDF"); PDF_STEM=${PDF_BASE%.*}
 
-# Each trial gets a path neither app has opened before, so neither restores a
-# page position, zoom or window frame from a previous trial. Without this,
+# Each trial gets a document neither app has opened before, so neither restores
+# a page position, zoom or window frame from a previous trial. Without this,
 # every run after the first starts somewhere different and measures different
 # pages -- and a run that resumes at the end of the document measures an app
 # doing nothing at all.
+#
+# A copy, not a hard link. A hard link is the same inode and therefore the same
+# document: Postview keys its saved position on the path and was fooled, Preview
+# keys on the document's identity and was not. This script's own TSV is where
+# that was caught -- see the `end_title` column, which has Preview on page 1,174
+# of a freshly staged file in the `launch` scenario, before any key is pressed.
+# The same fix is in Tools/showdown.sh, with the reasoning in full.
 fresh_document() {
     label=$(printf '%s' "$1" | /usr/bin/tr ' /' '--')
     path="$WORKDIR/$PDF_STEM-$label.pdf"
-    /bin/ln "$PDF" "$path" 2>/dev/null || /bin/cp "$PDF" "$path" 2>/dev/null || return 1
+    /bin/rm -f "$path" 2>/dev/null
+    /bin/cp -X "$PDF" "$path" 2>/dev/null || /bin/cp "$PDF" "$path" 2>/dev/null || return 1
+    /usr/bin/xattr -c "$path" 2>/dev/null || true
     printf '%s\n' "$path"
 }
 
@@ -291,30 +300,60 @@ AS
 }
 
 reset_samples() { samples=0; cpu_sum=0; cpu_peak=0; rss_peak=0; rss_sum=0; }
+
+# One counter out of the app's census, matched exactly on field 2 rather than by
+# a regex over the line.
+#
+# `requests.suppressed` is a prefix of `requests.suppressed.motion` and
+# `requests.suppressed.total`, so the older `/requests.suppressed/` pattern
+# matched all three and printed three numbers into a single TSV field, newlines
+# included -- which does not fail loudly, it corrupts the file. Anchoring on the
+# field means a key added later cannot quietly do it again.
+pvstat() {
+    /usr/bin/awk -v k="$1" '$1 == "PVSTAT" && $2 == k { print $3; exit }' "$2"
+}
+
+# Every variable here is prefixed, because a shell function has no locals and
+# this one is called from inside the run loop several hundred times a trial.
+#
+# It used to take its two readings into `c` and `r`. `r` is the run counter of
+# the loop at the bottom of this script, so the first sample of the first trial
+# overwrote it with a resident-set size in kilobytes. Two consequences, both
+# silent: the `run` column recorded an RSS reading instead of a run number --
+# visible in every TSV this script has ever written -- and `while [ "$r" -le
+# "$RUNS" ]` compared ~150000 against RUNS and ended after a single pass, so
+# RUNS was accepted, printed in the header, and then ignored. Every profile ever
+# taken with it is one unrepeated trial per scenario with no spread to check it
+# against, which is the one thing this project's own methodology says must never
+# be allowed to decide anything.
 sample_process() {
-    line=$(/bin/ps -o %cpu= -o rss= -p "$1" 2>/dev/null | /usr/bin/awk 'NR==1 { print $1, $2 }')
-    set -- $line
+    _sp_line=$(/bin/ps -o %cpu= -o rss= -p "$1" 2>/dev/null | /usr/bin/awk 'NR==1 { print $1, $2 }')
+    set -- $_sp_line
     [ "$#" -eq 2 ] || return 0
-    c=$1; r=$2
-    case "$c" in ''|*[!0-9.-]*) return 0 ;; esac
-    case "$r" in ''|*[!0-9]*) return 0 ;; esac
-    cpu_sum=$(/usr/bin/awk -v a="$cpu_sum" -v b="$c" 'BEGIN { printf "%.4f", a+b }')
-    cpu_peak=$(/usr/bin/awk -v a="$cpu_peak" -v b="$c" 'BEGIN { print (b>a)?b:a }')
-    rss_sum=$(/usr/bin/awk -v a="$rss_sum" -v b="$r" 'BEGIN { printf "%.0f", a+b }')
-    [ "$r" -le "$rss_peak" ] || rss_peak=$r
+    _sp_cpu=$1; _sp_rss=$2
+    case "$_sp_cpu" in ''|*[!0-9.-]*) return 0 ;; esac
+    case "$_sp_rss" in ''|*[!0-9]*) return 0 ;; esac
+    cpu_sum=$(/usr/bin/awk -v a="$cpu_sum" -v b="$_sp_cpu" 'BEGIN { printf "%.4f", a+b }')
+    cpu_peak=$(/usr/bin/awk -v a="$cpu_peak" -v b="$_sp_cpu" 'BEGIN { print (b>a)?b:a }')
+    rss_sum=$(/usr/bin/awk -v a="$rss_sum" -v b="$_sp_rss" 'BEGIN { printf "%.0f", a+b }')
+    [ "$_sp_rss" -le "$rss_peak" ] || rss_peak=$_sp_rss
     samples=$((samples+1))
 }
 
 OUTPUT="$PWD/Postview-Profile-$(/bin/date +%Y%m%d-%H%M%S).tsv"
-printf 'app\tscenario\trun\twall_seconds\tcpu_seconds\tcpu_per_second\tmean_cpu_percent\tpeak_cpu_percent\tmean_rss_kb\tpeak_rss_kb\twindow_size\tstart_idle\tend_title\trenders_full\trenders_preview\tmegapixels_total\trequests_suppressed\n' > "$OUTPUT"
+printf 'app\tscenario\trun\twall_seconds\tcpu_seconds\tcpu_per_second\tmean_cpu_percent\tpeak_cpu_percent\tmean_rss_kb\tpeak_rss_kb\twindow_size\tstart_idle\tstart_title\tend_title\trenders_full\trenders_preview\tmegapixels_total\trequests_suppressed\trequests_suppressed_motion\n' > "$OUTPUT"
 
 # $1 bundle  $2 app  $3 process  $4 scenario  $5 run
 run_scenario() {
     bundle=$1; app=$2; process=$3; scen=$4; iter=$5
     CURRENT_APP=$app
 
-    start_idle=$(wait_for_quiet_machine) || true
+    # Staged before the quiet gate, not after. Since the staging became a real
+    # copy rather than a hard link it does actual disk I/O, and doing that after
+    # the machine has been declared quiet puts it inside the window the gate
+    # exists to keep clean. Copy first, then wait for it to settle.
     trial_pdf=$(fresh_document "$app-$scen-$iter") || die "could not stage a copy of the PDF"
+    start_idle=$(wait_for_quiet_machine) || true
     trial_name=$(basename "$trial_pdf" .pdf)
     statfile="$WORKDIR/stat-$app-$scen-$iter.txt"
 
@@ -336,6 +375,22 @@ run_scenario() {
     # Let the opening render finish before any scenario clock starts, so what
     # follows measures the scenario and not the tail of the launch.
     /bin/sleep "$SETTLE_SECONDS"
+
+    # Where the app opened, recorded before any input is sent. `end_title` alone
+    # could not distinguish "read four pages from page 1" from "read four pages
+    # from page 1,174", and the difference decides whether the two apps
+    # rasterised comparable content at all.
+    start_title=$(current_page_label "$process" | /usr/bin/tr '\t' ' ')
+    [ -n "$start_title" ] || start_title="-"
+    # Both apps write "(page N of M)"; only the thousands separator differs, and
+    # page 1 never has one. A title with no page in it at all is not evidence of
+    # anything and is left alone.
+    case "$start_title" in
+        -|*"page 1 of"*) : ;;
+        *"page "*)
+           printf '  !! %s opened a freshly copied file at "%s", not page 1.\n' "$app" "$start_title"
+           printf '     It restored a saved position; this trial is not comparable.\n' ;;
+    esac
 
     reset_samples
     driver=""
@@ -386,23 +441,32 @@ run_scenario() {
     quit_app "$app" "$process" || die "$app did not quit cleanly after '$scen'"
     CURRENT_APP=""
 
-    rf="-"; rp="-"; mp="-"; sup="-"
+    # A copy is the whole file, unlike the hard link this replaced, so it goes
+    # as soon as the app has let go of it rather than accumulating until the
+    # trap fires.
+    [ -n "$trial_pdf" ] && /bin/rm -f "$trial_pdf" 2>/dev/null
+
+    rf="-"; rp="-"; mp="-"; sup="-"; supm="-"
     if [ -f "$statfile" ]; then
-        rf=$(/usr/bin/awk '/renders.full/    { print $3 }' "$statfile")
-        rp=$(/usr/bin/awk '/renders.preview/ { print $3 }' "$statfile")
-        mp=$(/usr/bin/awk '/megapixels.total/{ print $3 }' "$statfile")
-        sup=$(/usr/bin/awk '/requests.suppressed/ { print $3 }' "$statfile")
+        rf=$(pvstat  renders.full               "$statfile")
+        rp=$(pvstat  renders.preview            "$statfile")
+        mp=$(pvstat  megapixels.total           "$statfile")
+        sup=$(pvstat requests.suppressed        "$statfile")
+        supm=$(pvstat requests.suppressed.motion "$statfile")
+        [ -n "$rf" ]  || rf="-";  [ -n "$rp" ]  || rp="-"
+        [ -n "$mp" ]  || mp="-";  [ -n "$sup" ] || sup="-"
+        [ -n "$supm" ] || supm="-"
     fi
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$app" "$scen" "$iter" "$wall" "$cpu_used" "$cpu_rate" "$mean_cpu" "$cpu_peak" \
-        "$mean_rss" "$rss_peak" "$winsize" "$start_idle" "$end_title" \
-        "$rf" "$rp" "$mp" "$sup" >> "$OUTPUT"
+        "$mean_rss" "$rss_peak" "$winsize" "$start_idle" "$start_title" "$end_title" \
+        "$rf" "$rp" "$mp" "$sup" "$supm" >> "$OUTPUT"
 
     printf '  %-9s %-7s run %s: %5.1f s wall, %6.2f CPU-s (%.2f/s), RSS %s MB, win %s' \
         "$app" "$scen" "$iter" "$wall" "$cpu_used" "$cpu_rate" \
         "$(/usr/bin/awk -v r="$rss_peak" 'BEGIN { printf "%.0f", r/1024 }')" "$winsize"
-    [ "$mp" != "-" ] && printf ', %s MP in %s+%s renders, %s skipped' "$mp" "$rf" "$rp" "$sup"
+    [ "$mp" != "-" ] && printf ', %s MP in %s+%s renders, %s+%s skipped' "$mp" "$rf" "$rp" "$sup" "$supm"
     printf '\n'
 
     /bin/sleep 0.5

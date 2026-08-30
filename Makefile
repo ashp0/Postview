@@ -21,8 +21,10 @@ MACOS    := $(CONTENTS)/MacOS
 RES      := $(CONTENTS)/Resources
 # Make needs spaces escaped in prerequisite names; the raw form is kept for
 # quoted shell commands below, where a backslash would become part of the name.
-ICON_SOURCE := Resources/New\ Icon\ (Rename\ me).icns
-ICON_SOURCE_PATH := Resources/New Icon (Rename me).icns
+# No spaces in the name, so no escaped and unescaped copies of the same path:
+# Make needs backslashes in a prerequisite and a quoted shell command must not
+# have them, which is why this used to be two variables that had to agree.
+ICON_SOURCE := Resources/$(APP).icns
 BENCHMARK_SOURCE := Tools/benchmark-preview-vs-postview.sh
 BENCHMARK := Postview-Benchmark.command
 PROFILE_SOURCE := Tools/profile-postview.sh
@@ -55,7 +57,7 @@ CFLAGS := -arch x86_64 -march=core2 -mmacosx-version-min=$(MIN) -isysroot $(SDK)
 LDFLAGS := -arch x86_64 -mmacosx-version-min=$(MIN) -isysroot $(SDK) \
            -framework Cocoa -framework CoreGraphics -Wl,-dead_strip
 
-.PHONY: all clean run dist verify icon analyze release test uitest soak stress leakcheck verify-all
+.PHONY: all clean run dist verify icon analyze release test uitest soak stress leakcheck verify-all band
 
 all: $(BUNDLE)
 
@@ -73,7 +75,7 @@ $(BUNDLE): $(OBJECTS) Resources/Info.plist $(ICON_SOURCE)
 	@strip -x $(MACOS)/$(APP)
 	@cp Resources/Info.plist $(CONTENTS)/Info.plist
 	@printf 'APPL????' > $(CONTENTS)/PkgInfo
-	@cp "$(ICON_SOURCE_PATH)" "$(RES)/$(APP).icns"
+	@cp $(ICON_SOURCE) $(RES)/$(APP).icns
 	@cp Resources/TB_*.pdf $(RES)/ 2>/dev/null || true
 	@touch $(BUNDLE)
 	@echo "  built    $(BUNDLE)"
@@ -116,7 +118,7 @@ verify:
 	@echo "== Mach-O compatibility check =="
 	@plutil -lint $(CONTENTS)/Info.plist >/dev/null || \
 	  (echo "FAIL: Info.plist is invalid"; exit 1)
-	@cmp -s "$(ICON_SOURCE_PATH)" "$(RES)/$(APP).icns" || \
+	@cmp -s $(ICON_SOURCE) $(RES)/$(APP).icns || \
 	  (echo "FAIL: bundled icon does not match the selected source icon"; exit 1)
 	@otool -l $(MACOS)/$(APP) | grep -A2 LC_VERSION_MIN_MACOSX || \
 	  (echo "FAIL: no LC_VERSION_MIN_MACOSX (Mavericks dyld cannot load this)"; exit 1)
@@ -191,6 +193,47 @@ soak: $(OBJECTS) | $(BUILD)
 	@$(CC) $(CFLAGS) -ISources -c Tests/pvsoak.m -o $(BUILD)/pvsoak.o
 	@$(CC) $(LDFLAGS) $(UIOBJ) $(BUILD)/pvsoak.o -o $(BUILD)/pvsoak
 	@$(BUILD)/pvsoak $(PDF) $(SOAKCYCLES)
+
+# Task 4 stage 1: does a band render cost a fraction of a page render, or does
+# per-render PDF parsing overhead dominate? An experiment, not a gate -- it is
+# not in verify-all and it ships nothing. Built for the host architecture as
+# well as the Mavericks one, because the quantity it measures is a ratio and a
+# ratio that disagrees between the two is a ratio that cannot be trusted to
+# transfer to the machine that decides.
+BANDPAGES ?= 6
+BANDREPS  ?= 3
+
+band: | $(BUILD)
+	@test -f $(BUILD)/heavy.pdf || ( \
+	   $(CC) -isysroot $(SDK) -fobjc-arc -framework Cocoa \
+	     -o $(BUILD)/mkheavy Tests/make_heavy_fixture.m && \
+	   $(BUILD)/mkheavy $(BUILD)/heavy.pdf 60 )
+	@test -f $(BUILD)/text.pdf || ( \
+	   $(CC) -isysroot $(SDK) -fobjc-arc -framework Cocoa \
+	     -o $(BUILD)/mktext Tests/make_text_fixture.m && \
+	   $(BUILD)/mktext $(BUILD)/text.pdf 60 )
+	@$(CC) $(CFLAGS) -ISources -c Sources/PVCommon.m   -o $(BUILD)/band-PVCommon.o
+	@$(CC) $(CFLAGS) -ISources -c Sources/PVPDFSource.m -o $(BUILD)/band-PVPDFSource.o
+	@$(CC) $(CFLAGS) -ISources -c Tests/pvband.m       -o $(BUILD)/pvband.o
+	@$(CC) $(LDFLAGS) $(BUILD)/band-PVCommon.o $(BUILD)/band-PVPDFSource.o $(BUILD)/pvband.o -o $(BUILD)/pvband
+	@echo "== x86_64 (the shipping architecture; under Rosetta on an Apple silicon host) =="
+	@$(BUILD)/pvband $(PDF) $(BANDPAGES) $(BANDREPS)
+	@echo ""
+	@echo "== $(shell uname -m) (native, as a cross-check that the ratio is not a Rosetta artefact) =="
+	@$(CC) -arch $(shell uname -m) -mmacosx-version-min=11.0 -isysroot $(SDK) -fno-objc-arc \
+	   -fobjc-exceptions -Os -ISources -Wno-deprecated-declarations \
+	   -c Sources/PVCommon.m -o $(BUILD)/bandn-PVCommon.o
+	@$(CC) -arch $(shell uname -m) -mmacosx-version-min=11.0 -isysroot $(SDK) -fno-objc-arc \
+	   -fobjc-exceptions -Os -ISources -Wno-deprecated-declarations \
+	   -c Sources/PVPDFSource.m -o $(BUILD)/bandn-PVPDFSource.o
+	@$(CC) -arch $(shell uname -m) -mmacosx-version-min=11.0 -isysroot $(SDK) -fno-objc-arc \
+	   -fobjc-exceptions -Os -ISources -Wno-deprecated-declarations \
+	   -c Tests/pvband.m -o $(BUILD)/bandn-pvband.o
+	@$(CC) -arch $(shell uname -m) -mmacosx-version-min=11.0 -isysroot $(SDK) \
+	   -framework Cocoa -framework CoreGraphics \
+	   $(BUILD)/bandn-PVCommon.o $(BUILD)/bandn-PVPDFSource.o $(BUILD)/bandn-pvband.o \
+	   -o $(BUILD)/pvband-native
+	@$(BUILD)/pvband-native $(PDF) $(BANDPAGES) $(BANDREPS)
 
 # Contention check: the same objects, driven with every asynchronous event the
 # app can receive arriving while the render queue is busy. pvsoak proves a

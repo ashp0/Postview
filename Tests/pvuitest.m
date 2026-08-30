@@ -12,6 +12,22 @@
 #import "PVDropView.h"
 #import "PVPageView.h"
 #import <objc/runtime.h>
+#include <sys/resource.h>   // the scroll-back probe reports process CPU
+#include <stdlib.h>          // setenv, for the rasterisation census
+
+// The census is off unless asked for, and PVStatsEnabled() resolves it once via
+// dispatch_once -- so it has to be set before anything at all touches it, which
+// means before main() runs rather than at the top of main(). A constructor is
+// the only place early enough that is still inside this file.
+//
+// Turning it on for the whole suite only adds counting; no decision anywhere
+// reads a counter. It is on so that [5g5] can assert the motion gate actually
+// increments the counter that was added for it -- an uncounted counter is
+// exactly the bug being fixed, and it would be absurd to reintroduce it here.
+__attribute__((constructor)) static void PVEnableStatsForTests(void)
+{
+    setenv("POSTVIEW_STATS", "1", 1);
+}
 
 // Declared, not added: every one of these already exists on the class. The
 // controller has no reason to advertise them, and the test has no reason to
@@ -68,6 +84,11 @@ static void PVInstallRequestCounter(void)
 - (double)secondsPageStaysVisible:(NSUInteger)page;
 - (void)willStartLiveScroll:(NSNotification *)note;
 - (void)didEndLiveScroll:(NSNotification *)note;
+// The bounds-change handler, which is where the wanted-set rebuild early-out
+// lives. Missing here it still dispatched -- the selector exists -- but the
+// compiler inferred a return type of id for a void method and said so on every
+// build, and a warning that is always present is a warning nobody reads.
+- (void)clipBoundsChanged:(NSNotification *)note;
 - (void)scrollToPage:(NSUInteger)page fraction:(CGFloat)fraction;
 - (void)pageViewWillMagnify:(PVPageView *)v atPoint:(NSPoint)p;
 - (void)pageView:(PVPageView *)v magnifyBy:(CGFloat)factor;
@@ -129,6 +150,83 @@ static BOOL PumpUntil(BOOL (^cond)(void), double deadline)
     return cond();
 }
 
+// Drive the viewport the way an input device does, and count what the scheduler
+// asks for.
+//
+// Both devices reach the scheduler through exactly one door. -keyDown: calls
+// -[PVPageView scrollByPoints:], which calls -[NSClipView scrollToPoint:]; the
+// trackpad and wheel are handled by NSScrollView itself, because PVPageView
+// deliberately does NOT override -scrollWheel: (that is the precondition for
+// +isCompatibleWithResponsiveScrolling). Both end at the same clip-view bounds
+// change and therefore at -clipBoundsChanged:.
+//
+// So moving the clip view directly is not an approximation of either device --
+// it is the code both of them run. The ONLY thing that differs between them is
+// the pair of live-scroll notifications AppKit posts for gestures and not for
+// keys, and `gesture` adds exactly those.
+//
+// usleep rather than the run loop, so both variants present the same elapsed
+// time between bounds changes and are therefore judged at the same speed. The
+// bounds notification is posted synchronously by -scrollToPoint:, so nothing
+// here needs the run loop to run.
+static void DriveScroll(PVWindowController *wc, NSScrollView *sv,
+                        BOOL gesture, CGFloat step, useconds_t gapUs, int steps,
+                        int warmup, NSUInteger *outFulls, NSUInteger *outPreviews)
+{
+    NSClipView *clip = [sv contentView];
+
+    // Both variants start from rest with no speed history, which is what
+    // -willStartLiveScroll: does for a gesture. Stated for the keyboard variant
+    // too, or the comparison would be between a fresh gesture and whatever the
+    // previous phase of the test left behind.
+    [wc setValue:[NSNumber numberWithDouble:0.0] forKey:@"_scrollSpeed"];
+    [wc setValue:[NSNumber numberWithDouble:0.0] forKey:@"_lastScrollTime"];
+
+    if (gesture)
+        [[NSNotificationCenter defaultCenter]
+            postNotificationName:NSScrollViewWillStartLiveScrollNotification object:sv];
+
+    // `warmup` moves happen before the counters are armed.
+    //
+    // Speed is computed from the gap between two bounds changes, so the FIRST
+    // change of any movement carries no speed measurement at all, and the policy
+    // renders when it has no evidence -- deliberately, and documented in
+    // PVShouldRenderWhileMoving. A gesture is exempt from that one event because
+    // AppKit says a scroll is beginning before it begins; the keyboard has no
+    // such announcement, and nothing can invent one from a single key press that
+    // is genuinely indistinguishable from a deliberate page-down.
+    //
+    // That one event is the whole of the difference between the devices. With
+    // warmup 0 it is included and the counts differ by it; with warmup 1 the
+    // comparison is between two movements that both have a speed, which is where
+    // the claim "one path, one policy" is either true or false.
+    PVFullRequestCount = 0; PVPreviewRequestCount = 0;
+
+    int i;
+    for (i = 0; i < steps; i++) {
+        if (i == warmup) {
+            PVFullRequestCount = 0; PVPreviewRequestCount = 0;
+            PVCountRequests = YES;
+        }
+        NSRect vis = [clip documentVisibleRect];
+        CGFloat maxY = NSHeight([[sv documentView] frame]) - NSHeight(vis);
+        CGFloat y = NSMinY(vis) + step;
+        if (y > maxY) y = maxY;
+        if (y < 0) y = 0;
+        [clip scrollToPoint:NSMakePoint(NSMinX(vis), y)];
+        [sv reflectScrolledClipView:clip];
+        if (gapUs) usleep(gapUs);
+    }
+
+    PVCountRequests = NO;
+    if (outFulls)    *outFulls    = PVFullRequestCount;
+    if (outPreviews) *outPreviews = PVPreviewRequestCount;
+
+    if (gesture)
+        [[NSNotificationCenter defaultCenter]
+            postNotificationName:NSScrollViewDidEndLiveScrollNotification object:sv];
+}
+
 static void Snap(NSWindow *win, NSString *path)
 {
     NSView *v = [win contentView];
@@ -152,6 +250,24 @@ int main(int argc, const char *argv[])
         [NSApplication sharedApplication];
         PVInstallRequestCounter();
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+
+        // Pinned to battery for the whole suite, and this is load-bearing
+        // rather than tidy.
+        //
+        // Almost everything below asserts the scheduler's cautious behaviour --
+        // no full-resolution bitmaps while the document moves, prefetch of one
+        // page, the motion gate reporting what it withheld. That is the battery
+        // policy. On mains power PVRenderPolicyFor deliberately opens the motion
+        // gate, so on a desktop, or on a laptop that happens to be charging,
+        // those assertions would fail for a reason that is not a regression --
+        // and, far worse, would pass or fail depending on where the machine was
+        // plugged in when the suite ran. A gate whose verdict depends on that is
+        // not a gate.
+        //
+        // The AC branch is not skipped: TestPowerAwareScheduling below turns it
+        // on explicitly, asserts what it changes, and turns it back off. This is
+        // the same reason Tools/showdown.sh pins -PVPowerState battery.
+        PVSetPowerSourceOverride(PVPowerBattery, YES);
 
         NSURL *url = [NSURL fileURLWithPath:pdf];
 
@@ -434,6 +550,35 @@ int main(int argc, const char *argv[])
             OK([tc entryCount] == 0,
                "a thumbnail delivered after the sidebar closed is not stored");
             OK([tc byteCount] == 0, "no thumbnail bytes are held once the sidebar is away");
+        }
+
+        // The strip rebuilds its wanted set only when the visible range changes
+        // -- the same early-out -clipBoundsChanged: has for the page view, and
+        // worth it for the same reason: dragging the strip posts a bounds
+        // notification per frame, and an identical range gives an identical
+        // answer.
+        //
+        // The failure it can cause is the one pinned here. -hideSidebar empties
+        // the thumbnail cache, and reopening the strip at the page it was closed
+        // on produces the identical visible range -- so an early-out that
+        // remembered that range across the hide would recognise it, decline to
+        // ask, and leave a sidebar of empty boxes until something else moved it.
+        // Driven through the real show/hide rather than by reading the flag,
+        // because the flag being right is not the claim; the thumbnails coming
+        // back is.
+        printf("\n[5c] the thumbnail early-out is reset when the cache is emptied\n");
+        {
+            PVImageCache *tc = [wc valueForKey:@"_thumbCache"];
+            [wc showSidebar];
+            OK(PumpUntil(^{ return (BOOL)([tc entryCount] > 0); }, 20.0),
+               "reopening the sidebar renders thumbnails");
+            NSUInteger firstFill = [tc entryCount];
+            [wc hideSidebar];
+            OK([tc entryCount] == 0, "hiding it empties the cache again");
+            [wc showSidebar];
+            OK(PumpUntil(^{ return (BOOL)([tc entryCount] >= firstFill); }, 20.0),
+               "reopening at the same page refills it: the early-out is not sticky");
+            [wc hideSidebar];
         }
 
         // A page CoreGraphics will not rasterise never reaches the cache, so
@@ -724,6 +869,452 @@ int main(int argc, const char *argv[])
                "...and none of that involved a live-scroll notification");
         }
 
+        // The keep-test applied to an arriving bitmap, which is the other half
+        // of what the wanted-set asked for and until now did not match it.
+        //
+        // Prefetch only ever looks forward along _lastDirection. The keep-test
+        // was symmetric, so a full bitmap arriving for the page one BEHIND a
+        // moving viewport was stored -- ~28 MB in the profiling window, for a
+        // page nothing had asked about and that already has a preview. The two
+        // now agree: PV_FULL_PREFETCH_PAGES ahead, nothing behind.
+        //
+        // Driven by handing the controller a delivery directly, because that is
+        // the decision under test. Waiting for the real queue to produce a
+        // bitmap for a page outside the visible range would be testing the
+        // prefetch policy instead, and would be timing-dependent.
+        printf("\n[5g3] an arriving full bitmap is kept ahead of the viewport, not behind it\n");
+        {
+            PVRenderQueue *pq     = [wc valueForKey:@"_pageQueue"];
+            PVImageCache  *pcache = [wc valueForKey:@"_pageCache"];
+
+            [wc goToPageNumber:20];
+            PumpUntil(^{ return [pq isIdle]; }, 60.0);
+            [wc updateVisibleContent];          // establishes _lastRequestRange
+
+            NSRange vis = [[wc valueForKey:@"_lastRequestRange"] rangeValue];
+            NSInteger behind = (NSInteger)vis.location - 1;
+            NSInteger ahead  = (NSInteger)NSMaxRange(vis);
+            OK(behind >= 0 && ahead < (NSInteger)[[wc valueForKey:@"_source"] pageCount],
+               "the probe has a page on each side of the visible range to test with");
+
+            // One small synthetic bitmap, delivered as though it were a full
+            // page. Size does not matter to the keep-test; only the page index
+            // and the direction of travel do.
+            CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+            CGContextRef bc = CGBitmapContextCreate(NULL, 32, 32, 8, 0, cs,
+                (CGBitmapInfo)kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Host);
+            CGColorSpaceRelease(cs);
+            CGImageRef img = bc ? CGBitmapContextCreateImage(bc) : NULL;
+            if (bc) CGContextRelease(bc);
+            CGSize px = CGSizeMake(32, 32);
+
+            if (!img) {
+                OK(NO, "could not build the synthetic bitmap for the delivery probe");
+            } else {
+                // Travelling forwards.
+                [wc setValue:[NSNumber numberWithBool:YES] forKey:@"_hasMovedViewport"];
+                [wc setValue:[NSNumber numberWithInt:1]    forKey:@"_lastDirection"];
+
+                [pcache removeAll];
+                [wc renderQueue:pq didRenderPage:(NSUInteger)ahead image:img
+                      pixelSize:px preview:NO];
+                OK([pcache fullImageForPage:(NSUInteger)ahead pixelSize:px] != NULL,
+                   "forwards: the page ahead of the viewport is kept");
+
+                [pcache removeAll];
+                [wc renderQueue:pq didRenderPage:(NSUInteger)behind image:img
+                      pixelSize:px preview:NO];
+                OK([pcache fullImageForPage:(NSUInteger)behind pixelSize:px] == NULL,
+                   "forwards: the page behind it is dropped, not stored");
+
+                // A preview for the same trailing page is still kept. This is
+                // the thing that makes scrolling back instant, and it is ~1/9
+                // the pixels, so it is not what the memory work is aimed at.
+                [pcache removeAll];
+                [wc renderQueue:pq didRenderPage:(NSUInteger)behind image:img
+                      pixelSize:px preview:YES];
+                OK([pcache hasPreviewForPage:(NSUInteger)behind],
+                   "...but its preview is kept: preview retention stays symmetric");
+
+                // Travelling backwards: the window flips with the direction.
+                [wc setValue:[NSNumber numberWithInt:-1] forKey:@"_lastDirection"];
+
+                [pcache removeAll];
+                [wc renderQueue:pq didRenderPage:(NSUInteger)behind image:img
+                      pixelSize:px preview:NO];
+                OK([pcache fullImageForPage:(NSUInteger)behind pixelSize:px] != NULL,
+                   "backwards: the window flips and the page above is kept");
+
+                [pcache removeAll];
+                [wc renderQueue:pq didRenderPage:(NSUInteger)ahead image:img
+                      pixelSize:px preview:NO];
+                OK([pcache fullImageForPage:(NSUInteger)ahead pixelSize:px] == NULL,
+                   "backwards: the page below is now the trailing one and is dropped");
+
+                // Before the viewport has ever moved there is no direction to
+                // widen along, and none is invented: the window is the visible
+                // range exactly, which is also all the wanted-set asks for.
+                [wc setValue:[NSNumber numberWithBool:NO] forKey:@"_hasMovedViewport"];
+                [wc setValue:[NSNumber numberWithInt:1]   forKey:@"_lastDirection"];
+                [pcache removeAll];
+                [wc renderQueue:pq didRenderPage:(NSUInteger)ahead image:img
+                      pixelSize:px preview:NO];
+                OK([pcache fullImageForPage:(NSUInteger)ahead pixelSize:px] == NULL,
+                   "before the first movement the window is the visible range and nothing more");
+
+                [pcache removeAll];
+                [wc renderQueue:pq didRenderPage:vis.location image:img
+                      pixelSize:px preview:NO];
+                OK([pcache fullImageForPage:vis.location pixelSize:px] != NULL,
+                   "...and a visible page is always kept, in every direction");
+
+                CGImageRelease(img);
+                [wc setValue:[NSNumber numberWithBool:YES] forKey:@"_hasMovedViewport"];
+            }
+        }
+
+        // The cost of the change above, measured rather than assumed.
+        //
+        // Dropping the trailing page's full bitmap means a scroll-back
+        // re-renders it. ENGINEERING.md section 4.3 says that is the price
+        // and says to measure it; this is the measurement. Page forward N, page
+        // back over the same N, and report what the scheduler asked for and what
+        // the process actually spent on each leg.
+        //
+        // The bound asserted is the theoretical worst case of the change: at
+        // most one extra full-resolution render per page revisited. Anything
+        // above that is not the trailing page being re-rendered, it is the cache
+        // thrashing, which is a different and much more expensive failure.
+        printf("\n[5g4] scroll-back probe: what the directional keep-window costs\n");
+        {
+            PVRenderQueue *pq     = [wc valueForKey:@"_pageQueue"];
+            PVImageCache  *pcache = [wc valueForKey:@"_pageCache"];
+            const NSInteger kSteps = 8;
+            const NSInteger kStart = 10;
+
+            [pcache removeAll];
+            [wc goToPageNumber:kStart];
+            PumpUntil(^{ return [pq isIdle]; }, 60.0);
+
+            struct rusage ru;
+            double cpu0 = 0, cpu1 = 0, cpu2 = 0;
+            if (getrusage(RUSAGE_SELF, &ru) == 0)
+                cpu0 = (double)ru.ru_utime.tv_sec + (double)ru.ru_utime.tv_usec / 1.0e6 +
+                       (double)ru.ru_stime.tv_sec + (double)ru.ru_stime.tv_usec / 1.0e6;
+
+            PVFullRequestCount = 0; PVPreviewRequestCount = 0; PVCountRequests = YES;
+
+            // A settle after every jump, not just an idle queue. A page jump
+            // moves the viewport, which registers as motion, which closes the
+            // full-resolution gate -- so the queue goes idle at once having
+            // asked for nothing, and a probe that only waited for idle would
+            // measure a scroll rather than a reader. PV_SETTLE_SECONDS past the
+            // last movement the sharp pass is asked for, and that pass is the
+            // work this probe exists to count.
+            NSInteger step;
+            for (step = 1; step <= kSteps; step++) {
+                [wc goToPageNumber:kStart + step];
+                Pump(PV_SETTLE_SECONDS + PV_SPEED_FRESH_SECONDS);
+                PumpUntil(^{ return [pq isIdle]; }, 60.0);
+            }
+            NSUInteger fullsForward = PVFullRequestCount;
+            if (getrusage(RUSAGE_SELF, &ru) == 0)
+                cpu1 = (double)ru.ru_utime.tv_sec + (double)ru.ru_utime.tv_usec / 1.0e6 +
+                       (double)ru.ru_stime.tv_sec + (double)ru.ru_stime.tv_usec / 1.0e6;
+
+            PVFullRequestCount = 0;
+            for (step = kSteps - 1; step >= 0; step--) {
+                [wc goToPageNumber:kStart + step];
+                Pump(PV_SETTLE_SECONDS + PV_SPEED_FRESH_SECONDS);
+                PumpUntil(^{ return [pq isIdle]; }, 60.0);
+            }
+            NSUInteger fullsBack = PVFullRequestCount;
+            PVCountRequests = NO;
+            if (getrusage(RUSAGE_SELF, &ru) == 0)
+                cpu2 = (double)ru.ru_utime.tv_sec + (double)ru.ru_utime.tv_usec / 1.0e6 +
+                       (double)ru.ru_stime.tv_sec + (double)ru.ru_stime.tv_usec / 1.0e6;
+
+            printf("  forward %ld pages : %lu full requests, %.2f s CPU\n",
+                   (long)kSteps, (unsigned long)fullsForward, cpu1 - cpu0);
+            printf("  back    %ld pages : %lu full requests, %.2f s CPU\n",
+                   (long)kSteps, (unsigned long)fullsBack, cpu2 - cpu1);
+            printf("  scroll-back cost : %+ld full requests, %+.2f s CPU\n",
+                   (long)fullsBack - (long)fullsForward, (cpu2 - cpu1) - (cpu1 - cpu0));
+            printf("  (this host is not the arbiter; the ratio is the point, not the seconds)\n");
+
+            OK(fullsForward > 0, "the forward leg asked for full-resolution bitmaps at all");
+            char msg[200];
+            snprintf(msg, sizeof msg,
+                     "the return leg costs at most one extra full render per page "
+                     "(%lu back vs %lu forward, bound %ld)",
+                     (unsigned long)fullsBack, (unsigned long)fullsForward,
+                     (long)fullsForward + kSteps);
+            OK((NSInteger)fullsBack <= (NSInteger)fullsForward + kSteps, msg);
+        }
+
+        // Device parity, measured rather than argued.
+        //
+        // The claim under test is that trackpad/wheel scrolling and keyboard
+        // scrolling reach the render scheduler through one path and are decided
+        // by one policy. [5g2] shows the policy is device-independent; this
+        // shows the two devices actually produce the same requests, by driving
+        // the same viewport at the same speed with and without the live-scroll
+        // notifications that are the only thing AppKit does differently for a
+        // gesture.
+        //
+        // Written to fail if anyone reintroduces a device test. The original bug
+        // was exactly that -- `!_liveScrolling && !_liveZooming` guarding the
+        // expensive half of the work -- and it would show up here as a keyboard
+        // count that is not the gesture count.
+        printf("\n[5g5] trackpad and keyboard reach the scheduler through one path\n");
+        {
+            PVRenderQueue *pq     = [wc valueForKey:@"_pageQueue"];
+            PVImageCache  *pcache = [wc valueForKey:@"_pageCache"];
+            NSScrollView  *sv     = [wc valueForKey:@"_scrollView"];
+
+            [wc goToPageNumber:8];
+            PumpUntil(^{ return [pq isIdle]; }, 60.0);
+            Pump(PV_SETTLE_SECONDS + PV_SPEED_FRESH_SECONDS);
+            PumpUntil(^{ return [pq isIdle]; }, 60.0);
+
+            // Fast: 300 pt every 5 ms is 60,000 pt/s, a hard flick. Once either
+            // device is moving at a measured speed, neither may ask for a
+            // full-resolution bitmap and neither may ask for a preview of a page
+            // that will be gone before it arrives.
+            NSUInteger kbFull = 0, kbPrev = 0, tpFull = 0, tpPrev = 0;
+
+            [pcache removeAll];
+            DriveScroll(wc, sv, NO,  300, 5000, 12, 1, &kbFull, &kbPrev);
+            [pcache removeAll];
+            DriveScroll(wc, sv, YES, 300, 5000, 12, 1, &tpFull, &tpPrev);
+
+            printf("  flick (~60,000 pt/s), once moving: keyboard %lu full / %lu preview,"
+                   "  trackpad %lu full / %lu preview\n",
+                   (unsigned long)kbFull, (unsigned long)kbPrev,
+                   (unsigned long)tpFull, (unsigned long)tpPrev);
+
+            OK(kbFull == 0, "flick, keyboard: no full-resolution bitmap is asked for");
+            OK(tpFull == 0, "flick, trackpad: no full-resolution bitmap is asked for");
+            OK(kbFull == tpFull && kbPrev == tpPrev,
+               "flick: the two devices ask for exactly the same set");
+
+            // The first bounds change of a movement, which is the one place the
+            // two devices genuinely differ and the reason the comparison above
+            // skips it.
+            //
+            // A gesture is announced before it starts, so its first event is
+            // already known to be a scroll. A key press is not announced and the
+            // first one is indistinguishable from a deliberate single page-down,
+            // so the policy does what it does everywhere else with no evidence:
+            // it renders. That costs one wanted-set rebuild per scroll episode --
+            // per episode, not per key, because a gap under half a second keeps
+            // the speed measurement alive across the whole of a held key.
+            //
+            // Recorded rather than removed. Removing it means either rendering
+            // nothing on a single deliberate page-down, which is the case
+            // `read` is made of and where sharp pages are the whole point, or
+            // inferring a scroll from key auto-repeat -- a behaviour change that
+            // moves CPU and must be judged on the Mavericks machine, not here.
+            NSUInteger kbFirst = 0, tpFirst = 0, kbFirstPrev = 0, tpFirstPrev = 0;
+            [pcache removeAll];
+            DriveScroll(wc, sv, NO,  300, 5000, 12, 0, &kbFirst, &kbFirstPrev);
+            [pcache removeAll];
+            DriveScroll(wc, sv, YES, 300, 5000, 12, 0, &tpFirst, &tpFirstPrev);
+            printf("  flick including its first event : keyboard %lu full,"
+                   "  trackpad %lu full  (difference is the announced-gesture bit)\n",
+                   (unsigned long)kbFirst, (unsigned long)tpFirst);
+            OK(tpFirst == 0,
+               "an announced gesture asks for nothing even on its first event");
+            OK(kbFirst <= 2,
+               "an unannounced scroll costs at most one rebuild's worth of full requests");
+
+            // The motion gate's own counter. Before this key existed the gate
+            // appeared in no column of any profile: `scroll` reported zero
+            // suppressed requests while the gate was suppressing everything,
+            // because the PVStatAdd it would have run sits inside the branch the
+            // gate closes. Both flicks above ran with the gate shut, so the
+            // counter must have moved -- and the dwell counter must not have,
+            // since at 60,000 pt/s the gate closes before any page is dwell-tested.
+            double motion = PVStatValue(PVStatMotionSuppressed);
+            printf("  motion-gate suppressions counted so far: %.0f "
+                   "(dwell: %.0f)\n", motion, PVStatValue(PVStatRequestsSuppressed));
+            OK(PVStatsEnabled(), "the census is enabled for this suite");
+            OK(motion > 0,
+               "the motion gate now reports the full renders it withheld");
+
+            // Slow: 8 pt every 40 ms is 200 pt/s, a deliberate read-along drag.
+            // Every page survives the dwell test at that speed, so the per-page
+            // policy says "render" for both devices -- and here the two DO
+            // diverge, because -viewportIsMoving short-circuits on the gesture
+            // flag before it ever consults the speed.
+            //
+            // Reported, not asserted equal, because it is a deliberate trade and
+            // not the bug: the flag covers the first bounds change of a flick,
+            // where no speed has been measured yet and the alternative is
+            // rasterising whole pages at 60,000 pt/s. What it costs is that a
+            // slow trackpad drag holds the sharp pass until the fingers lift,
+            // where a slow keyboard scroll gets it PV_SETTLE_SECONDS after the
+            // last key. Both end in the same call; only the trigger differs.
+            // Counted over the whole episode, first event included, because the
+            // question here is what a slow movement costs in total on each
+            // device rather than whether the two agree once under way.
+            [pcache removeAll];
+            DriveScroll(wc, sv, NO,  8, 40000, 6, 0, &kbFull, &kbPrev);
+            [pcache removeAll];
+            DriveScroll(wc, sv, YES, 8, 40000, 6, 0, &tpFull, &tpPrev);
+
+            printf("  drag  (~200 pt/s), whole episode : keyboard %lu full / %lu preview,"
+                   "  trackpad %lu full / %lu preview\n",
+                   (unsigned long)kbFull, (unsigned long)kbPrev,
+                   (unsigned long)tpFull, (unsigned long)tpPrev);
+            printf("  (the announced gesture makes the trackpad the more conservative\n"
+                   "   of the two at every speed; it never makes it the less)\n");
+            OK(tpFull <= kbFull,
+               "a gesture never asks for MORE full bitmaps than the keyboard at the same speed");
+
+            // The end of the gesture is the settle, and it is the same settle.
+            // -didEndLiveScroll: and -settleFired: both zero the speed, clear
+            // _haveRequestState and call -updateVisibleContent; this asserts the
+            // outcome rather than the identity of the two methods.
+            [pcache removeAll];
+            PVFullRequestCount = 0; PVCountRequests = YES;
+            [[NSNotificationCenter defaultCenter]
+                postNotificationName:NSScrollViewDidEndLiveScrollNotification object:sv];
+            NSUInteger afterGestureEnd = PVFullRequestCount;
+
+            [pcache removeAll];
+            PVFullRequestCount = 0;
+            [wc setValue:[NSNumber numberWithDouble:0.0] forKey:@"_scrollSpeed"];
+            [wc setValue:[NSNumber numberWithDouble:0.0] forKey:@"_lastScrollTime"];
+            [wc setValue:[NSNumber numberWithBool:NO]    forKey:@"_haveRequestState"];
+            [wc updateVisibleContent];
+            NSUInteger afterKeyboardSettle = PVFullRequestCount;
+            PVCountRequests = NO;
+
+            printf("  settle: gesture end asks for %lu full, keyboard settle asks for %lu\n",
+                   (unsigned long)afterGestureEnd, (unsigned long)afterKeyboardSettle);
+            OK(afterGestureEnd > 0 && afterGestureEnd == afterKeyboardSettle,
+               "both devices end their movement in the same sharp pass");
+            OK(![[wc valueForKey:@"_liveScrolling"] boolValue],
+               "the gesture flag is clear once the gesture has ended");
+
+            PumpUntil(^{ return [pq isIdle]; }, 90.0);
+        }
+
+        // The AC branch, driven through the same real controller as everything
+        // above, because a policy that is only ever exercised as a pure function
+        // is a policy nobody has run.
+        //
+        // Two claims, and the second matters more than the first. On mains power
+        // the blanket motion gate is replaced by a per-page cost question, so a
+        // slow deliberate drag does ask for sharp pages where on battery it asks
+        // for none. But the cost question still has to refuse a genuine flick --
+        // if plugging in a laptop turned the flick pathology back on, this whole
+        // branch would be a regression wearing a feature's clothes.
+        printf("\n[5g6] on mains power the motion gate becomes a per-page cost question\n");
+        {
+            PVRenderQueue *pq     = [wc valueForKey:@"_pageQueue"];
+            PVImageCache  *pcache = [wc valueForKey:@"_pageCache"];
+            NSScrollView  *sv     = [wc valueForKey:@"_scrollView"];
+            PVCostModel   *cost   = [pq costModel];
+
+            [wc goToPageNumber:8];
+            PumpUntil(^{ return [pq isIdle]; }, 60.0);
+            Pump(PV_SETTLE_SECONDS + PV_SPEED_FRESH_SECONDS);
+            PumpUntil(^{ return [pq isIdle]; }, 60.0);
+
+            // The model has to have something to say before its effect can be
+            // asserted, and by this point in the suite the document has been
+            // rendered many times over. Checked rather than assumed: if it were
+            // empty the AC branch would fall back to the constant and the test
+            // below would be measuring nothing.
+            printf("  cost model: %lu full samples at %.1f ms/Mpx, "
+                   "%lu preview samples at %.1f ms/Mpx\n",
+                   (unsigned long)[cost sampleCountForPreview:NO],
+                   [cost msPerMegapixelForPreview:NO],
+                   (unsigned long)[cost sampleCountForPreview:YES],
+                   [cost msPerMegapixelForPreview:YES]);
+            OK([cost sampleCountForPreview:NO] >= PV_COST_MIN_SAMPLES,
+               "the cost model has measured this document by now");
+
+            NSUInteger acFull = 0, acPrev = 0, batFull = 0, batPrev = 0;
+
+            // A slow deliberate drag, the same one [5g5] uses, on each branch.
+            //
+            // Counted over the whole episode -- warmup 0 -- and that is not a
+            // detail. Six 8 pt steps move the viewport 48 pt, which does not
+            // change the visible page range, so -clipBoundsChanged:'s early-out
+            // correctly declines to rebuild the wanted set for every event after
+            // the first. Skipping the first event would leave nothing to count
+            // on either branch and the test would pass by measuring silence.
+            // A gesture is announced before it starts, so `moving` is already
+            // true on that first event and the battery branch is still being
+            // asked the question it refuses.
+            // _haveRequestState is cleared before each drag, symmetrically.
+            //
+            // Without it the second of the two runs measures the early-out
+            // rather than the policy: -clipBoundsChanged: rebuilds the wanted
+            // set only when the page range, the direction or the motion state
+            // has changed, and two consecutive slow drags over 48 pt change none
+            // of the three -- so the second one would record zero requests on
+            // whichever branch happened to go second and the comparison would be
+            // between a policy and an optimisation. This is the same thing
+            // -settleFired: does, for the same stated reason.
+            PVSetPowerSourceOverride(PVPowerBattery, YES);
+            [pcache removeAll];
+            [wc setValue:[NSNumber numberWithBool:NO] forKey:@"_haveRequestState"];
+            DriveScroll(wc, sv, YES, 8, 40000, 6, 0, &batFull, &batPrev);
+            PumpUntil(^{ return [pq isIdle]; }, 90.0);
+
+            PVSetPowerSourceOverride(PVPowerAC, YES);
+            [pcache removeAll];
+            [wc setValue:[NSNumber numberWithBool:NO] forKey:@"_haveRequestState"];
+            DriveScroll(wc, sv, YES, 8, 40000, 6, 0, &acFull, &acPrev);
+            PumpUntil(^{ return [pq isIdle]; }, 90.0);
+
+            printf("  slow drag (~200 pt/s): battery %lu full / %lu preview,"
+                   "  AC %lu full / %lu preview\n",
+                   (unsigned long)batFull, (unsigned long)batPrev,
+                   (unsigned long)acFull,  (unsigned long)acPrev);
+            OK(batFull == 0, "battery: a slow gesture drag asks for no sharp pages");
+            OK(acFull > 0,   "AC: the same drag does ask for sharp pages");
+
+            // And the safety property, which must hold on every power source
+            // and on every machine. At 60,000 pt/s a page is on screen for
+            // roughly 20 ms, so no prediction and no power source can make
+            // rasterising it worth anything -- the dwell floor refuses it before
+            // the cost model is even consulted.
+            NSUInteger acFlick = 0, acFlickPrev = 0;
+            [pcache removeAll];
+            DriveScroll(wc, sv, YES, 300, 5000, 12, 1, &acFlick, &acFlickPrev);
+            PumpUntil(^{ return [pq isIdle]; }, 90.0);
+            printf("  flick (~60,000 pt/s) on AC: %lu full / %lu preview\n",
+                   (unsigned long)acFlick, (unsigned long)acFlickPrev);
+            OK(acFlick == 0,
+               "AC: a genuine flick still asks for no full-resolution bitmaps");
+
+            // Prefetch depth follows the policy, and the delivery keep-window
+            // has to agree with it. These two numbers describe one window from
+            // opposite ends; if they disagree the extra page is rasterised,
+            // dropped on delivery, and asked for again on the next event.
+            PVRenderPolicy acPolicy  = PVRenderPolicyFor(PVPowerAC, PVRamTierOfThisMachine(), 0);
+            PVRenderPolicy batPolicy = PVRenderPolicyFor(PVPowerBattery, PVRamTierOfThisMachine(), 0);
+            printf("  prefetch depth on this machine (tier %d): battery %lu, AC %lu\n",
+                   (int)PVRamTierOfThisMachine(),
+                   (unsigned long)batPolicy.fullPrefetchPages,
+                   (unsigned long)acPolicy.fullPrefetchPages);
+            OK(acPolicy.fullPrefetchPages >= batPolicy.fullPrefetchPages,
+               "AC never prefetches less than battery");
+            OK(PVRenderPolicyFitsCache(acPolicy, PVRamTierOfThisMachine()),
+               "this machine's AC prefetch depth fits its own cache budget");
+
+            // Back to battery for everything that follows, so the rest of the
+            // suite keeps asserting the policy it was written against.
+            PVSetPowerSourceOverride(PVPowerBattery, YES);
+            [pcache removeAll];
+            PumpUntil(^{ return [pq isIdle]; }, 90.0);
+        }
+
         printf("\n[5g] the page stays centred at every width, in every zoom mode\n");
         {
             PVPageView   *pv = [wc valueForKey:@"_pageView"];
@@ -834,7 +1425,14 @@ int main(int argc, const char *argv[])
             [wc pageViewWillMagnify:pv atPoint:NSMakePoint(300, 400)];
             OK([[wc valueForKey:@"_liveZooming"] boolValue], "a gesture is in progress");
 
-            [pv endGestureWithEvent:nil];          // the Mavericks route
+            // Deliberately no event: -endGestureWithEvent: must not read one,
+            // because the only way to reach it in a test is without one. The
+            // current SDK annotates the parameter nonnull, so passing a literal
+            // nil warns; a variable says the same thing without the diagnostic,
+            // and the point of the check is that the implementation copes.
+            NSEvent *noEvent = nil;
+
+            [pv endGestureWithEvent:noEvent];      // the Mavericks route
             OK(![[wc valueForKey:@"_liveZooming"] boolValue],
                "-endGestureWithEvent: ends the gesture, which is how Mavericks ends it");
             OK(![[pv valueForKey:@"_magnifying"] boolValue],
@@ -843,7 +1441,7 @@ int main(int argc, const char *argv[])
             // A second end -- a system that sends both a phase and a bracket --
             // must not report the gesture twice.
             [wc setValue:[NSNumber numberWithBool:YES] forKey:@"_liveZooming"];
-            [pv endGestureWithEvent:nil];
+            [pv endGestureWithEvent:noEvent];
             OK([[wc valueForKey:@"_liveZooming"] boolValue],
                "a second end is ignored rather than reported again");
             [wc setValue:[NSNumber numberWithBool:NO] forKey:@"_liveZooming"];

@@ -1,15 +1,26 @@
-# Build products
+# Everything here is produced by `make` from something that IS tracked.
+# Nothing in this file is a source of truth; a fresh clone plus `make` recreates
+# all of it. Anything tracked that the Makefile also writes would drift.
+
+# Object files and the linked binary
 build/
-Postview.app/Contents/MacOS/
-Postview.app/Contents/Resources/*.icns
 *.o
 *.dSYM/
+
+# The application bundle. Only the sources it is assembled from are tracked:
+# Resources/Info.plist, Resources/TB_*.pdf and the icon.
+Postview.app/
+
+# The double-clickable harnesses, generated from Tools/*.sh by `make`.
+Postview-Benchmark.command
+Postview-Profile.command
+Postview-Showdown.command
 
 # Distributables
 Postview.zip
 dist/
 
-# Benchmark output
+# Benchmark and profile output
 *.tsv
 Benchmarks/
 

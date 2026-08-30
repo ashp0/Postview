@@ -530,6 +530,51 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
                                      [self secondsPageStaysVisible:page]);
 }
 
+// The whole of the machine-and-power-dependent behaviour, fetched once.
+//
+// Everything a "High Performance" or "Low Memory" menu would have contained is
+// here instead, decided from three things the program can read and a user
+// cannot reliably state: what the machine has, what it is plugged into, and
+// whether the kernel is complaining. ENGINEERING.md §4.4 has the argument
+// for why that is better than the menu; the short form is that every position
+// of such a menu is worse than the automatic answer, so the control would only
+// move blame.
+//
+// Cheap enough to ask per pass. PVCurrentPowerSource caches for five seconds and
+// PVRamTierOfThisMachine resolves once, so this is a handful of comparisons.
+- (PVRenderPolicy)currentRenderPolicy
+{
+    return PVRenderPolicyFor(PVCurrentPowerSource(),
+                             PVRamTierOfThisMachine(),
+                             _pressureReports);
+}
+
+// Is this specific bitmap worth asking for, given how the viewport is moving
+// and what this document has been measured to cost?
+//
+// Takes the dwell and the speed age rather than reading them, because one pass
+// of the wanted-set builder asks about several bitmaps and they must all be
+// decided against the same instant. Two reads either side of a clock tick would
+// let a page's preview and its full-resolution bitmap disagree about whether
+// the document is moving, which is a wanted set that contradicts itself.
+//
+// The prediction is per bitmap and that is the point. A preview is a ninth the
+// pixels of a full page but re-walks the whole content stream, so on text it is
+// nothing like a ninth of the cost -- and the two are estimated separately for
+// exactly that reason (PVCostModel.h, failure 2). Asking one question for both
+// is what the old single dwell constant was doing.
+- (BOOL)bitmapSurvivesMotion:(CGSize)px
+                     preview:(BOOL)preview
+                       dwell:(double)dwell
+                         age:(double)age
+                      policy:(PVRenderPolicy)policy
+{
+    double predicted = [_pageQueue predictedSecondsForPixels:px preview:preview];
+    return PVShouldRenderWhileMovingCost(_scrollSpeed, age, dwell, predicted,
+                                         policy.dwellSafetyFactor,
+                                         policy.minDwellSeconds);
+}
+
 // Is the viewport in motion right now? The `Scrolling` half of the scheduler's
 // two states; `Settled` is simply its negation.
 //
@@ -638,21 +683,42 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
     // whether the document is moving.
     BOOL moving = [self viewportIsMoving];
 
+    // The rest of the pass's constants, likewise read exactly once.
+    //
+    // `age` in particular: -scrollSpeedAge reads the clock, and reading it per
+    // page would let the first page of a pass be decided against a fresh
+    // measurement and the last against a stale one, in the same wanted set,
+    // from one event.
+    PVRenderPolicy policy = [self currentRenderPolicy];
+    double age = [self scrollSpeedAge];
+
+    // May a full-resolution bitmap be asked for at all this pass?
+    //
+    // On battery this is the motion gate exactly as it was: nothing sharp while
+    // the document moves, because the common case is a flick past pages nobody
+    // will read. On mains power the blanket refusal is replaced by the per-page
+    // cost test below -- a page that takes 11 ms is not worth withholding from
+    // a scroll that will last half a second, and on a desktop there is no
+    // battery for withholding it to save.
+    BOOL fullsAllowed = (!moving || policy.fullRendersWhileMoving) && [self wantsFullRenders];
+
     for (i = range.location; i < NSMaxRange(range) && i < pageCount; i++) {
         if ([self pageIsUnrenderable:i]) continue;
         BOOL cold = (i == _expressPage);
 
-        // Asked once per page and used for both bitmaps below. Two calls would
-        // repeat the geometry and, more importantly, could answer differently
-        // either side of a clock tick.
-        BOOL survives = [self pageSurvivesMotion:i];
+        // Read once per page and shared by both bitmaps below, for the same
+        // reason `age` is read once per pass: the geometry call is not free and,
+        // more importantly, two reads could straddle a clock tick.
+        double dwell  = [self secondsPageStaysVisible:i];
+        CGSize fullPx = [_pageView pixelSizeForPage:i];
+        CGSize prevPx = CGSizeMake(ceil(fullPx.width  / PV_PREVIEW_DIVISOR),
+                                   ceil(fullPx.height / PV_PREVIEW_DIVISOR));
 
         if (![_pageCache hasPreviewForPage:i]) {
-            if (survives) {
-                CGSize px = [_pageView pixelSizeForPage:i];
+            if ([self bitmapSurvivesMotion:prevPx preview:YES
+                                     dwell:dwell age:age policy:policy]) {
                 [reqs addObject:[PVRenderRequest page:i
-                    pixels:CGSizeMake(ceil(px.width / PV_PREVIEW_DIVISOR),
-                                      ceil(px.height / PV_PREVIEW_DIVISOR))
+                    pixels:prevPx
                     priority:PVPriorityVisiblePreview preview:YES express:cold]];
             } else {
                 PVStatAdd(PVStatRequestsSuppressed, 1);
@@ -671,22 +737,53 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
         // beside it correctly suppressed 323 and 47 requests respectively. The
         // throttle was working and reporting a healthy suppression rate for
         // the cheap half of the work while the expensive half walked past it.
-        if (!moving && [self wantsFullRenders]) {
-            CGSize px = [_pageView pixelSizeForPage:i];
-            if (![_pageCache fullImageForPage:i pixelSize:px]) {
-                if (survives) {
+        if (fullsAllowed) {
+            if (![_pageCache fullImageForPage:i pixelSize:fullPx]) {
+                if ([self bitmapSurvivesMotion:fullPx preview:NO
+                                         dwell:dwell age:age policy:policy]) {
                     // A promoted full render shares the top priority band with the
                     // previews so it sorts immediately behind its own page's
                     // preview, rather than behind every other page's preview.
                     // Without this the page being read went sharp last.
-                    [reqs addObject:[PVRenderRequest page:i pixels:px
+                    [reqs addObject:[PVRenderRequest page:i pixels:fullPx
                                                  priority:(cold ? PVPriorityVisiblePreview
                                                                 : PVPriorityVisibleFull)
                                                   preview:NO express:cold]];
+                    // A sharp page asked for while the document is still moving
+                    // is the cost model's other direction, and it only happens
+                    // on mains power. Counted separately from the renders that
+                    // were going to happen anyway, because a model that only
+                    // ever suppressed would be indistinguishable in the totals
+                    // from a tighter constant.
+                    if (moving) PVStatAdd(PVStatCostAdmitted, 1);
                 } else {
-                    PVStatAdd(PVStatRequestsSuppressed, 1);
+                    // Which counter this is depends on what actually refused it.
+                    // A page with plenty of dwell that is withheld anyway was
+                    // withheld because this document is expensive -- that is the
+                    // cost model, and folding it into the dwell counter would
+                    // hide the mechanism inside a number that predates it.
+                    if (dwell > policy.minDwellSeconds) PVStatAdd(PVStatCostSuppressed, 1);
+                    else                                PVStatAdd(PVStatRequestsSuppressed, 1);
                 }
             }
+        } else if (moving && PVStatsEnabled() && [self wantsFullRenders]) {
+            // The motion gate above is an outer branch, so when it is closed the
+            // whole full-resolution arm -- including the PVStatAdd inside it --
+            // is skipped, and the gate gets no credit for the bitmaps it stopped.
+            // That is why `scroll` reported zero suppressed requests while the
+            // gate was doing all of the suppressing: at 3000 pt/s a page is on
+            // screen for ~0.76 s, well above PV_MIN_VISIBLE_SECONDS, so the dwell
+            // test that owns the other counter correctly withheld nothing.
+            //
+            // Counted through the non-mutating query on purpose. -fullImageForPage:
+            // bumps the entry's LRU stamp, and a counter that reorders eviction
+            // during every scroll would be measuring a program that only exists
+            // while it is being measured.
+            //
+            // Behind PVStatsEnabled() so the geometry call costs nothing in the
+            // shipping default, where the census is off.
+            if (![_pageCache hasFullImageForPage:i pixelSize:[_pageView pixelSizeForPage:i]])
+                PVStatAdd(PVStatMotionSuppressed, 1);
         }
     }
 
@@ -717,12 +814,23 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
     NSUInteger k;
     for (k = 0; k < [near count]; k++) {
         NSUInteger p = (NSUInteger)[[near objectAtIndex:k] integerValue];
-        if (![_pageCache hasPreviewForPage:p] && [self worthRenderingDuringScroll:p]) {
-            CGSize px = [_pageView pixelSizeForPage:p];
+        if ([_pageCache hasPreviewForPage:p]) continue;
+        CGSize px     = [_pageView pixelSizeForPage:p];
+        CGSize prevPx = CGSizeMake(ceil(px.width  / PV_PREVIEW_DIVISOR),
+                                   ceil(px.height / PV_PREVIEW_DIVISOR));
+        // The preview's own predicted cost, not the page's. This used to go
+        // through -worthRenderingDuringScroll:, which asks the device-independent
+        // dwell question and knows nothing about what the bitmap costs -- fine
+        // when the answer was a constant, and wrong now that a preview of a text
+        // page and a preview of a vector page differ by an order of magnitude.
+        if ([self bitmapSurvivesMotion:prevPx preview:YES
+                                 dwell:[self secondsPageStaysVisible:p]
+                                   age:age policy:policy]) {
             [reqs addObject:[PVRenderRequest page:p
-                pixels:CGSizeMake(ceil(px.width / PV_PREVIEW_DIVISOR),
-                                  ceil(px.height / PV_PREVIEW_DIVISOR))
+                pixels:prevPx
                 priority:PVPriorityNearPreview preview:YES]];
+        } else {
+            PVStatAdd(PVStatRequestsSuppressed, 1);
         }
     }
     // Prefetching full-resolution bitmaps is the first thing to give up when
@@ -745,16 +853,53 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
     // resolution in the direction of a scroll is the single most expensive
     // thing to be wrong about, because the pages being guessed at are exactly
     // the ones moving fastest.
-    if (!moving && _hasMovedViewport && [self wantsFullPrefetch]) {
-        NSUInteger limit = [near count];
-        if (limit > PV_FULL_PREFETCH_PAGES) limit = PV_FULL_PREFETCH_PAGES;
-        for (k = 0; k < limit; k++) {
+    // Depth now comes from the policy rather than straight from the constant.
+    // On battery it *is* the constant; on mains power it is
+    // PV_AC_FULL_PREFETCH_PAGES, and PVRenderPolicyFor has already clamped it
+    // to what this machine's cache can actually hold, so a tier whose budget
+    // cannot take a second prefetched page never asks for one.
+    NSUInteger fullPrefetchLimit = [near count];
+    if (fullPrefetchLimit > policy.fullPrefetchPages) fullPrefetchLimit = policy.fullPrefetchPages;
+
+    if ((!moving || policy.fullRendersWhileMoving) && _hasMovedViewport &&
+        [self wantsFullPrefetch]) {
+        for (k = 0; k < fullPrefetchLimit; k++) {
             NSUInteger p = (NSUInteger)[[near objectAtIndex:k] integerValue];
             CGSize px = [_pageView pixelSizeForPage:p];
             if (![_pageCache fullImageForPage:p pixelSize:px]) {
+                // The per-page test is not optional here the way it was while
+                // this branch required `!moving`. Prefetching full-resolution
+                // pages in the direction of a fast scroll is the single most
+                // expensive thing in this program to be wrong about -- the pages
+                // being guessed at are the ones moving fastest -- so opening the
+                // branch to a moving viewport on AC has to bring the cost test
+                // in with it. During a genuine flick the dwell collapses and
+                // this refuses every one of them, on any power source.
+                if (moving && ![self bitmapSurvivesMotion:px preview:NO
+                                                    dwell:[self secondsPageStaysVisible:p]
+                                                      age:age policy:policy]) {
+                    PVStatAdd(PVStatCostSuppressed, 1);
+                    continue;
+                }
                 [reqs addObject:[PVRenderRequest page:p pixels:px
                                              priority:PVPriorityNearFull preview:NO]];
+                if (moving) PVStatAdd(PVStatCostAdmitted, 1);
             }
+        }
+    } else if (moving && PVStatsEnabled() && _hasMovedViewport && [self wantsFullPrefetch]) {
+        // The same blind spot as the visible arm, on the more expensive half:
+        // prefetching full-resolution pages in the direction of a fast scroll is
+        // the single costliest thing to be wrong about, and until now the gate
+        // that stops it appeared in no column of the profile at all.
+        //
+        // Only when `moving` is the condition that closed the branch. A prefetch
+        // skipped because the viewport has never moved, or because the kernel
+        // reported memory pressure, is a different mechanism and belongs to a
+        // different number.
+        for (k = 0; k < fullPrefetchLimit; k++) {
+            NSUInteger p = (NSUInteger)[[near objectAtIndex:k] integerValue];
+            if (![_pageCache hasFullImageForPage:p pixelSize:[_pageView pixelSizeForPage:p]])
+                PVStatAdd(PVStatMotionSuppressed, 1);
         }
     }
 
@@ -819,11 +964,28 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
 
 #pragma mark - Render results
 
+// The protocol's required delivery, kept so the controller still satisfies it,
+// and forwarding so there is exactly one implementation of the logic. Nothing
+// reaches this in the running app -- PVRenderQueue prefers the cost-carrying
+// method below whenever the delegate implements it -- but a delegate that
+// silently had two divergent delivery paths would be a bug waiting for whichever
+// call site was changed first.
 - (void)renderQueue:(PVRenderQueue *)queue
       didRenderPage:(NSUInteger)page
               image:(CGImageRef)image
           pixelSize:(CGSize)px
             preview:(BOOL)preview
+{
+    [self renderQueue:queue didRenderPage:page image:image pixelSize:px
+              preview:preview renderSeconds:0];
+}
+
+- (void)renderQueue:(PVRenderQueue *)queue
+      didRenderPage:(NSUInteger)page
+              image:(CGImageRef)image
+          pixelSize:(CGSize)px
+            preview:(BOOL)preview
+      renderSeconds:(double)renderSeconds
 {
     if (_closing || !image) return;
     if (queue == _pageQueue) {
@@ -840,15 +1002,41 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
         // past is simply never picked up) and keeping the result once it turns
         // out to be for somewhere the user no longer is.
         //
-        // The window is the visible range widened by the prefetch depth,
-        // because the pages prefetched in the direction of travel are outside
-        // the visible range by construction and are exactly the ones worth
-        // keeping. Previews are exempt: at ~1/9 the pixels they are what makes
-        // scrolling back instant, and dropping them would cost more renders
-        // than it saves bytes.
+        // The window is the visible range widened by the prefetch depth on the
+        // side the viewport is travelling towards, and by nothing at all behind
+        // it.
+        //
+        // It used to be widened symmetrically, which did not match what had been
+        // asked for. Prefetch only ever looks forward along _lastDirection, so
+        // the page one *behind* a moving viewport was never requested at full
+        // resolution -- yet an arriving bitmap for it was kept, and a full page
+        // bitmap is ~28 MB against a 96 MB budget. Paying that for a page nobody
+        // asked about is not a neutral choice: the bytes come out of the same
+        // budget the pages on screen are competing for.
+        //
+        // What the trailing page keeps is its preview, which is ~1/9 the pixels
+        // and is what makes scrolling back feel instant; preview retention stays
+        // symmetric for exactly that reason. Reversing direction re-renders one
+        // page at full resolution, which is the intended and measured cost.
+        //
+        // Zero on both sides until the viewport has actually moved. Before then
+        // there is no direction of travel to widen along, and -updateVisibleContent
+        // makes no full-resolution prefetch either, so the window is the visible
+        // range and nothing outside it was ever requested.
         if (!preview && _haveRequestState) {
-            NSInteger lo = (NSInteger)_lastRequestRange.location - PV_FULL_PREFETCH_PAGES;
-            NSInteger hi = (NSInteger)NSMaxRange(_lastRequestRange) - 1 + PV_FULL_PREFETCH_PAGES;
+            // The same depth the wanted set was built with, not the constant.
+            // These two numbers describe one window from opposite ends -- what
+            // was asked for, and what is kept when it arrives -- so a policy
+            // that prefetches two pages ahead while this kept only one would
+            // rasterise the second page, drop it on the doorstep, and be asked
+            // for it again on the next event. That is the most expensive
+            // possible way to be inconsistent.
+            NSInteger ahead = _hasMovedViewport
+                ? (NSInteger)[self currentRenderPolicy].fullPrefetchPages : 0;
+            NSInteger lo = (NSInteger)_lastRequestRange.location
+                         - ((_lastDirection >= 0) ? 0 : ahead);
+            NSInteger hi = (NSInteger)NSMaxRange(_lastRequestRange) - 1
+                         + ((_lastDirection >= 0) ? ahead : 0);
             if (lo < 0) lo = 0;
             // Not counted as a suppressed request. This bitmap was asked for
             // and was rasterised; the cost has already been paid. Counting it
@@ -865,8 +1053,13 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
                 return;
             }
         }
-        if (preview) [_pageCache setPreviewImage:image pixelSize:px forPage:page];
-        else         [_pageCache setFullImage:image pixelSize:px forPage:page];
+        // The measured cost goes into the cache with the bitmap, which is what
+        // lets eviction prefer the page that would be expensive to rebuild over
+        // the one that would be cheap, at identical bytes. See -evictExcept:.
+        if (preview) [_pageCache setPreviewImage:image pixelSize:px forPage:page
+                                   renderSeconds:renderSeconds];
+        else         [_pageCache setFullImage:image pixelSize:px forPage:page
+                                renderSeconds:renderSeconds];
         // The promotion has done its job the moment this page is sharp.
         if (!preview && page == _expressPage) _expressPage = NSNotFound;
         [_pageView setNeedsDisplayForPage:page];
@@ -877,7 +1070,8 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
         // until the sidebar was next opened -- which breaks the one promise
         // the on-demand sidebar makes, that it costs nothing when put away.
         if (!_sidebarVisible) return;
-        [_thumbCache setPreviewImage:image pixelSize:px forPage:page];
+        [_thumbCache setPreviewImage:image pixelSize:px forPage:page
+                       renderSeconds:renderSeconds];
         [_thumbView setNeedsDisplayForPage:page];
     }
 }
@@ -1097,6 +1291,7 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
     [self resetRenderFailures];      // every bitmap is a different size now
     [_pageCache removeAll];
     [_thumbCache removeAll];
+    _haveThumbState = NO;            // and every thumbnail is a different size
     [_thumbView setBackingScale:[self backingScale]];
     CGFloat f = 0;
     NSUInteger p = [self currentPageWithFraction:&f];
@@ -1111,6 +1306,10 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
     if (_closing) return;
     [_pageCache dropFullImages];
     [_thumbCache dropFullImages];
+    // Thumbnails are stored as previews and so survive this, but the cache is
+    // free to change what it drops and the early-out must not be the thing that
+    // notices last. Pressure is rare; a rebuilt wanted set costs nothing here.
+    _haveThumbState = NO;
 
     // The previews survive the drop, so there is something to draw immediately
     // and the pages on screen do not blank.
@@ -1212,6 +1411,12 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
     // stop the queue and release every rendered thumbnail bitmap.
     [_thumbQueue setDesiredRequests:[NSArray array]];
     [_thumbCache removeAll];
+    // Every thumbnail just went. Reopening the strip at the page it was closed
+    // on gives the identical visible range, and without this the early-out in
+    // -updateThumbnailContent would recognise it and decline to ask for the
+    // bitmaps that no longer exist -- a sidebar of empty boxes until something
+    // else moved it.
+    _haveThumbState = NO;
     [_thumbView setNeedsDisplay:YES];
 }
 
@@ -1226,9 +1431,30 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
     if (!_sidebarVisible || !_thumbView || _closing) return;
     NSRect vis = [[_thumbScrollView contentView] documentVisibleRect];
     NSRange range = [_thumbView pageRangeInRect:NSInsetRect(vis, 0, -PV_THUMB_BOX_H)];
+
+    // The wanted set for the strip is a pure function of which thumbnails are
+    // visible, so an identical range gives an identical answer. Dragging the
+    // strip posts a bounds notification per frame; without this each one walks
+    // the visible thumbnails, allocates a request array and takes the thumbnail
+    // queue's lock to arrive at the set already pending. This is the same
+    // early-out -clipBoundsChanged: has for the page view, and it is a smaller
+    // saving only because a thumbnail request is smaller -- the frequency is
+    // the same.
+    //
+    // No motion or direction term here, unlike the page view's. The strip asks
+    // for previews and nothing else, so there is no expensive arm for a motion
+    // state to gate, and nothing that a change of direction would reorder.
+    //
     // Same rule as the page cache: a thumbnail on screen is one that will be
-    // asked for again the moment it is thrown away.
+    // asked for again the moment it is thrown away. Stated before the early-out
+    // and on every path through here, because it is a struct assignment and
+    // because a pin that is only refreshed when the wanted set changes is a pin
+    // that goes stale exactly when the strip is sitting still.
     [_thumbCache setPinnedPages:range];
+
+    if (_haveThumbState && NSEqualRanges(range, _lastThumbRange)) return;
+    _lastThumbRange = range;
+    _haveThumbState = YES;
     NSMutableArray *reqs = [NSMutableArray array];
     NSUInteger i;
     for (i = range.location; i < NSMaxRange(range) && i < [_source pageCount]; i++) {

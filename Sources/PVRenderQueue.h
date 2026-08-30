@@ -22,6 +22,7 @@
 
 #import "PVCommon.h"
 #import "PVPDFSource.h"
+#import "PVCostModel.h"
 
 // Values taken from <dispatch/block.h> and <sys/qos.h>. They are spelled out
 // rather than referenced so this file still compiles against the 10.9 headers.
@@ -39,6 +40,25 @@
            pixelSize:(CGSize)px
              preview:(BOOL)preview;
 @optional
+// The same delivery, carrying what the rasterisation actually cost.
+//
+// Preferred over the method above when the delegate implements it; exactly one
+// of the two is called per bitmap. Added rather than folded into the required
+// method because the seconds are useful to precisely one caller -- the cache,
+// which evicts by cost -- and every other implementor of this protocol is a
+// test collector that would have had to grow a parameter it ignores.
+//
+// `renderSeconds` is wall-clock time inside -createImageForPage:pixelSize:, so
+// it includes the bitmap allocation and the white fill as well as
+// CGContextDrawPDFPage. That is the right quantity for both consumers: it is
+// what a re-render would cost, which is what the cache is deciding about, and
+// it is what the page has to be on screen long enough to absorb.
+- (void)renderQueue:(PVRenderQueue *)queue
+       didRenderPage:(NSUInteger)page
+               image:(CGImageRef)image
+           pixelSize:(CGSize)px
+             preview:(BOOL)preview
+       renderSeconds:(double)renderSeconds;
 // CoreGraphics declined to produce a bitmap: a page object the document could
 // not hand back, or a bitmap context that could not be allocated. Reported so
 // the layer above can stop asking. Without it a page that cannot be rasterised
@@ -76,9 +96,31 @@
     // cannot be created after all, the express work is simply rendered at
     // background QoS rather than handed back and forth forever.
     BOOL              _expressYielded;
+    // Full-resolution bitmaps rasterised and not yet handed to the delegate.
+    //
+    // The quantity PV_MAX_INFLIGHT_FULL bounds. A bitmap counted here is ~28 MB
+    // that the page cache's byte budget cannot see, because it is not in the
+    // cache yet -- so a worker free to start the next full render before the
+    // previous result has landed can stack up several of them behind a busy
+    // main thread with nothing anywhere in the program able to say no.
+    //
+    // Incremented on the render queue the moment a full bitmap exists and is
+    // going to be delivered; decremented on the main queue in the delivery
+    // block. Exactly one of those two paths runs for any one bitmap: a queue
+    // that has shut down never increments, because its result is released on
+    // the spot instead of being dispatched.
+    NSUInteger        _undeliveredFull;
     // Guarded by _lock. Read on the render queue and cleared under the lock by
     // -shutdown, so a delivery can never race a deallocating delegate.
     __unsafe_unretained id <PVRenderQueueDelegate> _delegate;
+    // What this document's renders cost, measured. Owned here because the queue
+    // is the only place that sees both ends of a rasterisation, and one per
+    // queue because there is one queue per document and the whole point of the
+    // model is that documents differ by up to 59x. The thumbnail queue keeps
+    // its own for the same reason: a thumbnail is 1/100 the pixels of a page
+    // and pays the same content-stream interpretation, so its rate is not the
+    // page queue's rate and mixing them would be failure 2 in PVCostModel.h.
+    PVCostModel      *_cost;
 }
 - (id)initWithSource:(PVPDFSource *)source label:(const char *)label;
 - (void)setDelegate:(id <PVRenderQueueDelegate>)delegate;
@@ -87,5 +129,23 @@
 - (void)shutdown;                       // must be called before release
 - (BOOL)isIdle;                         // for tests and soak instrumentation
 - (NSUInteger)inFlightCount;            // ditto: must always return to zero
+// Full bitmaps rasterised but not yet delivered. Never exceeds
+// PV_MAX_INFLIGHT_FULL, and returns to zero like the two above.
+- (NSUInteger)undeliveredFullCount;
+
+// What this document's renders have been measured to cost. Never nil.
+//
+// Exposed rather than proxied because the scheduler asks it two different
+// questions -- a prediction for a specific bitmap, and how many samples exist
+// yet -- and wrapping each one here would put the model's interface in two
+// files. Safe to call from any thread; see PVCostModel.h.
+- (PVCostModel *)costModel;
+
+// Predicted seconds for a bitmap of this size, or 0 when there is not yet
+// enough evidence. A convenience over -costModel with one important addition:
+// the size is clamped exactly as the renderer will clamp it, so a caller that
+// asks about a bitmap larger than PVMaxRenderPixels() is told what the render
+// it will actually get costs rather than what the one it asked for would have.
+- (double)predictedSecondsForPixels:(CGSize)px preview:(BOOL)preview;
 
 @end

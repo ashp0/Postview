@@ -210,6 +210,18 @@ static CGRect PVCropBox(CGPDFPageRef page)
     CGColorSpaceRelease(cs);
     if (!ctx) return NULL;
 
+    // The pixels exist from here. Taken from the context rather than computed
+    // from w*h*4 because CoreGraphics pads every row out to an alignment
+    // boundary, and a census that understates by the padding is a census that
+    // drifts further from the truth the narrower the page is.
+    //
+    // Balanced inside this one function, at every exit, so no caller can leak
+    // it -- pvtest and pvuitest both call this method directly and neither
+    // knows the census exists. The image that comes out is a separate claim
+    // taken up by the render queue: see PVResidentUndelivered.
+    size_t ctxBytes = CGBitmapContextGetBytesPerRow(ctx) * CGBitmapContextGetHeight(ctx);
+    PVResidentAdd(PVResidentRender, ctxBytes);
+
     CGContextSetFillColorWithColor(ctx, CGColorGetConstantColor(kCGColorWhite));
     CGContextFillRect(ctx, CGRectMake(0, 0, (CGFloat)w, (CGFloat)h));
 
@@ -236,6 +248,7 @@ static CGRect PVCropBox(CGPDFPageRef page)
     // before it reaches Quartz; returning NULL takes the bounded render-failure
     // path in PVRenderQueue instead of relying on undefined graphics behavior.
     if (!PVFiniteTransform(t)) {
+        PVResidentSub(PVResidentRender, ctxBytes);
         CGContextRelease(ctx);
         return NULL;
     }
@@ -244,6 +257,7 @@ static CGRect PVCropBox(CGPDFPageRef page)
     CGContextDrawPDFPage(ctx, page);
 
     CGImageRef img = CGBitmapContextCreateImage(ctx);
+    PVResidentSub(PVResidentRender, ctxBytes);
     CGContextRelease(ctx);
     return img;   // +1, caller releases
 }

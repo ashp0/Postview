@@ -15,6 +15,14 @@
     size_t               _budget;
     // The pages currently on screen. Eviction steps over them; see -setPinnedPages:.
     NSRange              _pinned;
+    // The GreedyDual inflation value. See -evictExcept:.
+    //
+    // Rises to the value of whatever was last thrown away, which is what stops
+    // an expensive page that is never looked at again from being immortal:
+    // every eviction raises the bar that a resident entry's original cost has
+    // to clear, so age catches up with cost eventually and without a second
+    // parameter to tune.
+    double               _gdsL;
 }
 - (id)initWithBudget:(size_t)budget;
 
@@ -41,6 +49,12 @@
 
 // Exact-size match only; NULL if the cached bitmap was rendered at another zoom.
 - (CGImageRef)fullImageForPage:(NSUInteger)page pixelSize:(CGSize)px;
+// The same question, asked without touching the cache. -fullImageForPage: bumps
+// the entry's LRU stamp, which is right for a caller about to draw and wrong for
+// one that is only deciding whether a request would have been made: counting a
+// suppressed render must not reorder eviction, or the instrumentation changes
+// the behaviour it was added to measure.
+- (BOOL)hasFullImageForPage:(NSUInteger)page pixelSize:(CGSize)px;
 // Best bitmap available for this page at any size, for use as a placeholder.
 - (CGImageRef)placeholderImageForPage:(NSUInteger)page;
 - (BOOL)hasPreviewForPage:(NSUInteger)page;
@@ -49,6 +63,29 @@
 // call from policy code that is not actually about to draw.
 - (BOOL)hasAnyImageForPage:(NSUInteger)page;
 
+// Store a bitmap along with what it cost to produce.
+//
+// Two cached bitmaps of the same size are not interchangeable, and until the
+// cost arrived here the eviction policy could not tell them apart. Measured:
+// rebuilding a page of `heavy.pdf` costs 657 ms and a page of `text.pdf` costs
+// 11.2 ms, and both occupy 27.1 MB. An LRU clock is as likely to discard the
+// 657 ms page as the 11 ms one -- a 59:1 difference in the value of what is
+// thrown away, invisible to the policy throwing it.
+//
+// Keeping the expensive one is better on every axis at once: identical bytes,
+// less CPU, less energy, no change to any budget. It is the only change in
+// ENGINEERING.md §4.4 that costs nothing to make.
+//
+// `renderSeconds` of 0 means "not measured", and is not the same as "free".
+// With every entry unmeasured the ordering degrades exactly to the stamp-based
+// LRU this replaced, which is what lets the old two-argument form below stay
+// truthful rather than quietly meaning "evict me first".
+- (void)setFullImage:(CGImageRef)img pixelSize:(CGSize)px forPage:(NSUInteger)page
+       renderSeconds:(double)renderSeconds;
+- (void)setPreviewImage:(CGImageRef)img pixelSize:(CGSize)px forPage:(NSUInteger)page
+          renderSeconds:(double)renderSeconds;
+
+// The same, with no cost measurement. Equivalent to passing 0 above.
 - (void)setFullImage:(CGImageRef)img pixelSize:(CGSize)px forPage:(NSUInteger)page;
 - (void)setPreviewImage:(CGImageRef)img pixelSize:(CGSize)px forPage:(NSUInteger)page;
 

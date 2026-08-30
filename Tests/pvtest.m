@@ -11,6 +11,7 @@
 #import "PVPDFSource.h"
 #import "PVImageCache.h"
 #import "PVRenderQueue.h"
+#import "PVCostModel.h"
 #import "PVPageView.h"
 #import "PVStateStore.h"
 
@@ -64,6 +65,22 @@ static double NowMs(void) { return [NSDate timeIntervalSinceReferenceDate] * 100
 static void PumpRunLoop(double seconds)
 {
     [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:seconds]];
+}
+
+// Pump until the condition holds, or the deadline passes. Rendering runs at
+// background QoS by design, so a fixed sleep has to be sized for the slowest
+// plausible machine and then costs that long on every machine. Waiting on the
+// condition takes as long as this machine actually needs, and a genuine
+// regression still fails -- just at the deadline rather than at once.
+static BOOL PumpUntil2(BOOL (^cond)(void), double deadline)
+{
+    double waited = 0;
+    while (waited < deadline) {
+        if (cond()) return YES;
+        @autoreleasepool { PumpRunLoop(0.05); }
+        waited += 0.05;
+    }
+    return cond();
 }
 
 #pragma mark - Tests
@@ -1018,6 +1035,385 @@ static void TestRunningLocation(void)
 // Five full bitmaps against a budget sized for three meant that storing one
 // evicted a page still on screen, which was then asked for again -- 51 full
 // renders to display six pages of a document nobody was scrolling.
+// ---------------------------------------------------------------------------
+// The resident rendered-pixel census.
+//
+// Every memory claim about the render pipeline is now read off this counter, so
+// the counter itself has to be shown correct first: balanced, clamped at both
+// ends, and returning to zero. A census that drifts is worse than none, because
+// the number it reports is still believed.
+// ---------------------------------------------------------------------------
+static void TestResidentCensus(void)
+{
+    printf("\nResident rendered-pixel census\n");
+
+    PVResidentReset();
+    OK(PVResidentTotal() == 0 && PVResidentHighWater() == 0,
+       "reset clears both the totals and the high-water marks");
+
+    PVResidentAdd(PVResidentCache, 100);
+    PVResidentAdd(PVResidentUndelivered, 30);
+    OK(PVResidentTotal() == 130, "the total is the sum of the buckets");
+    OK(PVResidentBytes(PVResidentCache) == 100 &&
+       PVResidentBytes(PVResidentUndelivered) == 30 &&
+       PVResidentBytes(PVResidentRender) == 0,
+       "each bucket holds only what was added to it");
+    OK(PVResidentHighWater() == 130, "the high-water mark tracks the peak sum");
+
+    PVResidentSub(PVResidentCache, 100);
+    OK(PVResidentTotal() == 30, "subtracting removes exactly what was added");
+    OK(PVResidentHighWater() == 130, "the high-water mark does not follow the total back down");
+    OK(PVResidentHighWaterForBucket(PVResidentCache) == 100,
+       "each bucket keeps its own peak");
+
+    // An unbalanced subtraction has to clamp. Wrapping a size_t here would read
+    // as a colossal resident total that then suppresses every subsequent peak
+    // for the life of the process -- silent, and permanent.
+    PVResidentSub(PVResidentUndelivered, 1000000);
+    OK(PVResidentBytes(PVResidentUndelivered) == 0 && PVResidentTotal() == 0,
+       "an over-subtraction clamps at zero rather than wrapping");
+
+    // ...and the same at the other end.
+    PVResidentAdd(PVResidentRender, SIZE_MAX);
+    PVResidentAdd(PVResidentRender, SIZE_MAX);
+    OK(PVResidentBytes(PVResidentRender) == SIZE_MAX,
+       "an overflowing addition saturates rather than wrapping");
+    PVResidentReset();
+
+    // Out-of-range buckets are ignored, not written through the end of the
+    // array. The enum is the only caller today; this is about the day it isn't.
+    PVResidentAdd((PVResidentBucket)-1, 4096);
+    PVResidentAdd((PVResidentBucket)PVResidentBucketCount, 4096);
+    OK(PVResidentTotal() == 0, "an out-of-range bucket is ignored");
+    OK(PVResidentBytes((PVResidentBucket)99) == 0,
+       "reading an out-of-range bucket is zero, not a wild read");
+
+    // The cache mirrors its own byte count into the census exactly.
+    PVResidentReset();
+    {
+        PVImageCache *c = [[PVImageCache alloc] initWithBudget:64 * 1024 * 1024];
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        int i;
+        for (i = 0; i < 3; i++) {
+            CGContextRef bc = CGBitmapContextCreate(NULL, 200, 200, 8, 0, cs,
+                (CGBitmapInfo)kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Host);
+            if (!bc) continue;
+            CGImageRef im = CGBitmapContextCreateImage(bc);
+            CGContextRelease(bc);
+            if (!im) continue;
+            [c setFullImage:im pixelSize:CGSizeMake(200, 200) forPage:(NSUInteger)i];
+            CGImageRelease(im);
+        }
+        CGColorSpaceRelease(cs);
+        OK(PVResidentBytes(PVResidentCache) == [c byteCount],
+           "the census agrees with the cache's own byte count");
+        [c removeAll];
+        OK(PVResidentBytes(PVResidentCache) == 0,
+           "-removeAll takes the census back down with it");
+
+        // A cache thrown away without -removeAll must not leave its bytes
+        // counted. Across the soak's document cycles that would climb without
+        // bound and read as a leak in the one figure that exists to disprove one.
+        CGColorSpaceRef cs2 = CGColorSpaceCreateDeviceRGB();
+        CGContextRef bc = CGBitmapContextCreate(NULL, 200, 200, 8, 0, cs2,
+            (CGBitmapInfo)kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Host);
+        CGColorSpaceRelease(cs2);
+        if (bc) {
+            CGImageRef im = CGBitmapContextCreateImage(bc);
+            CGContextRelease(bc);
+            if (im) {
+                [c setFullImage:im pixelSize:CGSizeMake(200, 200) forPage:0];
+                CGImageRelease(im);
+            }
+        }
+        OK(PVResidentBytes(PVResidentCache) > 0, "the cache is holding bytes before release");
+        [c release];
+        OK(PVResidentBytes(PVResidentCache) == 0,
+           "releasing a cache retires the bytes it was holding");
+    }
+    PVResidentReset();
+}
+
+// ---------------------------------------------------------------------------
+// PV_MAX_INFLIGHT_FULL, enforced.
+//
+// The bug this closes is specific and is reproduced here rather than approximated:
+// the worker rasterises a full page, hands the result to the main queue and
+// starts the next one immediately. When the main thread is busy -- which during
+// `page` and `scroll` it is, handling 20-50 key events a second -- the deliveries
+// queue up behind those events and several ~28 MB bitmaps sit undelivered, where
+// no cache budget can see them.
+//
+// "The main thread is busy" is not simulated with a sleep inside a delegate; it
+// is produced exactly, by not running the run loop at all. No delivery block can
+// execute until this function pumps, so the queue is left to rasterise against a
+// main thread that never drains. Without the cap the undelivered count climbs to
+// the size of the request set. With it, it stops at two, and the remaining work
+// is still there to be finished the moment the main thread comes back.
+// ---------------------------------------------------------------------------
+static void TestInFlightFullCap(PVPDFSource *geom, NSURL *url)
+{
+    printf("\nIn-flight full-bitmap cap (PV_MAX_INFLIGHT_FULL = %d)\n", PV_MAX_INFLIGHT_FULL);
+
+    NSError *err = nil;
+    PVPDFSource *src = [[PVPDFSource alloc] initWithURL:url geometryFrom:geom error:&err];
+    if (!src) { OK(NO, "could not open the fixture for the in-flight cap test"); return; }
+
+    PVRenderQueue *q = [[PVRenderQueue alloc] initWithSource:src label:"pv.test.inflight"];
+    Collector *c = [[Collector alloc] init];
+    c->quiet = YES;
+    [q setDelegate:c];
+
+    const NSUInteger kRequests = 6;
+    NSUInteger pages = [src pageCount];
+    if (pages > kRequests) pages = kRequests;
+
+    // Big enough that a render takes long enough to observe, small enough that
+    // six of them do not dominate the suite's runtime.
+    CGSize px = CGSizeMake(700, 900);
+
+    // ---- full-resolution requests, with the main thread never draining ----
+    PVResidentReset();
+    {
+        NSMutableArray *reqs = [NSMutableArray array];
+        NSUInteger i;
+        for (i = 0; i < pages; i++)
+            [reqs addObject:[PVRenderRequest page:i pixels:px
+                                         priority:PVPriorityVisibleFull preview:NO]];
+        [q setDesiredRequests:reqs];
+
+        // usleep, deliberately, not PumpRunLoop: pumping would let the delivery
+        // blocks run, which is the very thing the cap exists to survive without.
+        // Renders run at background QoS, so give the worker real time to get as
+        // far as it is ever going to get.
+        NSUInteger observedMax = 0;
+        double waited = 0;
+        while (waited < 20.0) {
+            NSUInteger n = [q undeliveredFullCount];
+            if (n > observedMax) observedMax = n;
+            // Once it has sat at the cap through several samples, the worker has
+            // demonstrably stopped rather than merely not started.
+            if (observedMax >= PV_MAX_INFLIGHT_FULL && waited > 2.0) break;
+            usleep(50000);
+            waited += 0.05;
+        }
+
+        char msg[200];
+        snprintf(msg, sizeof msg,
+                 "undelivered full bitmaps never exceeded %d (observed max %lu of %lu asked for)",
+                 PV_MAX_INFLIGHT_FULL, (unsigned long)observedMax, (unsigned long)pages);
+        OK(observedMax <= PV_MAX_INFLIGHT_FULL, msg);
+        OK(observedMax == PV_MAX_INFLIGHT_FULL,
+           "...and the cap is what stopped it, not the machine being slow");
+        OK([q inFlightCount] <= PV_MAX_INFLIGHT_FULL,
+           "nothing extra is held in flight behind the cap");
+
+        // The bytes, which is the point of the exercise: at most two page
+        // bitmaps are resident where no budget can see them.
+        double undeliveredMB = (double)PVResidentBytes(PVResidentUndelivered) / (1024.0 * 1024.0);
+        double onePageMB     = (double)(700 * 900 * 4) / (1024.0 * 1024.0);
+        snprintf(msg, sizeof msg,
+                 "undelivered bytes bounded at %.2f MB (%.2f MB per bitmap, cap %d)",
+                 undeliveredMB, onePageMB, PV_MAX_INFLIGHT_FULL);
+        OK(undeliveredMB <= onePageMB * PV_MAX_INFLIGHT_FULL + 0.5, msg);
+
+        // Nothing was lost: the skipped requests are still pending and are
+        // picked up as soon as deliveries start landing again. This is the half
+        // that a naive "drop the request" implementation would fail.
+        BOOL drained = PumpUntil2(^{ return (BOOL)([q isIdle] && [c->pages count] >= pages); }, 90.0);
+        snprintf(msg, sizeof msg,
+                 "every deferred request still completed once the main thread drained (%lu of %lu)",
+                 (unsigned long)[c->pages count], (unsigned long)pages);
+        OK(drained, msg);
+        OK([q undeliveredFullCount] == 0, "the undelivered count returns to zero");
+        OK(PVResidentBytes(PVResidentUndelivered) == 0,
+           "and so do the undelivered bytes");
+    }
+
+    // ---- previews are NOT gated: they are the responsiveness path ----
+    {
+        [c->pages removeAllObjects];
+        NSMutableArray *reqs = [NSMutableArray array];
+        NSUInteger i;
+        CGSize small = CGSizeMake(px.width / PV_PREVIEW_DIVISOR, px.height / PV_PREVIEW_DIVISOR);
+        for (i = 0; i < pages; i++)
+            [reqs addObject:[PVRenderRequest page:i pixels:small
+                                         priority:PVPriorityVisiblePreview preview:YES]];
+        [q setDesiredRequests:reqs];
+
+        NSUInteger observedInFlight = 0;
+        double waited = 0;
+        while (waited < 20.0) {
+            NSUInteger n = [q inFlightCount];
+            if (n > observedInFlight) observedInFlight = n;
+            if (observedInFlight > PV_MAX_INFLIGHT_FULL) break;
+            usleep(50000);
+            waited += 0.05;
+        }
+        char msg[200];
+        snprintf(msg, sizeof msg,
+                 "previews drain past the full-bitmap cap (%lu in flight, cap is %d)",
+                 (unsigned long)observedInFlight, PV_MAX_INFLIGHT_FULL);
+        OK(observedInFlight > PV_MAX_INFLIGHT_FULL, msg);
+        OK([q undeliveredFullCount] == 0, "previews are not counted against the cap");
+        PumpUntil2(^{ return [q isIdle]; }, 90.0);
+    }
+
+    // ---- shutdown with work outstanding leaves nothing counted ----
+    {
+        NSMutableArray *reqs = [NSMutableArray array];
+        NSUInteger i;
+        for (i = 0; i < pages; i++)
+            [reqs addObject:[PVRenderRequest page:i pixels:px
+                                         priority:PVPriorityVisibleFull preview:NO]];
+        [q setDesiredRequests:reqs];
+        usleep(200000);
+        [q shutdown];
+        BOOL quiet = PumpUntil2(^{ return (BOOL)([q inFlightCount] == 0); }, 90.0);
+        OK(quiet, "a shutdown mid-render retires every in-flight marker");
+        OK([q undeliveredFullCount] == 0,
+           "shutdown leaves no bitmap counted against the cap");
+        OK(PVResidentBytes(PVResidentUndelivered) == 0,
+           "shutdown leaves no undelivered bytes counted");
+    }
+
+    [q release];
+    [c release];
+    [src release];
+    PVResidentReset();
+}
+
+// The eviction budget and the render ceiling are two numbers now, not one
+// expression, so the property that used to hold by construction has to be
+// asserted. It is asserted on every tier rather than on whichever tier this
+// machine happens to be: the failure being guarded against is someone cutting a
+// budget for the 2 GB tier while developing on an 8 GB one, which no test that
+// only reads PVPageCacheBudget() can ever see.
+static void TestRamTierInvariants(void)
+{
+    printf("\nRAM tiers: eviction budget vs render ceiling\n");
+
+    // The tier boundaries themselves, as a pure function of a byte count.
+    const unsigned long long GB = 1024ULL * 1024ULL * 1024ULL;
+    OK(PVRamTierForBytes(0)            == PVRamTierSmall,  "an implausible RAM reading takes the smallest tier");
+    OK(PVRamTierForBytes(1 * GB)       == PVRamTierSmall,  "1 GB is the small tier");
+    OK(PVRamTierForBytes(2 * GB)       == PVRamTierSmall,  "2 GB is the small tier (boundary is inclusive)");
+    OK(PVRamTierForBytes(2 * GB + 1)   == PVRamTierMedium, "just over 2 GB moves up a tier");
+    OK(PVRamTierForBytes(4 * GB)       == PVRamTierMedium, "4 GB is the medium tier (boundary is inclusive)");
+    OK(PVRamTierForBytes(4 * GB + 1)   == PVRamTierLarge,  "just over 4 GB is the large tier");
+    OK(PVRamTierForBytes(8 * GB)       == PVRamTierLarge,  "8 GB is the large tier (boundary is inclusive)");
+    OK(PVRamTierForBytes(8 * GB + 1)   == PVRamTierHuge,   "just over 8 GB is the huge tier");
+    OK(PVRamTierForBytes(16 * GB)      == PVRamTierHuge,   "16 GB is the huge tier");
+    OK(PVRamTierForBytes(64 * GB)      == PVRamTierHuge,   "64 GB is the huge tier");
+    OK(PVRamTierForBytes(1024 * GB)    == PVRamTierHuge,   "a machine larger than any Mavericks Mac does not overflow past the top tier");
+    OK(PVRamTierOfThisMachine() == PVRamTierForBytes(
+           [[NSProcessInfo processInfo] physicalMemory]),
+       "this machine's tier agrees with the pure function");
+
+    // The anti-thrash invariant, on every tier. Two full-resolution pages are on
+    // screen at any ordinary zoom; the previews are what make scrolling back
+    // instant and must not be the thing evicted to make room for a page.
+    //
+    // This is what the old `ceiling = budget / 3 / 4` bought by construction.
+    // Stated as an inequality it survives either number being tuned, and fails
+    // loudly on the tier that was tuned rather than silently rendering that
+    // tier's pages soft.
+    int t;
+    for (t = 0; t < PVRamTierCount; t++) {
+        double ceiling = PVMaxRenderPixelsForTier((PVRamTier)t);
+        double budget  = (double)PVPageCacheBudgetForTier((PVRamTier)t);
+        double pageBytes    = ceiling * 4.0;
+        double previewBytes = pageBytes / (PV_PREVIEW_DIVISOR * PV_PREVIEW_DIVISOR);
+        double needed = 2.0 * pageBytes + PV_CACHE_SLACK_PREVIEWS * previewBytes;
+
+        char msg[200];
+        snprintf(msg, sizeof msg,
+                 "tier %d: two full pages + %d previews (%.1f MB) fit the %.0f MB budget",
+                 t, PV_CACHE_SLACK_PREVIEWS, needed / (1024.0 * 1024.0),
+                 budget / (1024.0 * 1024.0));
+        OK(needed <= budget, msg);
+
+        snprintf(msg, sizeof msg, "tier %d: ceiling and budget are both positive", t);
+        OK(ceiling > 0 && budget > 0, msg);
+
+        snprintf(msg, sizeof msg, "tier %d: one bitmap is at most a third of the budget", t);
+        OK(pageBytes * 3.0 <= budget + 1.0, msg);
+    }
+
+    // No machine may render a softer page than it did before the split. These
+    // are the values the old derivation produced; they are pinned so that a
+    // later cut to PVPageCacheBudgetForTier() cannot quietly drag them down --
+    // which is the exact trap ENGINEERING.md §4.1 documents.
+    OK(fabs(PVMaxRenderPixelsForTier(PVRamTierLarge)  - 8388608.0) < 1.0,
+       "the >4 GB render ceiling has not moved from 8.39 Mpx");
+    OK(fabs(PVMaxRenderPixelsForTier(PVRamTierMedium) - 5592405.3333) < 1.0,
+       "the 4 GB render ceiling has not moved from 5.59 Mpx");
+    OK(PVMaxRenderPixelsForTier(PVRamTierHuge) > PVMaxRenderPixelsForTier(PVRamTierLarge) &&
+       PVMaxRenderPixelsForTier(PVRamTierLarge) > PVMaxRenderPixelsForTier(PVRamTierMedium) &&
+       PVMaxRenderPixelsForTier(PVRamTierMedium) > PVMaxRenderPixelsForTier(PVRamTierSmall),
+       "a bigger machine never gets a smaller ceiling");
+    OK(PVPageCacheBudgetForTier(PVRamTierHuge) > PVPageCacheBudgetForTier(PVRamTierLarge) &&
+       PVPageCacheBudgetForTier(PVRamTierLarge) > PVPageCacheBudgetForTier(PVRamTierMedium) &&
+       PVPageCacheBudgetForTier(PVRamTierMedium) > PVPageCacheBudgetForTier(PVRamTierSmall),
+       "a bigger machine never gets a smaller budget");
+
+    // The three tiers that existed before the split are pinned to the byte.
+    // Every Mavericks-capable Mac with 8 GB or less lands in one of them, so
+    // this is the assertion that says the fourth tier changed nothing for the
+    // machines that were already supported -- a 2 GB 2007 iMac and an 8 GB 2013
+    // MacBook Pro must get exactly the budgets they got before it existed.
+    OK(PVPageCacheBudgetForTier(PVRamTierSmall)  ==  32 * 1024 * 1024 &&
+       PVPageCacheBudgetForTier(PVRamTierMedium) ==  64 * 1024 * 1024 &&
+       PVPageCacheBudgetForTier(PVRamTierLarge)  ==  96 * 1024 * 1024,
+       "the three original tiers' budgets are unchanged by the fourth");
+    OK(PVThumbCacheBudgetForTier(PVRamTierSmall)  ==  6 * 1024 * 1024 &&
+       PVThumbCacheBudgetForTier(PVRamTierMedium) == 10 * 1024 * 1024 &&
+       PVThumbCacheBudgetForTier(PVRamTierLarge)  == 16 * 1024 * 1024,
+       "the three original tiers' thumbnail budgets are unchanged by the fourth");
+
+    // The zoom headroom cliff, stated as a number instead of left to be
+    // discovered. A US Letter page fit to the width of the 1200x800 showdown
+    // window on a 2x display is ~7.1 Mpx against an 8.39 Mpx ceiling -- so the
+    // ceiling is crossed by zooming in less than a tenth. Past that point
+    // PVClampPixelSize() scales the request down and -drawRect: stretches it
+    // back up: the page is soft, silently, and stays soft for as long as the
+    // zoom does.
+    //
+    // Not raised here. Raising it means raising the eviction budget to keep the
+    // inequality above, which is the opposite of what this round of work is
+    // for. Recorded, pinned, and left as a known limit.
+    {
+        double colWidthPt = 1200.0 - 2.0 * PV_EDGE_GAP;
+        double pagePt     = 792.0 / 612.0;             // US Letter aspect
+        double wPx = colWidthPt * 2.0;                 // backingScaleFactor 2
+        double hPx = wPx * pagePt;
+        double fitPixels = wPx * hPx;
+        double crossing  = sqrt(PVMaxRenderPixelsForTier(PVRamTierLarge) / fitPixels);
+        printf("  note  fit-width Letter at 2x is %.2f Mpx; the >4 GB ceiling is\n"
+               "        crossed at %.2fx zoom, above which every page is rendered\n"
+               "        downscaled and stretched back up\n",
+               fitPixels / 1.0e6, crossing);
+        OK(fitPixels < PVMaxRenderPixelsForTier(PVRamTierLarge),
+           "fit-width itself is under the ceiling: the default view is sharp");
+        OK(crossing > 1.05 && crossing < 1.15,
+           "the ceiling is crossed between 1.05x and 1.15x zoom (pinned, known limit)");
+
+        // The huge tier exists to move that cliff, and this is the number it
+        // moves it to. A machine with more than 8 GB gets its ceiling doubled,
+        // which is sqrt(2) on the zoom axis because the ceiling is in pixels
+        // and zoom is linear -- so 1.09x becomes 1.54x, not 2.18x. Stated here
+        // because "we doubled the ceiling" and "we doubled the usable zoom" are
+        // different claims and only the first one is true.
+        double crossingHuge = sqrt(PVMaxRenderPixelsForTier(PVRamTierHuge) / fitPixels);
+        printf("  note  the > 8 GB ceiling is crossed at %.2fx zoom\n", crossingHuge);
+        OK(crossingHuge > 1.50 && crossingHuge < 1.58,
+           "the huge tier moves the cliff to between 1.50x and 1.58x zoom");
+        OK(fabs(PVMaxRenderPixelsForTier(PVRamTierHuge)
+                / PVMaxRenderPixelsForTier(PVRamTierLarge) - 2.0) < 1e-9,
+           "the huge tier's ceiling is exactly twice the large tier's");
+    }
+}
+
 static void TestSchedulerBudgetArithmetic(void)
 {
     printf("\nScheduler budget arithmetic\n");
@@ -1027,8 +1423,18 @@ static void TestSchedulerBudgetArithmetic(void)
     double budget   = (double)PVPageCacheBudget();
 
     OK(maxBytes > 0 && budget > 0, "budget and per-bitmap ceiling are positive");
-    OK(fabs(maxBytes - budget / 3.0) < 1.0,
-       "one full bitmap is capped at a third of the page-cache budget");
+    // An inequality, where this used to assert equality with budget/3.
+    //
+    // The equality was a restatement of `ceiling = budget / 3 / 4`, which is
+    // precisely the coupling task 3 existed to break: written as a derivation,
+    // any cut to the budget silently cut the ceiling too and every page in every
+    // scenario came out soft with no diagnostic. Re-asserting it here put the
+    // coupling back in the test suite after it had been removed from the code,
+    // and it is what the huge tier's fourth-page budget trips over. The property
+    // actually being protected is that one bitmap cannot monopolise the cache,
+    // and that is a bound, not an identity.
+    OK(maxBytes * 3.0 <= budget + 1.0,
+       "one full bitmap is at most a third of the page-cache budget");
 
     // Two pages are on screen at any ordinary zoom. Everything the wanted-set
     // may ask for at full resolution has to fit what the cache can hold, or
@@ -1226,6 +1632,442 @@ static void TestRenderSuppressionPolicy(void)
     OK(stable, "same inputs give the same answer across 10000 calls");
 }
 
+
+#pragma mark - Power source
+
+static void TestPowerSource(void)
+{
+    printf("\nPower source\n");
+
+    // The classifier, which is the only part of this that a machine cannot
+    // change underneath the test. Both IOKit's own spellings and the ones a
+    // person types at a shell have to work, because -PVPowerState is meant to
+    // be usable by hand and Tools/showdown.sh passes it programmatically.
+    OK(PVPowerSourceFromString(@"AC Power")      == PVPowerAC,      "IOKit's \"AC Power\" is AC");
+    OK(PVPowerSourceFromString(@"ACPower")       == PVPowerAC,      "\"ACPower\" is AC");
+    OK(PVPowerSourceFromString(@"ac")            == PVPowerAC,      "\"ac\" is AC");
+    OK(PVPowerSourceFromString(@"  AC  ")        == PVPowerAC,      "surrounding space is trimmed");
+    OK(PVPowerSourceFromString(@"Battery Power") == PVPowerBattery, "IOKit's \"Battery Power\" is battery");
+    OK(PVPowerSourceFromString(@"battery")       == PVPowerBattery, "\"battery\" is battery");
+
+    // Everything else is Unknown, and Unknown is never AC. This is the whole
+    // safety property of the classifier: a string nobody anticipated must not
+    // be able to turn on the branch that spends energy.
+    OK(PVPowerSourceFromString(nil)              == PVPowerUnknown, "nil is unknown");
+    OK(PVPowerSourceFromString(@"")              == PVPowerUnknown, "empty is unknown");
+    OK(PVPowerSourceFromString(@"AC Powerrr")    == PVPowerUnknown, "a near miss is unknown, not AC");
+    OK(PVPowerSourceFromString(@"UPS Power")     == PVPowerUnknown, "an unhandled source is unknown");
+    OK(PVPowerSourceFromString((NSString *)@42)  == PVPowerUnknown, "a non-string is unknown");
+
+    // The override, which is what lets every test below run the same on a
+    // laptop, a desktop and a machine with the charger being pulled in and out.
+    PVPowerSource actual = PVCurrentPowerSource();
+    OK(actual == PVPowerAC || actual == PVPowerBattery || actual == PVPowerUnknown,
+       "this machine reports one of the three states");
+    printf("  note  this machine reports %s\n",
+           actual == PVPowerAC ? "AC" : actual == PVPowerBattery ? "battery" : "unknown");
+
+    PVSetPowerSourceOverride(PVPowerBattery, YES);
+    OK(PVCurrentPowerSource() == PVPowerBattery, "the override pins battery");
+    PVSetPowerSourceOverride(PVPowerAC, YES);
+    OK(PVCurrentPowerSource() == PVPowerAC, "the override pins AC");
+    PVSetPowerSourceOverride(PVPowerUnknown, NO);
+    OK(PVCurrentPowerSource() == actual, "clearing the override restores the machine's own answer");
+}
+
+#pragma mark - The render policy
+
+static void TestRenderPolicy(void)
+{
+    printf("\nRender policy (power x tier x pressure)\n");
+
+    const PVPowerSource powers[3] = { PVPowerUnknown, PVPowerBattery, PVPowerAC };
+    int pi, t, pr;
+
+    // Exhaustive. Three power states, four tiers, and pressure from none to
+    // past the point where only previews are allowed -- 36 combinations, every
+    // one of which some machine somewhere will actually be in.
+    int checked = 0, violations = 0;
+    for (pi = 0; pi < 3; pi++)
+    for (t = 0; t < PVRamTierCount; t++)
+    for (pr = 0; pr < 3; pr++) {
+        PVRenderPolicy p = PVRenderPolicyFor(powers[pi], (PVRamTier)t, (NSUInteger)pr);
+        checked++;
+        // The invariant that matters: no policy may ask for more full-resolution
+        // bitmaps than that tier's cache can hold. Violating it is the loop that
+        // produced 51 full renders to display 6 pages, and it is invisible from
+        // outside the process.
+        if (!PVRenderPolicyFitsCache(p, (PVRamTier)t)) {
+            violations++;
+            printf("        power=%d tier=%d pressure=%d prefetch=%lu does not fit\n",
+                   (int)powers[pi], t, pr, (unsigned long)p.fullPrefetchPages);
+        }
+        // Every field has to be usable as a number. A NaN safety factor would
+        // make PVShouldRenderWhileMovingCost ignore the prediction silently,
+        // which is a policy nobody chose.
+        if (!(p.dwellSafetyFactor > 0) || !isfinite(p.dwellSafetyFactor)) violations++;
+        if (!(p.minDwellSeconds   > 0) || !isfinite(p.minDwellSeconds))   violations++;
+    }
+    OK(checked == 36, "every power x tier x pressure combination was walked");
+    OK(violations == 0, "no combination asks for more full bitmaps than its cache holds");
+
+    // Battery is today's behaviour, to the field. This is the assertion that
+    // says adding a power-aware policy did not change the case the project
+    // exists to optimise -- if any of these four moves, every recorded battery
+    // number in ENGINEERING.md stops describing the program.
+    for (t = 0; t < PVRamTierCount; t++) {
+        PVRenderPolicy b = PVRenderPolicyFor(PVPowerBattery, (PVRamTier)t, 0);
+        char msg[160];
+        snprintf(msg, sizeof msg, "tier %d on battery: prefetch is still PV_FULL_PREFETCH_PAGES", t);
+        OK(b.fullPrefetchPages == PV_FULL_PREFETCH_PAGES, msg);
+        snprintf(msg, sizeof msg, "tier %d on battery: the motion gate is still closed", t);
+        OK(b.fullRendersWhileMoving == NO, msg);
+        snprintf(msg, sizeof msg, "tier %d on battery: the dwell floor is still PV_MIN_VISIBLE_SECONDS", t);
+        OK(fabs(b.minDwellSeconds - PV_MIN_VISIBLE_SECONDS) < 1e-12, msg);
+    }
+
+    // Unknown is battery, not AC. A machine that cannot answer must get the
+    // conservative branch, and this is the test that stops a later refactor
+    // from folding Unknown in with AC because "most Macs are plugged in".
+    for (t = 0; t < PVRamTierCount; t++) {
+        PVRenderPolicy u = PVRenderPolicyFor(PVPowerUnknown, (PVRamTier)t, 0);
+        PVRenderPolicy b = PVRenderPolicyFor(PVPowerBattery, (PVRamTier)t, 0);
+        char msg[160];
+        snprintf(msg, sizeof msg, "tier %d: an unknown power source behaves exactly as battery", t);
+        OK(u.fullPrefetchPages == b.fullPrefetchPages &&
+           u.fullRendersWhileMoving == b.fullRendersWhileMoving &&
+           fabs(u.dwellSafetyFactor - b.dwellSafetyFactor) < 1e-12 &&
+           fabs(u.minDwellSeconds   - b.minDwellSeconds)   < 1e-12, msg);
+    }
+
+    // AC does something, and does it only where the cache can take it. On the
+    // three tiers that existed before, the budget holds exactly three ceiling
+    // sized pages -- two visible and one ahead -- so the deeper prefetch is
+    // clamped away and only the motion gate opens. The huge tier is sized for
+    // the fourth page and is the one place the deeper prefetch survives.
+    OK(PVRenderPolicyFor(PVPowerAC, PVRamTierLarge, 0).fullRendersWhileMoving == YES,
+       "AC opens the motion gate on the large tier");
+    OK(PVRenderPolicyFor(PVPowerAC, PVRamTierLarge, 0).fullPrefetchPages == PV_FULL_PREFETCH_PAGES,
+       "AC does not deepen prefetch on the large tier: the budget cannot hold it");
+    OK(PVRenderPolicyFor(PVPowerAC, PVRamTierHuge, 0).fullPrefetchPages == PV_AC_FULL_PREFETCH_PAGES,
+       "AC deepens prefetch on the huge tier, which is sized for it");
+    OK(PVRenderPolicyFor(PVPowerAC, PVRamTierSmall, 0).fullPrefetchPages <= PV_FULL_PREFETCH_PAGES,
+       "AC never deepens prefetch on a 2 GB machine");
+
+    // Pressure outranks power, in both directions and at both thresholds.
+    OK(PVRenderPolicyFor(PVPowerAC, PVRamTierHuge, 1).fullPrefetchPages == 0,
+       "one pressure report stops full prefetch even on AC");
+    OK(PVRenderPolicyFor(PVPowerAC, PVRamTierHuge, 1).fullRendersWhileMoving == NO,
+       "one pressure report closes the motion gate even on AC");
+    OK(PVRenderPolicyFor(PVPowerAC, PVRamTierHuge, 2).fullPrefetchPages == 0 &&
+       fabs(PVRenderPolicyFor(PVPowerAC, PVRamTierHuge, 2).dwellSafetyFactor
+            - PV_DWELL_SAFETY_BATTERY) < 1e-12,
+       "a second pressure report puts an AC machine fully back on the cautious policy");
+    OK(PVRenderPolicyFor(PVPowerAC, PVRamTierHuge, 99).fullPrefetchPages == 0,
+       "sustained pressure does not wrap around into permission");
+}
+
+#pragma mark - The cost model
+
+static void TestCostModel(void)
+{
+    printf("\nCost model\n");
+
+    PVCostModel *m = [[PVCostModel alloc] init];
+    CGSize page = CGSizeMake(2344, 3033);          // 7.11 Mpx, the showdown page
+    double mpx  = (page.width * page.height) / 1.0e6;
+
+    // Nothing is claimed until there is evidence. This is what makes the whole
+    // feature safe to add: while it holds, every gate is running the constant
+    // it ran before the cost model existed.
+    OK([m predictedSecondsForPixels:page preview:NO] == 0,
+       "an empty model offers no prediction");
+    OK([m sampleCountForPreview:NO] == 0, "an empty model has no samples");
+
+    int i;
+    for (i = 0; i < PV_COST_MIN_SAMPLES - 1; i++)
+        [m recordSeconds:0.657 pixels:page preview:NO];
+    OK([m predictedSecondsForPixels:page preview:NO] == 0,
+       "below PV_COST_MIN_SAMPLES there is still no prediction");
+    [m recordSeconds:0.657 pixels:page preview:NO];
+    OK([m predictedSecondsForPixels:page preview:NO] > 0,
+       "at PV_COST_MIN_SAMPLES a prediction appears");
+
+    // The measured heavy.pdf figure, fed in and read back. A model that cannot
+    // reproduce a constant input is not measuring anything.
+    double pred = [m predictedSecondsForPixels:page preview:NO];
+    OK(fabs(pred - 0.657) < 0.01, "a constant 657 ms input predicts 657 ms");
+    OK(fabs([m msPerMegapixelForPreview:NO] - (657.0 / mpx)) < 0.5,
+       "the stored rate is the input in ms per megapixel");
+
+    // Prediction scales with area, which is the one thing the rate is for.
+    CGSize half = CGSizeMake(page.width / 2, page.height / 2);   // a quarter the pixels
+    OK(fabs([m predictedSecondsForPixels:half preview:NO] - pred / 4.0) < 0.01,
+       "a quarter of the pixels is predicted at a quarter of the time");
+
+    // The two populations are independent. This is failure 2 from PVCostModel.h,
+    // and it is the one that made two earlier attempts at this unusable: a
+    // preview is 1/9 the pixels but re-walks the whole content stream, so its
+    // rate per megapixel is nothing like a full page's and mixing them moved
+    // the crossover by a factor of six.
+    OK([m predictedSecondsForPixels:page preview:YES] == 0,
+       "full-resolution samples say nothing about previews");
+    CGSize prev = CGSizeMake(ceil(page.width / 3.0), ceil(page.height / 3.0));
+    for (i = 0; i < PV_COST_MIN_SAMPLES; i++) [m recordSeconds:0.011 pixels:prev preview:YES];
+    OK([m predictedSecondsForPixels:prev preview:YES] > 0, "previews get their own prediction");
+    OK(fabs([m predictedSecondsForPixels:page preview:NO] - pred) < 1e-9,
+       "recording previews does not move the full-resolution rate");
+    // The two rates hold genuinely different values, and that is all that is
+    // asserted. Which of them is larger is a property of the document, not of
+    // this code: a text page pays the same content-stream interpretation over a
+    // ninth of the pixels and comes out dearer per megapixel, while a vector
+    // page's smaller destination fits a cache the whole page does not and comes
+    // out cheaper -- `make band` measures both directions on the two fixtures.
+    // A test that pinned the direction would be pinning heavy.pdf.
+    OK(fabs([m msPerMegapixelForPreview:YES] - [m msPerMegapixelForPreview:NO]) > 1.0,
+       "the two populations hold materially different rates");
+    OK([m sampleCountForPreview:YES] == PV_COST_MIN_SAMPLES &&
+       [m sampleCountForPreview:NO]  == PV_COST_MIN_SAMPLES,
+       "each population counts only its own samples");
+
+    // Convergence. The EWMA has to actually reach a step change, or a document
+    // whose character shifts partway through is modelled by its first page
+    // forever.
+    for (i = 0; i < 60; i++) [m recordSeconds:0.011 pixels:page preview:NO];
+    OK(fabs([m predictedSecondsForPixels:page preview:NO] - 0.011) < 0.002,
+       "the rate converges on a sustained step change");
+
+    // Rubbish in does not become policy. Every one of these is a real way for a
+    // measurement to be wrong -- a clock that stepped, a zero-size bitmap, a
+    // NaN out of a failed clamp -- and none of them may move a rate that decays
+    // over a dozen samples.
+    double before = [m msPerMegapixelForPreview:NO];
+    [m recordSeconds:-1.0    pixels:page preview:NO];
+    [m recordSeconds:0.0     pixels:page preview:NO];
+    [m recordSeconds:NAN     pixels:page preview:NO];
+    [m recordSeconds:INFINITY pixels:page preview:NO];
+    [m recordSeconds:0.5     pixels:CGSizeMake(0, 0) preview:NO];
+    [m recordSeconds:0.5     pixels:CGSizeMake(NAN, 100) preview:NO];
+    OK(fabs([m msPerMegapixelForPreview:NO] - before) < 1e-12,
+       "negative, zero, NaN, infinite and zero-area samples are all discarded");
+
+    // The clamps, which exist so one absurd sample cannot put the scheduler
+    // somewhere it will not come back from.
+    [m reset];
+    for (i = 0; i < 20; i++) [m recordSeconds:1.0e9 pixels:page preview:NO];
+    OK([m msPerMegapixelForPreview:NO] <= PV_COST_MAX_MS_PER_MPX + 1e-6,
+       "an absurdly slow sample is clamped rather than believed");
+    [m reset];
+    OK([m sampleCountForPreview:NO] == 0 && [m predictedSecondsForPixels:page preview:NO] == 0,
+       "reset clears both populations");
+
+    [m release];
+}
+
+#pragma mark - The cost-aware gate
+
+static void TestCostAwareGate(void)
+{
+    printf("\nCost-aware suppression gate\n");
+
+    const double kFresh = 0.0;
+    const double kFast  = 20000.0;
+
+    // Absence is the old policy, asserted across the same sweep the three
+    // argument form is checked with rather than at a handful of points. This is
+    // the property the whole design leans on: a machine where the cost model
+    // never gathers enough samples runs exactly the scheduler it ran before.
+    double speeds[] = { 0.0, PV_MIN_SCROLL_SPEED, 500.0, 3000.0, 60000.0 };
+    double ages[]   = { 0.0, 0.1, PV_SPEED_FRESH_SECONDS, 1.0, HUGE_VAL, -1.0 };
+    double dwells[] = { 0.0, 0.1, PV_MIN_VISIBLE_SECONDS, 0.3, 2.0, HUGE_VAL };
+    int si, ai, di, mismatches = 0, compared = 0;
+    for (si = 0; si < 5; si++)
+    for (ai = 0; ai < 6; ai++)
+    for (di = 0; di < 6; di++) {
+        BOOL oldWay = PVShouldRenderWhileMoving(speeds[si], ages[ai], dwells[di]);
+        BOOL newWay = PVShouldRenderWhileMovingCost(speeds[si], ages[ai], dwells[di],
+                                                    0.0, PV_DWELL_SAFETY_BATTERY,
+                                                    PV_MIN_VISIBLE_SECONDS);
+        compared++;
+        if (oldWay != newWay) mismatches++;
+    }
+    OK(compared == 180, "the equivalence sweep covered every combination");
+    OK(mismatches == 0, "with no prediction the cost-aware gate is the old gate exactly");
+
+    // The expensive direction. 657 ms is heavy.pdf, measured. A page with 0.4 s
+    // of dwell passes the old constant comfortably and cannot possibly be
+    // finished in time, which is the case one constant could not express.
+    OK(PVShouldRenderWhileMoving(kFast, kFresh, 0.4),
+       "the old gate admits a 0.4 s dwell without asking what it costs");
+    OK(!PVShouldRenderWhileMovingCost(kFast, kFresh, 0.4, 0.657,
+                                      PV_DWELL_SAFETY_BATTERY, PV_MIN_VISIBLE_SECONDS),
+       "a 657 ms render is refused a 0.4 s window");
+    OK(PVShouldRenderWhileMovingCost(kFast, kFresh, 2.0, 0.657,
+                                     PV_DWELL_SAFETY_BATTERY, PV_MIN_VISIBLE_SECONDS),
+       "the same render is allowed a 2 s window");
+
+    // The floor is never lowered. 11 ms is text.pdf, also measured: even a
+    // render the machine could do twenty times over does not license a page
+    // that nobody can look at. PV_MIN_VISIBLE_SECONDS is a claim about eyes and
+    // the cost model has no standing to overrule it.
+    OK(!PVShouldRenderWhileMovingCost(kFast, kFresh, 0.05, 0.011,
+                                      PV_DWELL_SAFETY_AC, PV_MIN_VISIBLE_SECONDS),
+       "a cheap render still cannot rescue a 50 ms glimpse");
+    OK(PVShouldRenderWhileMovingCost(kFast, kFresh, 0.3, 0.011,
+                                     PV_DWELL_SAFETY_AC, PV_MIN_VISIBLE_SECONDS),
+       "a cheap render is allowed anything above the floor");
+
+    // The safety factor is a margin and points the right way.
+    OK(!PVShouldRenderWhileMovingCost(kFast, kFresh, 0.60, 0.50, 1.5, PV_MIN_VISIBLE_SECONDS),
+       "a 0.5 s render is refused a 0.6 s window at a 1.5x margin");
+    OK(PVShouldRenderWhileMovingCost(kFast, kFresh, 0.60, 0.50, 1.0, PV_MIN_VISIBLE_SECONDS),
+       "the same case passes with no margin, so the margin is what decided it");
+    OK(PV_DWELL_SAFETY_BATTERY > PV_DWELL_SAFETY_AC,
+       "battery is the more cautious of the two margins");
+
+    // A prediction that is not a number must mean "no prediction", never
+    // "threshold zero" -- which would render everything, during a flick, at
+    // full resolution.
+    int j;
+    double junk[] = { NAN, INFINITY, -1.0, -0.0 };
+    int junkRendered = 0;
+    for (j = 0; j < 4; j++)
+        if (PVShouldRenderWhileMovingCost(kFast, kFresh, 0.05, junk[j],
+                                          PV_DWELL_SAFETY_BATTERY, PV_MIN_VISIBLE_SECONDS))
+            junkRendered++;
+    OK(junkRendered == 0, "a non-finite or negative prediction falls back to the floor");
+    OK(!PVShouldRenderWhileMovingCost(kFast, kFresh, 0.05, 0.011, NAN, PV_MIN_VISIBLE_SECONDS) &&
+       !PVShouldRenderWhileMovingCost(kFast, kFresh, 0.05, 0.011, PV_DWELL_SAFETY_AC, NAN),
+       "a non-finite margin or floor falls back to PV_MIN_VISIBLE_SECONDS");
+
+    // At rest nothing is ever suppressed, whatever it costs. A reader sitting
+    // on a page gets a sharp page even if it takes a second and a half.
+    OK(PVShouldRenderWhileMovingCost(0.0, kFresh, 0.001, 1.5,
+                                     PV_DWELL_SAFETY_BATTERY, PV_MIN_VISIBLE_SECONDS),
+       "at rest, an expensive page still renders");
+    OK(PVShouldRenderWhileMovingCost(kFast, HUGE_VAL, 0.001, 1.5,
+                                     PV_DWELL_SAFETY_BATTERY, PV_MIN_VISIBLE_SECONDS),
+       "with no fresh speed measurement, an expensive page still renders");
+
+    // Determinism, for the same reason the three-argument form is checked for
+    // it: this function reads no clock and holds no state.
+    int stable = 1;
+    BOOL first = PVShouldRenderWhileMovingCost(kFast, kFresh, 0.4, 0.657, 1.5, 0.25);
+    for (j = 0; j < 10000; j++)
+        if (PVShouldRenderWhileMovingCost(kFast, kFresh, 0.4, 0.657, 1.5, 0.25) != first)
+            stable = 0;
+    OK(stable, "same inputs give the same answer across 10000 calls");
+}
+
+#pragma mark - Cost-aware eviction
+
+// A bitmap of a given size, so the cache tests can control bytes exactly.
+static CGImageRef MakeTestImage(size_t w, size_t h)
+{
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(NULL, w, h, 8, 0, cs,
+        (CGBitmapInfo)kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Host);
+    CGColorSpaceRelease(cs);
+    if (!ctx) return NULL;
+    CGImageRef img = CGBitmapContextCreateImage(ctx);
+    CGContextRelease(ctx);
+    return img;
+}
+
+static void TestCostAwareEviction(void)
+{
+    printf("\nCost-aware eviction\n");
+
+    // Four bitmaps of identical size, so bytes cannot be what decides. Budget
+    // holds three of them, so storing the fourth must evict exactly one.
+    CGImageRef img = MakeTestImage(600, 800);
+    OK(img != NULL, "test bitmap was created");
+    if (!img) return;
+    size_t each = PVImageBytes(img);
+    CGSize px = CGSizeMake(600, 800);
+
+    {
+        PVImageCache *c = [[PVImageCache alloc] initWithBudget:each * 3 + each / 2];
+        // Page 0 is expensive to rebuild, pages 1 and 2 are cheap. Stored oldest
+        // first, so a pure LRU would throw page 0 away.
+        [c setFullImage:img pixelSize:px forPage:0 renderSeconds:0.657];
+        [c setFullImage:img pixelSize:px forPage:1 renderSeconds:0.011];
+        [c setFullImage:img pixelSize:px forPage:2 renderSeconds:0.011];
+        [c setFullImage:img pixelSize:px forPage:3 renderSeconds:0.011];
+        OK([c fullImageCount] == 3, "the budget still holds exactly three full bitmaps");
+        OK([c hasFullImageForPage:0 pixelSize:px],
+           "the expensive page survived, though it was the least recently stored");
+        OK(![c hasFullImageForPage:1 pixelSize:px],
+           "the cheapest and oldest page is the one that went");
+        [c release];
+    }
+
+    // The same sequence with no cost information anywhere degrades to the LRU
+    // it replaced. This is what lets the two-argument setters stay truthful and
+    // every test written against the old ordering keep describing the code.
+    {
+        PVImageCache *c = [[PVImageCache alloc] initWithBudget:each * 3 + each / 2];
+        [c setFullImage:img pixelSize:px forPage:0];
+        [c setFullImage:img pixelSize:px forPage:1];
+        [c setFullImage:img pixelSize:px forPage:2];
+        [c setFullImage:img pixelSize:px forPage:3];
+        OK([c fullImageCount] == 3, "unmeasured: the budget still holds three");
+        OK(![c hasFullImageForPage:0 pixelSize:px],
+           "unmeasured: the least recently stored page is evicted, exactly as before");
+        OK([c hasFullImageForPage:3 pixelSize:px], "unmeasured: the newest page is kept");
+        [c release];
+    }
+
+    // Cost is per byte, not per render. A page that took twice as long but
+    // occupies four times the bytes is worse value and must not win.
+    {
+        CGImageRef big = MakeTestImage(1200, 1600);
+        if (big) {
+            size_t bigBytes = PVImageBytes(big);
+            PVImageCache *c = [[PVImageCache alloc] initWithBudget:bigBytes + each];
+            [c setFullImage:big pixelSize:CGSizeMake(1200, 1600) forPage:0 renderSeconds:0.20];
+            [c setFullImage:img pixelSize:px forPage:1 renderSeconds:0.10];
+            // 0.20/4B vs 0.10/1B: the small one is twice the value per byte.
+            [c setFullImage:img pixelSize:px forPage:2 renderSeconds:0.10];
+            OK(![c hasFullImageForPage:0 pixelSize:CGSizeMake(1200, 1600)],
+               "a big slow bitmap loses to a small quick one with better value per byte");
+            [c release];
+            CGImageRelease(big);
+        }
+    }
+
+    // Aging. An expensive page that is never returned to must not be immortal:
+    // the inflation term has to catch up with it, or one 657 ms page outlives
+    // the document that contained it.
+    {
+        PVImageCache *c = [[PVImageCache alloc] initWithBudget:each * 3 + each / 2];
+        [c setFullImage:img pixelSize:px forPage:0 renderSeconds:0.657];
+        int k;
+        for (k = 1; k < 40; k++)
+            [c setFullImage:img pixelSize:px forPage:(NSUInteger)k renderSeconds:0.657];
+        OK(![c hasFullImageForPage:0 pixelSize:px],
+           "an expensive page nobody returns to is eventually evicted anyway");
+        OK([c fullImageCount] == 3, "the budget is still respected after 40 stores");
+        [c release];
+    }
+
+    // Pinning still outranks cost. A page on screen is one the layer above will
+    // ask for again immediately, so evicting it frees nothing -- that has to
+    // remain true whatever the cost model says about it.
+    {
+        PVImageCache *c = [[PVImageCache alloc] initWithBudget:each * 2];
+        [c setPinnedPages:NSMakeRange(0, 2)];
+        [c setFullImage:img pixelSize:px forPage:0 renderSeconds:0.001];
+        [c setFullImage:img pixelSize:px forPage:1 renderSeconds:0.001];
+        [c setFullImage:img pixelSize:px forPage:2 renderSeconds:9.999];
+        OK([c hasFullImageForPage:0 pixelSize:px] && [c hasFullImageForPage:1 pixelSize:px],
+           "cheap pinned pages survive an expensive unpinned one");
+        [c release];
+    }
+
+    CGImageRelease(img);
+}
+
 int main(int argc, const char *argv[])
 {
     @autoreleasepool {
@@ -1250,7 +2092,15 @@ int main(int argc, const char *argv[])
         TestStateStoreCorruptFile();
         TestRunningLocation();
         TestRenderSuppressionPolicy();
+        TestRamTierInvariants();
+        TestResidentCensus();
         TestSchedulerBudgetArithmetic();
+        TestPowerSource();
+        TestRenderPolicy();
+        TestCostModel();
+        TestCostAwareGate();
+        TestCostAwareEviction();
+        TestInFlightFullCap(src, url);
         TestScenarioReplay();
         if (argc > 2) TestRotation([NSString stringWithUTF8String:argv[2]]);
         if (argc > 3) TestArbitrary([NSString stringWithUTF8String:argv[3]]);

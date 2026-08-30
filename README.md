@@ -143,17 +143,26 @@ is already there:
 This machine is old and its battery is tired, so this was treated as a real
 constraint rather than an afterthought.
 
-- **Rendering runs at background QoS, and that is the single biggest saving
-  here.** The render queue targets `DISPATCH_QUEUE_PRIORITY_BACKGROUND`, which
-  confines the work to efficiency cores at a low clock. Measured on this
-  hardware, one full-resolution page costs about **84 mJ** there against
-  **684 mJ** at default priority — the same work for roughly an eighth of the
-  energy, in exchange for about 3.8x the wall time. It is worth knowing that
-  this is a real trade and not a free win: the page takes visibly longer to
-  sharpen, and that is deliberate. The figures are `task_power_info` readings
-  taken on an M4 with the render loop driven at each QoS band in turn; they will
-  differ in magnitude on the Mavericks-era hardware this targets, but the
-  direction is a property of how the scheduler places the work, not of the chip.
+- **Rendering runs at background QoS.** The render queue targets
+  `DISPATCH_QUEUE_PRIORITY_BACKGROUND`. On Apple silicon that confines the work
+  to efficiency cores at a low clock: measured there, one full-resolution page
+  costs about **84 mJ** against **684 mJ** at default priority — the same work
+  for roughly an eighth of the energy, in exchange for about 3.8x the wall time.
+  That is a real trade and not a free win; the page takes visibly longer to
+  sharpen, deliberately. The figures are `task_power_info` readings taken on an
+  M4 with the render loop driven at each QoS band in turn.
+
+  **On the 2013 Mac Pro this targets, the mechanism is different and the
+  eightfold saving does not transfer.** Its Xeon E5 v2 cores are homogeneous —
+  there are no efficiency cores to land on, so the same core does the same work
+  at the same frequency and a backgrounded render is not cheaper in joules. What
+  the setting buys there is lower scheduling priority, timer coalescing and
+  throttled I/O: the render thread stays out of the UI's way, which is worth
+  having and is measured as a win, but the energy saving on that machine comes
+  from **doing less work** — the motion gate below — rather than from cheaper
+  work. Both machines want the same setting for different reasons, and it is
+  worth being explicit, because a future change reasoning from "renders are 1/8
+  price here" would be reasoning from something untrue of the target.
 
 - **One exception, bounded: the page you are actually waiting on.** Opening a
   document, or jumping to a page nothing is cached for, leaves you looking at a
@@ -320,6 +329,224 @@ constraint rather than an afterthought.
 
 ---
 
+## Postview versus Preview
+
+Postview exists for one workload — reading a long PDF on a Mavericks-era Mac —
+and it is built around one idea: **most of the pixels a PDF viewer rasterises
+are never looked at.** Pages that fly past during a scroll, pages prefetched in
+a direction the reader turned out not to go, the same page re-rendered because
+something else evicted it. Postview's scheduler declines that work. Everything
+below follows from it.
+
+The priorities, in order, and they are not equally weighted: **battery life
+first, then responsiveness, then memory.** Where those conflict, the earlier one
+wins, and the sections below say where they conflicted.
+
+### Where each one wins
+
+| | Postview | Preview |
+|---|---|---|
+| Work refused during motion | asks for **zero** full-resolution bitmaps while the document moves | renders what is in front of it |
+| Rasterisation priority | background QoS, off the UI's path | default priority |
+| Memory ceiling | hard byte budget, ~96 MB of bitmaps, invariant asserted per RAM tier | no stated ceiling; in practice **lower than Postview's** |
+| Peak memory | **loses in all five scenarios** | wins |
+| Reading a PDF | that is all it does | does it too |
+| Text selection, search, copy | none | yes |
+| Annotation, Markup, signatures, forms | none | yes |
+| Editing pages, export, other formats | none | yes |
+| Encrypted PDFs | refuses, with a message pointing at Preview | opens them |
+| Printing | none | yes |
+| Code signature, sandbox, Quick Look | none | yes |
+| Reports what it rasterised | full census (`-PVStats YES`) | cannot be asked |
+
+The headline is the first row and the fourth, and they point opposite ways.
+Postview refuses work Preview does — that is the reason it exists. Preview does
+a dozen things Postview does not do at all, and it does them in less memory.
+
+### What Postview does better, and how
+
+**It does not render what you cannot see.** This is the whole design, and it is
+the only one of these that is a genuine architectural difference rather than a
+tuning choice. During any motion — trackpad, wheel, held Page Down, arrow
+repeat — the scheduler asks for cheap previews (1/9 the pixels) and *no*
+full-resolution bitmaps at all. It is two independent layers, either sufficient
+on its own: an outer motion gate, and a per-page dwell test that asks whether a
+page will still be on screen when its render could finish.
+
+One exception, deliberate and measured: the *first* event of a keyboard scroll.
+A gesture announces itself before it begins, so its very first event is already
+known to be a scroll; a key press is not announced, and the first one is
+indistinguishable from a single deliberate Page Down — which is the case
+`read` is made of, and where a sharp page is the entire point. So the first one
+renders, at a cost of one wanted-set rebuild per scroll episode (per episode,
+not per key). The UI suite pins that at ≤ 2 full requests for the keyboard and
+exactly 0 for the trackpad, so the difference cannot drift without a test
+failing.
+
+Getting this device-independent was the largest single correction in the
+project. The gate used to be `if (!_liveScrolling)`, which is a question about
+*which input device* moved the document — AppKit posts that notification for
+gestures and not for a held key. So the trackpad was throttled and the keyboard
+was not, and a held Page Down took the unthrottled path: a full-resolution
+bitmap plus prefetches for every page it flew past. Replaying the recorded
+workloads through the scheduler, full-resolution render *requests* model out at
+39 → 7 (`read`), 160 → 4 (`page`) and 400 → 4 (`scroll`). Those are
+Postview-against-Postview and come from its own census, so they are unaffected
+by the harness caveat further down; the zero-during-motion property underneath
+them is asserted directly by the UI suite against a real window controller.
+
+**It renders out of the UI's way.** The render queue targets
+`DISPATCH_QUEUE_PRIORITY_BACKGROUND`. On Apple silicon that is also a large
+energy saving because the work lands on efficiency cores; on the 2013 Mac Pro
+this actually targets it is not, because those cores are homogeneous — there it
+buys scheduling priority, timer coalescing and throttled I/O, and the energy win
+comes from the motion gate doing less work rather than from cheaper work. Worth
+stating plainly, because the two machines have different reasons for the same
+correct setting.
+
+**It bounds what it holds, and says so in code.** The page cache is byte-budgeted
+and evicts to a budget that scales with installed RAM; visible pages are pinned
+so a page on screen cannot be evicted by another page the same pass wants;
+undelivered bitmaps — rasterised but not yet handed to the main thread, where no
+cache budget can see them — are capped at two. The invariant that two
+full-resolution pages plus five previews must fit the eviction budget is
+asserted by the unit suite on every RAM tier, not left to whoever next edits a
+constant.
+
+**It opens straight to a window and does not restore your last session.** Launch
+is a window with your document in it; there is no Open panel and no reopening of
+whatever you were reading last time. Reading positions are still remembered
+per file and come back when you open that file.
+
+**It can be asked what it did.** With `-PVStats YES` it reports full renders,
+previews, megapixels, requests suppressed by each gate separately, and the
+high-water mark of resident rendered bytes. That is how every claim here was
+checked, and it is why the memory loss below is stated as a number rather than
+as an impression. Preview has no equivalent, which is a limit of the method
+rather than a result.
+
+### Where Postview loses
+
+**Memory, in every scenario, and it is the one metric that has never gone the
+right way.** Against Preview's peak RSS the recorded gaps were +33 MB
+(`launch`), +26 MB (`idle`), **+120 MB (`read`)**, +77 MB (`page`) and +50 MB
+(`scroll`). Mean RSS loses by about the same margin, so this is a sustained
+level and not a spike. The unit of the problem is one full-page bitmap: ~7
+megapixels, ~28 MB at 4 bytes per pixel, and every gap above is close to a whole
+number of them.
+
+Those five figures come from the same run as the CPU figures below, so they
+carry the same caveat — but they are much the least sensitive to it. A page
+bitmap's size is set by the page geometry and the window, both of which the
+harness equalises, and not by how complicated the page is; a 59× more expensive
+page is not one byte larger. The gaps are also corroborated from inside the
+process, by Postview's own resident-bytes census, which never involves Preview.
+The direction is not in doubt. The exact megabytes should be re-taken with the
+rest.
+
+Two of the four contributors have been fixed (the undelivered-bitmap cap, and
+making the delivery keep-window directional so the page *behind* a moving
+viewport no longer keeps a 28 MB bitmap nobody asked for). Together they are
+worth roughly half of the `read` gap. The rest is the cache sitting at its
+budget, and cutting the budget is not available as a fix without either
+rendering every page soft or rendering pages in bands — see
+`ENGINEERING.md` §4.1 and §7.
+
+**It is not a PDF application; it is a PDF reader.** No text selection, no copy,
+no search, no printing, no annotation, no page editing, no export, no other file
+formats, no encrypted PDFs. For a great many people "no search" alone
+disqualifies it. Preview is the right tool for all of that and Postview says so
+when it declines a file.
+
+**One page is rasterised at a time, on one thread.** `CGContextDrawPDFPage`
+interprets a sequential program and cannot be split, resumed or cancelled, and
+the render queue is deliberately serial to bound resident bytes. On a
+vector-heavy page — measured at **657 ms** against **11 ms** for a text page of
+*identical pixel dimensions*, a factor of **59** — you wait, while the Mac Pro's
+other 7 to 23 hardware threads do nothing. Preview is not obviously better at
+this, but nothing in Postview's design attacks it yet.
+
+(`make band`, on the development host, running the shipping x86_64 binary under
+Rosetta. The *ratio* is what transfers and it holds within 0.03 on native arm64
+as well; the absolute milliseconds do not — a 2013 Xeon is slower than
+Rosetta-translated code on Apple silicon, so 657 ms is a lower bound for the
+target and the real figure is likely higher.)
+
+**The latency mechanism does not run on the target machine.** The express lane
+promotes exactly one page — the one you are waiting on — to a higher QoS, via
+`dispatch_block_create_with_qos_class`. That API is 10.10+. On Mavericks the
+`dlsym` returns NULL and an express request gets *ordering* priority only — it
+is picked first, but it is not scheduled any faster. The one mechanism the app
+has for "get this page in front of the user sooner" is inert on the machine this
+targets. It works on 10.10 and later, so it is not dead code; it is simply not
+collected where it matters most. The consolation is that its cost is not paid
+there either.
+
+**Every render budget is denominated in pixels or bytes, and is being used as a
+proxy for time.** `PV_MIN_VISIBLE_SECONDS` suppresses renders a text page could
+afford twenty times over, and admits a 657 ms vector render into a 250 ms
+window. One constant, two wrong answers, because the quantity it stands in for
+varies by 59× across documents. A measured cost model would fix it and has not
+been built.
+
+**It is unsigned, unsandboxed and not a system app.** Gatekeeper needs a
+right-click → Open the first time. It deliberately registers as an *alternate*
+PDF handler so installing it does not take the association away from Preview.
+
+### The state of the head-to-head numbers
+
+**The recorded Postview-vs-Preview measurements should not be quoted, and the
+comparison needs re-running.** The harness staged each trial as a hard link to
+the PDF so that neither app would recognise the file and restore a saved reading
+position. A hard link is the same inode — the same file under a second name.
+Postview keys its saved position on the *path*, so it was fooled and started at
+page 1. Preview keys on the document's identity and was not fooled: it reopened
+at whatever page it had last been left on.
+
+The evidence is in the recorded TSV, in the `launch` scenario, which sends no
+input at all: Preview's window title reads *page 1,174 of 1,263* while
+Postview's reads *page 1 of 1263*. The two apps were rasterising different parts
+of a 1,263-page book — and the cost of a page varies by up to 59× with its
+content at identical pixel counts. Whichever way that error pointed, it is
+larger than the effect being measured.
+
+A second, independent unfairness sits beside it: in the `scroll` scenario the
+same 200 keystrokes moved Preview 48 pages and Postview 7, so those CPU figures
+are per-keypress rather than per-page.
+
+Both are fixed, and both are now checked rather than assumed:
+
+- trials are staged as **copies**, which have their own inode and their own
+  document identity;
+- the harness reads each app's own window title after it opens and records the
+  starting page in the TSV, and a trial that did not start on page 1 is
+  disqualified;
+- travel distance is recorded per trial, and a scenario where one app moved more
+  than twice as far as the other is flagged;
+- if either check fails, the script prints **NO VERDICT** and refuses to name a
+  winner, rather than averaging a contaminated run into a confident-looking
+  number;
+- the self-test covers all of it, including a case that asserts a hard link and
+  a copy differ in exactly the way the bug depended on.
+
+The check matters more than the copy. Inode identity is the mechanism that fits
+the evidence, but Preview is a closed application and it is not this project's
+place to be certain how it decides that two files are the same document — if it
+turns out to key on content, or on Spotlight metadata, a copy will not help
+either. What does help, whatever the mechanism, is that the harness no longer
+*assumes* the reset worked: it asks each app what page it is on and refuses to
+score the run if the answer is wrong. That is the part to keep.
+
+The architectural claims in this README do not rest on that harness. They are
+asserted by `make verify-all` — a static-analysis pass, 212 unit checks, 128 UI
+checks that drive a real window controller, a 150-cycle soak, a stress suite
+under ASan/UBSan and TSan, and a leak census — all of which run on any Mac and
+none of which involve Preview. The *comparative* claims do rest on it, and until
+the showdown is re-run on the Mavericks machine with the fixed staging, the
+honest statement is that they are unmeasured.
+
+---
+
 ## Is it actually faster than Preview?
 
 **Start here: `Postview-Showdown.command`.** One command, both apps, five
@@ -340,10 +567,22 @@ It measures the three things that actually drain a battery — exact CPU seconds
 from the kernel's own counter, Mavericks' Energy Impact figure, and idle wakeups
 as a delta — plus peak memory and launch time, across `launch`, `idle`, `read`,
 `page` and `scroll`. It equalises both windows to the same size, opens a fresh
-hardlink per trial so neither app restores a page position, waits for a quiet
-machine, and alternates which app goes first so a session-long thermal trend is
-not handed to one side. A metric whose run-to-run spread is wider than the gap
-between the apps is flagged as noisy instead of being allowed to decide anything.
+**copy** of the document per trial so neither app restores a page position,
+waits for a quiet machine, and alternates which app goes first so a
+session-long thermal trend is not handed to one side. A metric whose
+run-to-run spread is wider than the gap between the apps is flagged as noisy
+instead of being allowed to decide anything.
+
+**It also checks that the two apps were asked the same question, and refuses to
+declare a winner when they were not.** Both apps' starting and ending page are
+read out of their own window titles and recorded per trial. A trial that did not
+begin on page 1 is disqualified; a scenario where one app travelled more than
+twice as far as the other is flagged; and if either happens the script prints
+`NO VERDICT` with the reason instead of a scoreboard. This is not hypothetical
+tidiness — it is there because a staging bug let Preview resume at page 1,174 of
+a 1,263-page book while Postview started at page 1, and every metric in the run
+was silently a comparison of two different workloads. See *The state of the
+head-to-head numbers* above.
 
 It also reports what Postview itself rasterised — full renders, previews,
 megapixels, suppressed requests — beside the figures from before the render
@@ -357,7 +596,18 @@ One thing it will tell you that looks wrong and is not: the `read` workload
 reports **zero suppressed requests**. That is correct. `read` presses Page Down
 every 2.5 seconds, which leaves the document at rest between presses, and a page
 someone is sitting and reading should be sharp. Suppression is for pages flying
-past, and `page` and `scroll` are where it shows up. See `RENDER-SCHEDULER.md`.
+past, and `page` and `scroll` are where it shows up. See `ENGINEERING.md`.
+
+`scroll` used to report zero as well, and *that* was wrong — not in the app, in
+the counter. Suppression happens in two places: a per-page dwell test, and an
+outer motion gate. Only the dwell test was counted, and the motion gate is an
+outer branch, so when it closed, the arm containing the counter was skipped
+entirely. At scroll speeds a page is on screen for about 0.76 s, comfortably
+past the dwell threshold, so nothing was dwell-suppressed and the gate doing all
+of the actual work got no credit for any of it. The two are now reported as
+separate columns plus a total, rather than the older column quietly changing
+meaning — runs recorded against `requests_suppressed` go back to the first
+profile and it still counts exactly what it always counted.
 
 ### The older, narrower tools
 
@@ -456,6 +706,17 @@ rendering benchmark, and the summary says so rather than implying otherwise. It
 also says nothing about rendering quality, and a PDF that is unusual for one
 engine and ordinary for the other will say so — which is the point of running it
 on your own files.
+
+**If you have a TSV from an older `Postview-Profile.command`, its `run` column
+is wrong and its `RUNS` setting was ignored.** `sample_process()` read its two
+figures into variables called `c` and `r`, and `r` was also the run counter of
+the loop driving the whole script — shell functions have no locals, so the first
+sample of the first trial overwrote it with a resident-set size in kilobytes.
+That is why the `run` column in those files contains numbers like `139704`. The
+same overwrite then made `while [ "$r" -le "$RUNS" ]` compare ~150000 against
+`RUNS`, so the loop ended after one pass: every one of those profiles is a
+single unrepeated trial per scenario, with no spread to check it against. Fixed;
+the variables are prefixed now. Re-take any profile you were relying on.
 
 ## Building
 

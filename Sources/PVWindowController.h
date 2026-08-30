@@ -25,6 +25,14 @@
     PVRenderQueue    *_thumbQueue;
     PVThumbStripView *_thumbView;
     NSScrollView     *_thumbScrollView;
+    // The thumbnail range last handed to the thumbnail queue, and whether there
+    // is one. The same early-out the page view has, for the same reason:
+    // dragging the strip posts a bounds notification per frame, and rebuilding
+    // an identical wanted set for each one allocates a request array and takes
+    // the render queue's lock 60-120 times a second to reach the answer it
+    // already had. See -updateThumbnailContent.
+    NSRange           _lastThumbRange;
+    BOOL              _haveThumbState;
 
     NSSplitView      *_splitView;
 
