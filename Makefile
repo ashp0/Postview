@@ -57,7 +57,7 @@ CFLAGS := -arch x86_64 -march=core2 -mmacosx-version-min=$(MIN) -isysroot $(SDK)
 LDFLAGS := -arch x86_64 -mmacosx-version-min=$(MIN) -isysroot $(SDK) \
            -framework Cocoa -framework CoreGraphics -Wl,-dead_strip
 
-.PHONY: all clean run dist verify icon analyze release test uitest soak stress leakcheck verify-all band
+.PHONY: all clean run dist verify icon analyze release test uitest soak stress leakcheck verify-all band bandtool
 
 all: $(BUNDLE)
 
@@ -101,7 +101,7 @@ $(SHOWDOWN): $(SHOWDOWN_SOURCE)
 run: $(BUNDLE)
 	@open $(BUNDLE)
 
-dist: $(BUNDLE) verify $(BENCHMARK) $(PROFILE) $(SHOWDOWN)
+dist: $(BUNDLE) verify bandtool $(BENCHMARK) $(PROFILE) $(SHOWDOWN)
 	@rm -rf "$(DISTDIR)"
 	@mkdir -p "$(DISTDIR)"
 	@ditto "$(BUNDLE)" "$(DISTDIR)/$(BUNDLE)"
@@ -109,6 +109,7 @@ dist: $(BUNDLE) verify $(BENCHMARK) $(PROFILE) $(SHOWDOWN)
 	@cp "$(BENCHMARK)" "$(DISTDIR)/$(BENCHMARK)"
 	@cp "$(PROFILE)" "$(DISTDIR)/$(PROFILE)"
 	@cp "$(SHOWDOWN)" "$(DISTDIR)/$(SHOWDOWN)"
+	@cp $(BUILD)/pvband "$(DISTDIR)/pvband"
 	@xattr -cr "$(DISTDIR)" 2>/dev/null || true
 	@rm -f $(APP).zip
 	@ditto -c -k --sequesterRsrc "$(DISTDIR)" $(APP).zip
@@ -203,7 +204,22 @@ soak: $(OBJECTS) | $(BUILD)
 BANDPAGES ?= 6
 BANDREPS  ?= 3
 
-band: | $(BUILD)
+# Builds the probe without running it, and targets 10.9 like the app does.
+#
+# Split out of `band` so `make dist` can ship the binary. The probe cannot be
+# COMPILED on the Mavericks machine -- $(CFLAGS) carries
+# -Werror=unguarded-availability, which Xcode 6's clang does not have -- but the
+# binary it produces is x86_64/10.9 and RUNS there natively. That is the only
+# way the measurement ENGINEERING.md section 7 asks for can be taken on the
+# machine that decides, so the probe travels in the distributable.
+bandtool: | $(BUILD)
+	@$(CC) $(CFLAGS) -ISources -c Sources/PVCommon.m    -o $(BUILD)/band-PVCommon.o
+	@$(CC) $(CFLAGS) -ISources -c Sources/PVPDFSource.m -o $(BUILD)/band-PVPDFSource.o
+	@$(CC) $(CFLAGS) -ISources -c Tests/pvband.m        -o $(BUILD)/pvband.o
+	@$(CC) $(LDFLAGS) $(BUILD)/band-PVCommon.o $(BUILD)/band-PVPDFSource.o $(BUILD)/pvband.o -o $(BUILD)/pvband
+	@echo "  built    $(BUILD)/pvband (x86_64, 10.9 -- runs on the Mavericks machine)"
+
+band: bandtool | $(BUILD)
 	@test -f $(BUILD)/heavy.pdf || ( \
 	   $(CC) -isysroot $(SDK) -fobjc-arc -framework Cocoa \
 	     -o $(BUILD)/mkheavy Tests/make_heavy_fixture.m && \
@@ -212,10 +228,6 @@ band: | $(BUILD)
 	   $(CC) -isysroot $(SDK) -fobjc-arc -framework Cocoa \
 	     -o $(BUILD)/mktext Tests/make_text_fixture.m && \
 	   $(BUILD)/mktext $(BUILD)/text.pdf 60 )
-	@$(CC) $(CFLAGS) -ISources -c Sources/PVCommon.m   -o $(BUILD)/band-PVCommon.o
-	@$(CC) $(CFLAGS) -ISources -c Sources/PVPDFSource.m -o $(BUILD)/band-PVPDFSource.o
-	@$(CC) $(CFLAGS) -ISources -c Tests/pvband.m       -o $(BUILD)/pvband.o
-	@$(CC) $(LDFLAGS) $(BUILD)/band-PVCommon.o $(BUILD)/band-PVPDFSource.o $(BUILD)/pvband.o -o $(BUILD)/pvband
 	@echo "== x86_64 (the shipping architecture; under Rosetta on an Apple silicon host) =="
 	@$(BUILD)/pvband $(PDF) $(BANDPAGES) $(BANDREPS)
 	@echo ""
