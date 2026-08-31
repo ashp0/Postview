@@ -90,6 +90,7 @@ static void PVInstallRequestCounter(void)
 // build, and a warning that is always present is a warning nobody reads.
 - (void)clipBoundsChanged:(NSNotification *)note;
 - (void)scrollToPage:(NSUInteger)page fraction:(CGFloat)fraction;
+- (void)scrollClipTo:(NSPoint)p;
 - (void)pageViewWillMagnify:(PVPageView *)v atPoint:(NSPoint)p;
 - (void)pageView:(PVPageView *)v magnifyBy:(CGFloat)factor;
 - (void)pageViewDidMagnify:(PVPageView *)v;
@@ -1142,6 +1143,27 @@ int main(int argc, const char *argv[])
             OK(motion > 0,
                "the motion gate now reports the full renders it withheld");
 
+            // The paired RSS reading. The showdown subtracts this from the
+            // resident high-water mark to say how much of the peak is NOT
+            // rendered pixels, and that subtraction is only a quantity if both
+            // terms describe the same instant -- which is the whole reason the
+            // app takes the reading itself instead of the sampler taking a
+            // maximum of its own.
+            //
+            // Asserted as an inequality rather than a value, because the value
+            // is whatever this machine's frameworks weigh. The inequality is
+            // the part that would break if the pairing did: RSS at the moment
+            // the bitmaps peaked cannot be smaller than the bitmaps, since they
+            // are resident memory and are counted in it.
+            double rssAtPeak = PVStatValue(PVStatRSSAtPeakResident);
+            double residentPeak = (double)PVResidentHighWater();
+            printf("  rss at the bitmap peak: %.1f MB, bitmaps %.1f MB\n",
+                   rssAtPeak / (1024.0 * 1024.0), residentPeak / (1024.0 * 1024.0));
+            OK(rssAtPeak > 0,
+               "RSS is sampled at the instant the bitmap census peaks");
+            OK(rssAtPeak >= residentPeak,
+               "...and is never smaller than the bitmaps it contains");
+
             // Slow: 8 pt every 40 ms is 200 pt/s, a deliberate read-along drag.
             // Every page survives the dwell test at that speed, so the per-page
             // policy says "render" for both devices -- and here the two DO
@@ -1313,6 +1335,183 @@ int main(int argc, const char *argv[])
             PVSetPowerSourceOverride(PVPowerBattery, YES);
             [pcache removeAll];
             PumpUntil(^{ return [pq isIdle]; }, 90.0);
+        }
+
+        printf("\n[5g7] an arrow press moves the viewport by one eighth of itself\n");
+        {
+            // PVArrowScrollForViewportHeight is pinned by pvtest as a pure
+            // function. What that cannot show is that -keyDown: actually calls
+            // it, which is the half the showdown measures: the recorded failure
+            // was 200 presses moving Postview 6 pages against Preview's 13, and
+            // it was a real NSEvent that produced it. So this drives a real
+            // NSEvent through the real view and reads the clip view afterwards.
+            PVPageView   *pv   = [wc valueForKey:@"_pageView"];
+            NSScrollView *sv   = [wc valueForKey:@"_scrollView"];
+            NSClipView   *clip = [sv contentView];
+
+            [wc goToPageNumber:8];
+            Pump(0.05);
+
+            NSString *down = [NSString stringWithFormat:@"%C",
+                                  (unichar)NSDownArrowFunctionKey];
+            NSString *up   = [NSString stringWithFormat:@"%C",
+                                  (unichar)NSUpArrowFunctionKey];
+            NSEvent *downEvent =
+                [NSEvent keyEventWithType:NSEventTypeKeyDown
+                                 location:NSZeroPoint
+                            modifierFlags:0
+                                timestamp:0
+                             windowNumber:[[wc window] windowNumber]
+                                  context:nil
+                               characters:down
+              charactersIgnoringModifiers:down
+                                isARepeat:NO
+                                  keyCode:125];
+            NSEvent *upEvent =
+                [NSEvent keyEventWithType:NSEventTypeKeyDown
+                                 location:NSZeroPoint
+                            modifierFlags:0
+                                timestamp:0
+                             windowNumber:[[wc window] windowNumber]
+                                  context:nil
+                               characters:up
+              charactersIgnoringModifiers:up
+                                isARepeat:NO
+                                  keyCode:126];
+
+            CGFloat viewport = NSHeight([clip documentVisibleRect]);
+            CGFloat expected = PVArrowScrollForViewportHeight(viewport);
+
+            CGFloat before = NSMinY([clip documentVisibleRect]);
+            [pv keyDown:downEvent];
+            CGFloat afterDown = NSMinY([clip documentVisibleRect]);
+            [pv keyDown:upEvent];
+            CGFloat afterUp = NSMinY([clip documentVisibleRect]);
+
+            OK(fabs((afterDown - before) - expected) < 1.0,
+               "a Down press moves the viewport by the computed step");
+            OK(fabs(afterUp - before) < 1.0,
+               "an Up press puts it back");
+            OK(expected > 60.0,
+               "the step is larger than the flat 60 pt that failed the showdown");
+
+            // Ten presses travel ten steps, so the showdown's 200 are not
+            // being eaten by rounding inside -scrollByPoints:.
+            CGFloat start = NSMinY([clip documentVisibleRect]);
+            int kp;
+            for (kp = 0; kp < 10; kp++) [pv keyDown:downEvent];
+            CGFloat travelled = NSMinY([clip documentVisibleRect]) - start;
+            OK(fabs(travelled - 10.0 * expected) < 2.0,
+               "ten presses travel ten steps, with no drift");
+
+            [wc goToPageNumber:8];
+            Pump(0.05);
+        }
+
+        printf("\n[5g8] a programmatic scroll records where it actually landed\n");
+        {
+            // _lastScrollY is the controller's memory of where the viewport was,
+            // and -clipBoundsChanged: measures both direction and speed as the
+            // difference between it and what the clip view reports next.
+            //
+            // Every programmatic scroll rounds its target to a whole point, and
+            // AppKit constrains the result again to the document's bounds. The
+            // two scrolling paths used to record the number they had ASKED for,
+            // so the very next bounds notification measured up to half a point
+            // of travel that never happened. Half a point sits exactly on the
+            // direction threshold (`y > _lastScrollY + 0.5`), and divided by the
+            // 2 ms floor on a sample interval it is ~250 pt/s of scrolling
+            // reported for a viewport that was standing still -- into an
+            // estimator that is deliberately seeded from its first sample.
+            //
+            // Asserted as an exact equality on purpose. This is not a tolerance
+            // question: the recorded position either is where the viewport is or
+            // it is a number about nothing.
+            NSScrollView *sv   = [wc valueForKey:@"_scrollView"];
+            NSClipView   *clip = [sv contentView];
+
+            NSUInteger probes[4] = { 0, 3, 12, 37 };
+            BOOL exact = YES, exactAfterFraction = YES;
+            unsigned k;
+            for (k = 0; k < 4; k++) {
+                [wc scrollToPage:probes[k] fraction:0];
+                Pump(0.05);
+                double recorded = [[wc valueForKey:@"_lastScrollY"] doubleValue];
+                double actual   = (double)NSMinY([clip documentVisibleRect]);
+                if (recorded != actual) exact = NO;
+
+                // A fractional offset is where the rounding actually bites: the
+                // target is page origin + fraction * height, which is rarely a
+                // whole number.
+                [wc scrollToPage:probes[k] fraction:0.37f];
+                Pump(0.05);
+                recorded = [[wc valueForKey:@"_lastScrollY"] doubleValue];
+                actual   = (double)NSMinY([clip documentVisibleRect]);
+                if (recorded != actual) exactAfterFraction = NO;
+            }
+            OK(exact, "after a page jump the recorded position is the real one");
+            OK(exactAfterFraction,
+               "...and after a jump to a fractional offset, where rounding bites");
+
+            // A target past the end is clamped by AppKit, not by the caller's
+            // arithmetic, which is the other way the two used to disagree.
+            [wc scrollClipTo:NSMakePoint(0, 1.0e9)];
+            Pump(0.05);
+            OK([[wc valueForKey:@"_lastScrollY"] doubleValue] ==
+                   (double)NSMinY([clip documentVisibleRect]),
+               "a scroll clamped by the document's own bounds is recorded as clamped");
+
+            // The property all of that exists for: the notification a
+            // programmatic scroll causes must measure no travel at all.
+            [wc setValue:[NSNumber numberWithDouble:0.0] forKey:@"_scrollSpeed"];
+            [wc setValue:[NSNumber numberWithDouble:
+                             [NSDate timeIntervalSinceReferenceDate] - 0.003]
+                  forKey:@"_lastScrollTime"];
+            [wc scrollToPage:20 fraction:0.61f];
+            [wc clipBoundsChanged:nil];
+            OK([[wc valueForKey:@"_scrollSpeed"] doubleValue] == 0.0,
+               "so the notification it causes reports no speed, because there was none");
+        }
+
+        printf("\n[5g9] a viewport with nothing in it forgets the set it just dropped\n");
+        {
+            // -updateVisibleContent's degenerate branch clears the cache's pin
+            // and the queue's pending set, because neither describes anything
+            // any more. _lastRequestRange / _haveRequestState are the record OF
+            // that set, and -clipBoundsChanged: skips the whole rebuild whenever
+            // the range it computes matches them.
+            //
+            // Leaving the record standing while emptying the two things it is a
+            // record of is the one combination that cannot be right: a viewport
+            // that goes empty and comes back to the same page range is then
+            // recognised as unchanged, and the rebuild that would have re-pinned
+            // the visible pages and re-requested their bitmaps never runs.
+            //
+            // Reached here by handing the controller a page view that has not
+            // been laid out, which is exactly what -pageRangeInRect: answers
+            // with an empty range for.
+            PVPageView *real  = [[wc valueForKey:@"_pageView"] retain];
+            PVImageCache *pc  = [wc valueForKey:@"_pageCache"];
+            PVPDFSource  *psrc = [wc valueForKey:@"_source"];
+            PVPageView *blank = [[PVPageView alloc] initWithSource:psrc cache:pc];
+
+            [wc updateVisibleContent];
+            OK([[wc valueForKey:@"_haveRequestState"] boolValue],
+               "a laid-out viewport records the set it asked for");
+
+            [wc setValue:blank forKey:@"_pageView"];
+            [wc updateVisibleContent];
+            OK(![blank isLaidOut], "the stand-in page view really has no layout");
+            OK(![[wc valueForKey:@"_haveRequestState"] boolValue],
+               "an empty viewport drops the record along with the set it describes");
+
+            [wc setValue:real forKey:@"_pageView"];
+            [blank release];
+            [real release];
+            // Put the controller back to a state the sections after this one can
+            // rely on, rather than leaving them to inherit a torn-down one.
+            [wc updateVisibleContent];
+            PumpUntil(^{ return [(PVRenderQueue *)[wc valueForKey:@"_pageQueue"] isIdle]; }, 60.0);
         }
 
         printf("\n[5g] the page stays centred at every width, in every zoom mode\n");
@@ -1615,9 +1814,28 @@ int main(int argc, const char *argv[])
                "releasing the controller frees the page view");
             // The page view is what holds the cache and the document, so these
             // are the numbers that say the memory actually came back.
-            OK(PVLiveCount("PVImageCache") == cachesBefore,
+            //
+            // Waited for, not sampled once. These two used to be bare
+            // comparisons taken the instant the page view count reached zero,
+            // on the assumption that whatever the page view held died with it.
+            // It does not have to: the render queue's worker block holds its own
+            // reference to the source until it next looks at the stop flags, and
+            // a delivery already queued holds the cache until it runs on the
+            // main thread -- the same asynchronous unwind pvstress's
+            // SettlesToZero exists for. So the assertion was racing, and it lost
+            // roughly one run in three on this host: `and the parsed PDF behind
+            // it` failed while `and the bitmap cache it held` passed, and both
+            // passed on the immediately following run.
+            //
+            // A deadline keeps the assertion honest -- an object that never
+            // comes back still fails, twenty seconds later -- while a single
+            // sample was only ever asserting that this machine happened to be
+            // quick enough. A flaky gate is worse than a missing one: it teaches
+            // you to re-run until green, which is exactly how the ASan failure
+            // in ENGINEERING.md section 9.6 survived for as long as it did.
+            OK(PumpUntil(^{ return (BOOL)(PVLiveCount("PVImageCache") == cachesBefore); }, 20.0),
                "and the bitmap cache it held");
-            OK(PVLiveCount("PVPDFSource") == sourcesBefore,
+            OK(PumpUntil(^{ return (BOOL)(PVLiveCount("PVPDFSource") == sourcesBefore); }, 20.0),
                "and the parsed PDF behind it");
             printf("  (AppKit is still holding that window: isVisible=%d, never deallocated)\n",
                    (int)[heldWindow isVisible]);

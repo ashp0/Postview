@@ -859,7 +859,7 @@ run_trial() {
     # differently is only ever the length of one trial.
     [ -n "$statfile" ] && postview_settings_clear
 
-    rf="-"; rp="-"; mp="-"; sup="-"; supm="-"; res="-"; resu="-"; resc="-"
+    rf="-"; rp="-"; mp="-"; sup="-"; supm="-"; res="-"; resu="-"; resc="-"; resr="-"
     if [ -n "$statfile" ] && [ -f "$statfile" ]; then
         rf=$(pvstat renders.full "$statfile")
         rp=$(pvstat renders.preview "$statfile")
@@ -869,10 +869,14 @@ run_trial() {
         res=$(pvstat resident.peak.mb "$statfile")
         resu=$(pvstat resident.peak.undelivered.mb "$statfile")
         resc=$(pvstat resident.peak.cache.mb "$statfile")
+        # RSS as it stood when the census peaked. Paired with `res` by the app,
+        # so the two can be subtracted; see the resident block in the analysis.
+        resr=$(pvstat resident.peak.rss.mb "$statfile")
         [ -n "$rf" ]   || rf="-";   [ -n "$rp" ]   || rp="-"
         [ -n "$mp" ]   || mp="-";   [ -n "$sup" ]  || sup="-"
         [ -n "$supm" ] || supm="-"; [ -n "$res" ]  || res="-"
         [ -n "$resu" ] || resu="-"; [ -n "$resc" ] || resc="-"
+        [ -n "$resr" ] || resr="-"
     fi
 
     # Where the document ended up, beside where it started. The pair is what
@@ -882,11 +886,11 @@ run_trial() {
     end_page=$(page_from_title "$LAST_TITLE")
     [ -n "$end_page" ] || end_page="-"
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$app" "$scen" "$iter" "$launch" "$wall" "$cpu_used" "$cpu_rate" \
         "$pw_mean" "$pw_peak" "$wakeups" "$mean_rss" "$rss_peak" \
         "$rf" "$rp" "$mp" "$sup" "$supm" "$res" "$resu" "$resc" \
-        "$start_idle" "$START_PAGE" "$end_page" >> "$OUTPUT"
+        "$start_idle" "$START_PAGE" "$end_page" "$resr" >> "$OUTPUT"
     printf '  %-9s %-7s run %s: cpu %ss  energy %s  wakeups %s  peak rss %s MB  pages %s->%s%s\n' \
         "$app" "$scen" "$iter" "$cpu_used" "$pw_mean" "$wakeups" \
         "$(/usr/bin/awk -v k="$rss_peak" 'BEGIN { printf "%.0f", k/1024 }')" \
@@ -1075,39 +1079,59 @@ AWKEOF
     # on page 1,174 while Postview starts on page 1. A run like this must not
     # be allowed to name a winner, however clean its CPU columns look.
     unfairtsv="$WORKDIR/selftest-unfair.tsv"
-    printf 'app\tscenario\trun\tlaunch_seconds\twall_seconds\tcpu_seconds\tcpu_per_second\tenergy_mean\tenergy_peak\tidle_wakeups\tmean_rss_kb\tpeak_rss_kb\trenders_full\trenders_preview\tmegapixels\trequests_suppressed\trequests_suppressed_motion\tresident_peak_mb\tresident_peak_undelivered_mb\tresident_peak_cache_mb\tstart_idle\tstart_page\tend_page\n' > "$unfairtsv"
-    # Both rows are transcribed from the recorded run. `read` is the resumed-page
-    # case: Preview opens on 1,174 and travels about as far as Postview does, so
-    # only the start check can catch it. `scroll` is the unequal-travel case: 200
-    # of the same keystrokes move Preview 48 pages and Postview 7, which the
-    # start check would pass and only the travel check catches. One fixture, two
-    # independent failures, because each gate is blind to the other one.
+    printf 'app\tscenario\trun\tlaunch_seconds\twall_seconds\tcpu_seconds\tcpu_per_second\tenergy_mean\tenergy_peak\tidle_wakeups\tmean_rss_kb\tpeak_rss_kb\trenders_full\trenders_preview\tmegapixels\trequests_suppressed\trequests_suppressed_motion\tresident_peak_mb\tresident_peak_undelivered_mb\tresident_peak_cache_mb\tstart_idle\tstart_page\tend_page\tresident_peak_rss_mb\n' > "$unfairtsv"
+    # Rows transcribed from recorded runs. Four scenarios, four different things
+    # the gate has to do, and each one is invisible to the others:
+    #
+    #   read    the resumed-page case. Preview opens on 1,174 and travels about
+    #           as far as Postview does, so only the start check can catch it.
+    #   scroll  unequal travel: 200 of the same keystrokes move Preview 48 pages
+    #           and Postview 7. The start check passes it; only travel catches it.
+    #   wheel   travel inside the instrument's own resolution -- 0 pages against
+    #           1, from the 2026-08-31 run, where the two apps were 3% apart on
+    #           either side of a page boundary. The ratio is infinite and means
+    #           nothing. Must be reported and must NOT block the verdict.
+    #   page    unequal-looking travel that is real and fine: 26 against 23,
+    #           also from that run. Must be checked and must pass.
+    #
+    # Driven through render_verdict, i.e. the shipping analysis, rather than
+    # through a second copy of the rule written here. A self-test that
+    # reimplements the gate it is testing passes whichever way the gate breaks.
     for r in 1 2 3; do
         printf 'Preview\tread\t%s\t1.0\t30\t0.84\t0.03\t4.0\t9.0\t900\t146676\t156936\t-\t-\t-\t-\t-\t-\t-\t-\t88\t1174\t1178\n'  "$r" >> "$unfairtsv"
         printf 'Postview\tread\t%s\t0.5\t30\t6.03\t0.18\t0.4\t1.0\t60\t255561\t334268\t51\t25\t380.73\t0\t0\t120\t50\t90\t88\t1\t6\n' "$r" >> "$unfairtsv"
         printf 'Preview\tscroll\t%s\t1.0\t7\t1.46\t0.20\t4.0\t9.0\t900\t141755\t143700\t-\t-\t-\t-\t-\t-\t-\t-\t75\t1\t49\n'      "$r" >> "$unfairtsv"
         printf 'Postview\tscroll\t%s\t0.5\t7\t5.88\t0.82\t0.4\t1.0\t60\t231422\t272644\t126\t54\t962.19\t47\t388\t120\t50\t90\t75\t1\t8\n' "$r" >> "$unfairtsv"
+        printf 'Preview\twheel\t%s\t0.86\t8.7\t0.86\t0.099\t0.00\t0\t215\t125952\t139252\t-\t-\t-\t-\t-\t-\t-\t-\t96\t1\t2\n'      "$r" >> "$unfairtsv"
+        printf 'Postview\twheel\t%s\t0.59\t8.6\t0.75\t0.087\t0.00\t0\t129\t210837\t226208\t5\t4\t35.45\t0\t1\t102.50\t32.17\t101.58\t95\t1\t1\n' "$r" >> "$unfairtsv"
+        printf 'Preview\tpage\t%s\t1.02\t8.9\t8.14\t0.917\t0.00\t0\t41\t145087\t169836\t-\t-\t-\t-\t-\t-\t-\t-\t96\t1\t24\n'      "$r" >> "$unfairtsv"
+        printf 'Postview\tpage\t%s\t0.42\t9.0\t3.37\t0.376\t0.00\t0\t47\t212130\t267316\t6\t9\t51.20\t223\t129\t136.67\t32.17\t114.70\t96\t1\t27\n' "$r" >> "$unfairtsv"
     done
+    unfairout="$WORKDIR/selftest-unfair.txt"
+    render_verdict "$unfairtsv" 0.05 3 > "$unfairout" 2>&1
+
     v=$(/usr/bin/awk -F '\t' '
         NR==1 { next }
         $22 ~ /^[0-9]+$/ && $22+0 != 1 { bad++ }
         END { print (bad+0 == 3) ? "1" : "0" }' "$unfairtsv")
     ok "$v" "the fairness gate sees an app that resumed a saved page"
-    v=$(/usr/bin/awk -F '\t' '
-        NR==1 { next }
-        $2 != "scroll" { next }
-        $22 ~ /^[0-9]+$/ && $23 ~ /^[0-9]+$/ { d=$23-$22; if(d<0)d=-d; t[$1]+=d; n[$1]++ }
-        END { a=t["Postview"]/n["Postview"]; b=t["Preview"]/n["Preview"];
-              hi=(a>b)?a:b; lo=(a>b)?b:a; print (hi>0 && lo*2<hi) ? "1" : "0" }' "$unfairtsv")
-    ok "$v" "the fairness gate sees unequal travel between the two apps"
-    # ...and does not cry wolf on a scenario where both apps moved together.
-    v=$(/usr/bin/awk -F '\t' '
-        NR==1 { next }
-        $2 != "read" { next }
-        $22 ~ /^[0-9]+$/ && $23 ~ /^[0-9]+$/ { d=$23-$22; if(d<0)d=-d; t[$1]+=d; n[$1]++ }
-        END { a=t["Postview"]/n["Postview"]; b=t["Preview"]/n["Preview"];
-              hi=(a>b)?a:b; lo=(a>b)?b:a; print (hi>0 && lo*2<hi) ? "0" : "1" }' "$unfairtsv")
-    ok "$v" "the travel check passes a scenario where both apps moved together"
+    v=$(/usr/bin/grep -c 'read  *an app did not start on page 1' "$unfairout")
+    ok "$([ "$v" -ge 1 ] && echo 1 || echo 0)" "the verdict reports the resumed page"
+    v=$(/usr/bin/grep -c 'scroll  *unequal travel' "$unfairout")
+    ok "$([ "$v" -ge 1 ] && echo 1 || echo 0)" "the verdict reports unequal travel"
+    v=$(/usr/bin/grep -c 'NO VERDICT -- 2 fairness check' "$unfairout")
+    ok "$([ "$v" -ge 1 ] && echo 1 || echo 0)" "two failures block the verdict, and only those two"
+
+    # The resolution rule, stated as its two halves: it must speak, and it must
+    # not count. `wheel` is the reason the rule exists; `page` is the reason it
+    # is bounded at one page rather than at some larger number that would have
+    # swallowed a 26-against-23 comparison as well.
+    v=$(/usr/bin/grep -c 'wheel  *travel not checkable' "$unfairout")
+    ok "$([ "$v" -ge 1 ] && echo 1 || echo 0)" "travel inside the page counter's resolution is reported"
+    v=$(/usr/bin/grep -c 'wheel  *unequal travel' "$unfairout")
+    ok "$([ "$v" -eq 0 ] && echo 1 || echo 0)" "...and is not counted as a failure"
+    v=$(/usr/bin/grep -c 'page  *\(unequal travel\|travel not checkable\)' "$unfairout")
+    ok "$([ "$v" -eq 0 ] && echo 1 || echo 0)" "26 pages against 23 is checked, and passes"
 
     # And the staging that caused it. A hard link is the same inode, which is
     # the identity Preview restores against; a copy is a different document.
@@ -1157,6 +1181,372 @@ AWKEOF
     fi
     printf '%s check(s) failed. Fix these before trusting a measurement run.\n' "$fails"
     return 1
+}
+
+# ---------------------------------------------------------------------------
+# Analysis. Every metric here is lower-is-better.
+#
+# A function, and written to a file rather than passed inline, for one reason:
+# the self-test has to be able to run THIS program over a fixture. It used to
+# assert against its own second copy of the fairness rule, which is a test
+# that passes while the gate it is named after is broken -- and the rule has
+# since changed once, which is exactly when that gap costs something.
+# ---------------------------------------------------------------------------
+VERDICT_AWK=""
+verdict_program() {
+    [ -n "$VERDICT_AWK" ] && [ -f "$VERDICT_AWK" ] && return 0
+    VERDICT_AWK="$WORKDIR/verdict.awk"
+    /bin/cat > "$VERDICT_AWK" <<'AWKEOF'
+function med(a, n,   i, t) {
+    if (n == 0) return "-"
+    for (i = 1; i <= n; i++) for (t = i+1; t <= n; t++) if (a[t] < a[i]) { x=a[i]; a[i]=a[t]; a[t]=x }
+    if (n % 2) return a[(n+1)/2]
+    return (a[n/2] + a[n/2+1]) / 2
+}
+function spread(a, n,   i, lo, hi) {
+    if (n == 0) return 0
+    lo = a[1]; hi = a[1]
+    for (i = 2; i <= n; i++) { if (a[i] < lo) lo = a[i]; if (a[i] > hi) hi = a[i] }
+    return hi - lo
+}
+NR == 1 { next }
+{
+    app = $1; scen = $2
+    key = scen
+    if ($6  ~ /^[0-9.]+$/) { n_cpu[app,key]++;  cpu[app,key,n_cpu[app,key]]  = $6 + 0 }
+    if ($8  ~ /^[0-9.]+$/) { n_pw[app,key]++;   pw[app,key,n_pw[app,key]]    = $8 + 0 }
+    if ($10 ~ /^[0-9]+$/)  { n_iw[app,key]++;   iw[app,key,n_iw[app,key]]    = $10 + 0 }
+    if ($12 ~ /^[0-9]+$/)  { n_rss[app,key]++;  rss[app,key,n_rss[app,key]]  = $12 + 0 }
+    if ($4  ~ /^[0-9.]+$/) { n_l[app,key]++;    lau[app,key,n_l[app,key]]    = $4 + 0 }
+    # Postview-only diagnostics: what it actually rasterised, what it declined
+    # to rasterise, and how much of it was resident at the worst instant.
+    if ($13 ~ /^[0-9.]+$/) { n_rf[app,key]++;  rf[app,key,n_rf[app,key]]    = $13 + 0 }
+    if ($15 ~ /^[0-9.]+$/) { n_mp[app,key]++;  mpx[app,key,n_mp[app,key]]   = $15 + 0 }
+    if ($16 ~ /^[0-9.]+$/) { n_sp[app,key]++;  spr[app,key,n_sp[app,key]]   = $16 + 0 }
+    if ($17 ~ /^[0-9.]+$/) { n_sm[app,key]++;  spm[app,key,n_sm[app,key]]   = $17 + 0 }
+    if ($18 ~ /^[0-9.]+$/) { n_rb[app,key]++;  rbp[app,key,n_rb[app,key]]   = $18 + 0 }
+    if ($19 ~ /^[0-9.]+$/) { n_ru[app,key]++;  rbu[app,key,n_ru[app,key]]   = $19 + 0 }
+    if ($20 ~ /^[0-9.]+$/) { n_rc[app,key]++;  rbc[app,key,n_rc[app,key]]   = $20 + 0 }
+    # Column 24, appended after the page columns for the same reason they were
+    # appended after the census ones: every index above keeps its meaning and a
+    # TSV recorded before this column reads it as absent rather than as zero.
+    if ($24 ~ /^[0-9.]+$/) { n_rat[app,key]++; rat[app,key,n_rat[app,key]]   = $24 + 0 }
+    # Where each app started, and how far it travelled. Not scored -- these
+    # decide whether the scored metrics mean anything at all. A row from a TSV
+    # recorded before these columns existed reads as absent and is skipped,
+    # which is why the check counts what it saw rather than what it expected.
+    if ($22 ~ /^[0-9]+$/) {
+        n_sp2[app,key]++
+        if ($22 + 0 != 1) badstart[app,key]++
+        sp0[app,key] = $22 + 0
+    }
+    if ($22 ~ /^[0-9]+$/ && $23 ~ /^[0-9]+$/) {
+        d = $23 - $22; if (d < 0) d = -d
+        n_tr[app,key]++; trav[app,key] = trav[app,key] + d
+    }
+    seen[key] = 1
+}
+END {
+    order = "launch idle read page scroll swipe wheel"
+    nsc = split(order, sc, " ")
+
+    printf "=========================================================================\n"
+    printf "  POSTVIEW vs PREVIEW -- VERDICT\n"
+    printf "  %d runs per scenario, medians, lower is better throughout.\n", runs
+    printf "  A gap under %.0f%% is called a tie: below that the two apps are\n", band*100
+    printf "  doing the same thing and the difference is the machine.\n"
+    printf "=========================================================================\n"
+    # The conditions, in the file rather than only on the terminal the run
+    # scrolled past. The saved verdict is what gets carried back and read weeks
+    # later, and the power branch is not a detail: section 4.2 of ENGINEERING.md
+    # makes battery and AC two different scheduling policies, so a verdict that
+    # does not say which one it measured is a verdict whose subject is unknown.
+    # The 2026-08-31 file is the one that proved this -- it had to be inferred
+    # from the script's default.
+    if (power != "" || pdf != "" || win != "") {
+        printf "\n"
+        if (pdf   != "") printf "  document      %s\n", pdf
+        if (win   != "") printf "  window        %s\n", win
+        if (power != "") {
+            printf "  power policy  Postview pinned to -PVPowerState %s\n", power
+            if (power != "battery")
+                printf "                NOT the battery case; not comparable with default runs.\n"
+        }
+        if (host  != "") printf "  host          %s\n", host
+        if (when  != "") printf "  recorded      %s\n", when
+    }
+    printf "\n"
+
+    wins = 0; losses = 0; ties = 0
+    bwins = 0; blosses = 0; bties = 0
+
+    for (s = 1; s <= nsc; s++) {
+        k = sc[s]
+        if (!(k in seen)) continue
+        printf "-- %s %s\n", k, substr("--------------------------------------------------------", 1, 60 - length(k))
+
+        emit(k, "cpu_seconds",  "CPU seconds",    cpu,  n_cpu, 1, "%.2f")
+        emit(k, "energy_mean",  "Energy Impact",  pw,   n_pw,  1, "%.2f")
+        emit(k, "idle_wakeups", "Idle wakeups",   iw,   n_iw,  1, "%d")
+        emit(k, "peak_rss_kb",  "Peak memory MB", rss,  n_rss, 0, "%.0f")
+        if (k == "launch") emit(k, "launch_seconds", "Launch seconds", lau, n_l, 0, "%.3f")
+        printf "\n"
+    }
+
+    # What Postview rasterised, for confirming the scheduler on hardware.
+    # Preview reports nothing comparable, so this is diagnosis, not a contest.
+    any = 0
+    for (s = 1; s <= nsc; s++) if ((sc[s] in seen) && n_rf["Postview",sc[s]] > 0) any = 1
+    if (any) {
+        printf "-- what Postview rasterised (Preview has no equivalent counter) ----\n"
+        for (s = 1; s <= nsc; s++) {
+            k = sc[s]
+            if (!(k in seen) || n_rf["Postview",k] == 0) continue
+            for (i = 1; i <= n_rf["Postview",k]; i++) a1[i] = rf["Postview",k,i]
+            for (i = 1; i <= n_mp["Postview",k]; i++) a2[i] = mpx["Postview",k,i]
+            for (i = 1; i <= n_sp["Postview",k]; i++) a3[i] = spr["Postview",k,i]
+            for (i = 1; i <= n_sm["Postview",k]; i++) a4[i] = spm["Postview",k,i]
+            printf "  %-8s %6.0f full renders   %8.1f Mpx   %6.0f suppressed (%.0f dwell + %.0f motion)\n",
+                k, med(a1, n_rf["Postview",k]), med(a2, n_mp["Postview",k]),
+                med(a3, n_sp["Postview",k]) + med(a4, n_sm["Postview",k]),
+                med(a3, n_sp["Postview",k]), med(a4, n_sm["Postview",k])
+        }
+        printf "\n  Reference, before the scheduler work (same machine, one run):\n"
+        printf "    read        51 full renders      380.7 Mpx        0 suppressed\n"
+        printf "    page        90 full renders      666.7 Mpx      323 suppressed\n"
+        printf "    scroll     126 full renders      962.2 Mpx       47 suppressed\n"
+        printf "  Zero DWELL suppression on 'read' is correct: 2.5 s between key\n"
+        printf "  presses leaves the document at rest, and a page being read wants to\n"
+        printf "  be sharp. The motion column is separate and was not counted at all\n"
+        printf "  before this run, which is why 'scroll' used to report zero while the\n"
+        printf "  motion gate was doing the suppressing.\n\n"
+    }
+
+    # Resident rendered pixels: the part of peak RSS Postview actually decides.
+    # Preview reports nothing comparable, so like the census above this is
+    # diagnosis and not a contest -- but it is the only way to tell a peak_rss_kb
+    # change caused by the render pipeline from one caused by the frameworks.
+    any = 0
+    for (s = 1; s <= nsc; s++) if ((sc[s] in seen) && n_rb["Postview",sc[s]] > 0) any = 1
+    if (any) {
+        printf "-- resident rendered pixels, high water (Postview only) -----------\n"
+        for (s = 1; s <= nsc; s++) {
+            k = sc[s]
+            if (!(k in seen) || n_rb["Postview",k] == 0) continue
+            for (i = 1; i <= n_rb["Postview",k]; i++) b1[i] = rbp["Postview",k,i]
+            for (i = 1; i <= n_ru["Postview",k]; i++) b2[i] = rbu["Postview",k,i]
+            for (i = 1; i <= n_rc["Postview",k]; i++) b3[i] = rbc["Postview",k,i]
+            for (i = 1; i <= n_rss["Postview",k]; i++) b4[i] = rss["Postview",k,i]
+            for (i = 1; i <= n_rat["Postview",k]; i++) b5[i] = rat["Postview",k,i]
+            peakrss = med(b4, n_rss["Postview",k]) / 1024
+            resident = med(b1, n_rb["Postview",k])
+            # 'non-bitmap' is only a quantity if its two terms were read off the
+            # same instant. resident.peak.rss.mb is RSS sampled by the app at
+            # the moment it set the resident high-water mark, so that pair is
+            # simultaneous by construction and the subtraction is a real one.
+            #
+            # peak_rss_kb is a maximum in its own right, taken by the sampler on
+            # its own schedule, and max(bitmaps+rest) - max(rest) is not
+            # 'bitmaps' -- it equals it only if the two maxima coincide, and
+            # sags towards zero when they do not. Subtracting those two is what
+            # the 2026-08-31 run did, and it is why its 'non-bitmap' column ran
+            # from 68.8 MB to 177.6 MB across scenarios underneath a note saying
+            # the quantity should be roughly constant. Kept as a fallback for
+            # TSVs recorded before the app reported the paired reading, and
+            # marked when that is what is being shown.
+            atpeak = (n_rat["Postview",k] > 0) ? med(b5, n_rat["Postview",k]) : 0
+            if (atpeak > 0) { nonbitmap = atpeak - resident; mark = " " }
+            else            { nonbitmap = peakrss - resident; mark = "?" }
+            if (nonbitmap < 0) nonbitmap = 0
+            printf "  %-8s %7.1f MB resident  (cache %6.1f, undelivered %5.1f)   peak rss %6.1f MB   non-bitmap %6.1f MB%s\n", k, resident, med(b3, n_rc["Postview",k]), med(b2, n_ru["Postview",k]), peakrss, nonbitmap, mark
+            if (atpeak <= 0) sawlegacy = 1
+        }
+        printf "  The undelivered column is bounded by PV_MAX_INFLIGHT_FULL bitmaps.\n"
+        printf "  'non-bitmap' is everything else in the process at the instant the\n"
+        printf "  bitmap census peaked: frameworks, the window backing store, the\n"
+        printf "  binary. Both terms are read off that same instant, so it should be\n"
+        printf "  roughly constant across scenarios -- if it is not, the peak moved\n"
+        printf "  for a reason that has nothing to do with the render pipeline.\n"
+        if (sawlegacy) {
+            printf "  Rows marked ? predate resident.peak.rss.mb and fall back to\n"
+            printf "  subtracting two maxima taken at different moments. That is not\n"
+            printf "  the same quantity and it is not comparable with the rest.\n"
+        }
+        printf "\n"
+    }
+
+    # Fairness, checked before anything above is allowed to mean something.
+    #
+    # Two ways the same document produces two different workloads. Both are
+    # invisible in every metric this script scores, and both have happened:
+    #
+    #  - an app opened on a page it remembered instead of page 1, so the two
+    #    apps rasterised different parts of the file. The cost of one page
+    #    varies by up to 59x with its content (ENGINEERING.md), so this
+    #    can dwarf every real difference between the two programs.
+    #  - both started on page 1 but travelled different distances, because the
+    #    same key scrolls by a different amount in each app. Then the CPU
+    #    figures are per-keypress rather than per-page, and the app that moved
+    #    further did more work for its seconds.
+    #
+    # Reported, never silently corrected. The run is what it is; what changes is
+    # whether it is allowed to declare a winner.
+    unfair = 0; fairhdr = 0
+    for (s = 1; s <= nsc; s++) {
+        k = sc[s]; if (!seen[k]) continue
+        if (badstart["Postview",k] > 0 || badstart["Preview",k] > 0) {
+            if (!fairhdr) { printf "\n"; printf "  FAIRNESS\n"; fairhdr = 1 }
+            unfair++
+            printf "  %-8s an app did not start on page 1 (Postview %d of %d trials, Preview %d of %d)\n",
+                   k, badstart["Postview",k]+0, n_sp2["Postview",k]+0,
+                      badstart["Preview",k]+0,  n_sp2["Preview",k]+0
+        }
+    }
+    for (s = 1; s <= nsc; s++) {
+        k = sc[s]; if (!seen[k]) continue
+        if (n_tr["Postview",k] > 0 && n_tr["Preview",k] > 0) {
+            ta = trav["Postview",k] / n_tr["Postview",k]
+            tb = trav["Preview",k]  / n_tr["Preview",k]
+            hi = (ta > tb) ? ta : tb; lo = (ta > tb) ? tb : ta
+            # This instrument reads a page number out of a window title, so its
+            # resolution is one page and nothing finer. Two apps that travelled
+            # the SAME distance still report a page apart whenever that distance
+            # straddles a page boundary: one viewport top has crossed it and the
+            # other has not.
+            #
+            # So a gap of one page is exactly what equal travel looks like at
+            # this resolution, and the ratio computed from it is not evidence of
+            # anything -- at lo=0 it is not even finite. Recorded 2026-08-31:
+            # `wheel` moved Postview 1800 pt and Preview about 1860, a 3%
+            # difference either side of a 1859 pt page pitch, which the counter
+            # rendered as 0 pages against 1 and the ratio test as an infinite
+            # disparity. A gap of two pages or more cannot be manufactured this
+            # way and is the app.
+            #
+            # Said out loud rather than skipped, because "the check did not run"
+            # and "the check passed" are different facts about a run. Equal
+            # readings are silent: there is no gap to be unsure about.
+            #
+            # The band is one page on the AVERAGED travel, and stays one page
+            # there: averaging N trials cannot spread two equal-travel apps
+            # further than the single-trial quantum that produced each reading.
+            if (hi > 0 && hi - lo > 0 && hi - lo <= 1) {
+                if (!fairhdr) { printf "\n"; printf "  FAIRNESS\n"; fairhdr = 1 }
+                printf "  %-8s travel not checkable: Postview %.0f pages, Preview %.0f pages per trial\n",
+                       k, ta, tb
+                printf "           one page apart is what equal travel looks like to a page\n"
+                printf "           counter, so the ratio carries no information here. The\n"
+                printf "           scenario is scored; its staging is unverified.\n"
+            }
+            # Twice as far is not the same workload. Below that, the scenarios
+            # land close enough that the metric is still about the apps.
+            else if (hi > 0 && hi - lo > 1 && lo * 2 < hi) {
+                if (!fairhdr) { printf "\n"; printf "  FAIRNESS\n"; fairhdr = 1 }
+                unfair++
+                printf "  %-8s unequal travel: Postview %.0f pages, Preview %.0f pages per trial\n",
+                       k, ta, tb
+                printf "           the same keystrokes move the two apps different distances, so\n"
+                printf "           these CPU figures are per-keypress and not per-page.\n"
+            }
+        }
+    }
+    printf "\n"
+
+    printf "=========================================================================\n"
+    if (unfair > 0) {
+        printf "  NO VERDICT -- %d fairness check(s) failed above.\n", unfair
+        printf "\n"
+        printf "  The two apps were not asked the same question, so the medians\n"
+        printf "  below describe two different workloads and no winner can be read\n"
+        printf "  from them. Fix the staging and re-run; they are recorded only so\n"
+        printf "  the failure is visible rather than averaged away.\n"
+        printf "\n"
+        printf "  (unscored) battery: %d/%d/%d   overall: %d/%d/%d  win/loss/tie\n",
+               bwins, blosses, bties, wins, losses, ties
+        printf "=========================================================================\n"
+        exit 0
+    }
+    printf "  BATTERY VERDICT   (CPU seconds, Energy Impact and wakeups only --\n"
+    printf "                     the three metrics that actually drain a battery)\n"
+    printf "  Postview wins %d, loses %d, ties %d\n", bwins, blosses, bties
+    if (blosses == 0 && bwins > 0) printf "  ==> Postview is at least equivalent on every battery metric.\n"
+    else if (blosses > 0)          printf "  ==> NOT YET. %d battery metric(s) still favour Preview.\n", blosses
+    printf "\n"
+    printf "  OVERALL           Postview wins %d, loses %d, ties %d\n", wins, losses, ties
+    if (losses == 0 && wins > 0) printf "  ==> Postview is equivalent or better on every metric measured.\n"
+    else if (losses > 0)         printf "  ==> %d metric(s) still favour Preview. Not done.\n", losses
+    printf "=========================================================================\n"
+}
+function emit(k, metric, label, arr, cnt, isbattery, fmt,   i, a, b, na, nb, ma, mb, sa, sb, verdict, delta, note, denom, gap, pa, pb, sa_txt, sb_txt, allzero) {
+    na = cnt["Postview",k]; nb = cnt["Preview",k]
+    if (na == 0 || nb == 0) { printf "  %-16s %s\n", label, "(not reported by both apps)"; return }
+    for (i = 1; i <= na; i++) a[i] = arr["Postview",k,i]
+    for (i = 1; i <= nb; i++) b[i] = arr["Preview",k,i]
+    sa = spread(a, na); sb = spread(b, nb)
+    ma = med(a, na); mb = med(b, nb)
+
+    # A metric that reads zero for both apps in every single trial was not
+    # measured; it is an absent instrument wearing the clothes of a dead heat.
+    #
+    # The guard above catches a field that is literally missing ("-"). Energy
+    # Impact is not missing -- the sampler returns 0.00 on a machine that does
+    # not report it -- so it reached the comparison below, took the ma == 0 &&
+    # mb == 0 branch, and was scored TIE. Recorded 2026-08-31: all 70 rows of
+    # both apps read 0.00, and the verdict counted seven ties from it, which is
+    # seven ninths of every tie in the run. "The two apps drew" and "nobody
+    # asked" are not the same sentence.
+    #
+    # Every sample, not just the median, so a metric that genuinely spent most
+    # of a scenario at zero is still scored on the trials where it moved.
+    allzero = 1
+    for (i = 1; i <= na && allzero; i++) if (a[i] != 0) allzero = 0
+    for (i = 1; i <= nb && allzero; i++) if (b[i] != 0) allzero = 0
+    if (allzero) {
+        printf "  %-16s %s\n", label, "(not reported by this machine -- not scored)"
+        return
+    }
+
+    if (ma == 0 && mb == 0)      { verdict = "TIE";  delta = 0 }
+    else {
+        denom = (ma > mb) ? ma : mb
+        delta = (mb - ma) / denom
+        if (delta > band)       verdict = "WIN"
+        else if (delta < -band) verdict = "LOSS"
+        else                    verdict = "TIE"
+    }
+
+    if (verdict == "WIN")  { wins++;  if (isbattery) bwins++ }
+    if (verdict == "LOSS") { losses++; if (isbattery) blosses++ }
+    if (verdict == "TIE")  { ties++;  if (isbattery) bties++ }
+
+    pa = ma; pb = mb
+    if (metric == "peak_rss_kb") { pa = ma/1024; pb = mb/1024 }
+
+    note = ""
+    # A spread wider than the gap between the apps means the run-to-run noise is
+    # larger than the effect, so the verdict is not yet trustworthy.
+    if (sa + sb > 0 && ma != mb) {
+        gap = (ma > mb) ? ma - mb : mb - ma
+        if ((sa > gap) || (sb > gap)) note = "   [noisy: spread exceeds the gap]"
+    }
+
+    # Formatted into strings first so that a %d metric and a %.2f metric still
+    # line up in the same column.
+    sa_txt = sprintf(fmt, pa); sb_txt = sprintf(fmt, pb)
+    printf "  %-16s Postview %10s   Preview %10s   %-4s %+.0f%%%s\n",
+        label, sa_txt, sb_txt, verdict, delta*100, note
+}
+AWKEOF
+}
+
+# $1 tsv, $2 tie band, $3 runs per scenario. Writes the verdict to stdout.
+render_verdict() {
+    verdict_program
+    /usr/bin/awk -F '\t' -v band="$2" -v runs="$3" \
+        -v power="${POWERSTATE:-}" -v pdf="${PDF_BASE:-}" \
+        -v win="${VERDICT_WINDOW:-}" -v host="${VERDICT_HOST:-}" \
+        -v when="${VERDICT_WHEN:-}" \
+        -f "$VERDICT_AWK" "$1"
 }
 
 if [ "${SELFTEST:-0}" = "1" ]; then
@@ -1209,7 +1599,7 @@ case "$probe_iw" in ''|-) ;; *) WAKEUPS_OK=yes ;; esac
 # index the analysis below already uses keeps its meaning and TSVs recorded
 # before them still parse. The analysis reads fields by number and never NF,
 # which is what makes appending safe.
-printf 'app\tscenario\trun\tlaunch_seconds\twall_seconds\tcpu_seconds\tcpu_per_second\tenergy_mean\tenergy_peak\tidle_wakeups\tmean_rss_kb\tpeak_rss_kb\trenders_full\trenders_preview\tmegapixels\trequests_suppressed\trequests_suppressed_motion\tresident_peak_mb\tresident_peak_undelivered_mb\tresident_peak_cache_mb\tstart_idle\tstart_page\tend_page\n' > "$OUTPUT"
+printf 'app\tscenario\trun\tlaunch_seconds\twall_seconds\tcpu_seconds\tcpu_per_second\tenergy_mean\tenergy_peak\tidle_wakeups\tmean_rss_kb\tpeak_rss_kb\trenders_full\trenders_preview\tmegapixels\trequests_suppressed\trequests_suppressed_motion\tresident_peak_mb\tresident_peak_undelivered_mb\tresident_peak_cache_mb\tstart_idle\tstart_page\tend_page\tresident_peak_rss_mb\n' > "$OUTPUT"
 
 # Trials whose app restored a saved reading position instead of starting at
 # page 1. Any at all and the run compared two different workloads, which is not
@@ -1279,247 +1669,10 @@ else
     printf ' Every trial started on page 1. Writing verdict.\n\n'
 fi
 
-# ---------------------------------------------------------------------------
-# Analysis. Every metric here is lower-is-better.
-# ---------------------------------------------------------------------------
-/usr/bin/awk -F '\t' -v band="$TIE_BAND" -v runs="$RUNS" '
-function med(a, n,   i, t) {
-    if (n == 0) return "-"
-    for (i = 1; i <= n; i++) for (t = i+1; t <= n; t++) if (a[t] < a[i]) { x=a[i]; a[i]=a[t]; a[t]=x }
-    if (n % 2) return a[(n+1)/2]
-    return (a[n/2] + a[n/2+1]) / 2
-}
-function spread(a, n,   i, lo, hi) {
-    if (n == 0) return 0
-    lo = a[1]; hi = a[1]
-    for (i = 2; i <= n; i++) { if (a[i] < lo) lo = a[i]; if (a[i] > hi) hi = a[i] }
-    return hi - lo
-}
-NR == 1 { next }
-{
-    app = $1; scen = $2
-    key = scen
-    if ($6  ~ /^[0-9.]+$/) { n_cpu[app,key]++;  cpu[app,key,n_cpu[app,key]]  = $6 + 0 }
-    if ($8  ~ /^[0-9.]+$/) { n_pw[app,key]++;   pw[app,key,n_pw[app,key]]    = $8 + 0 }
-    if ($10 ~ /^[0-9]+$/)  { n_iw[app,key]++;   iw[app,key,n_iw[app,key]]    = $10 + 0 }
-    if ($12 ~ /^[0-9]+$/)  { n_rss[app,key]++;  rss[app,key,n_rss[app,key]]  = $12 + 0 }
-    if ($4  ~ /^[0-9.]+$/) { n_l[app,key]++;    lau[app,key,n_l[app,key]]    = $4 + 0 }
-    # Postview-only diagnostics: what it actually rasterised, what it declined
-    # to rasterise, and how much of it was resident at the worst instant.
-    if ($13 ~ /^[0-9.]+$/) { n_rf[app,key]++;  rf[app,key,n_rf[app,key]]    = $13 + 0 }
-    if ($15 ~ /^[0-9.]+$/) { n_mp[app,key]++;  mpx[app,key,n_mp[app,key]]   = $15 + 0 }
-    if ($16 ~ /^[0-9.]+$/) { n_sp[app,key]++;  spr[app,key,n_sp[app,key]]   = $16 + 0 }
-    if ($17 ~ /^[0-9.]+$/) { n_sm[app,key]++;  spm[app,key,n_sm[app,key]]   = $17 + 0 }
-    if ($18 ~ /^[0-9.]+$/) { n_rb[app,key]++;  rbp[app,key,n_rb[app,key]]   = $18 + 0 }
-    if ($19 ~ /^[0-9.]+$/) { n_ru[app,key]++;  rbu[app,key,n_ru[app,key]]   = $19 + 0 }
-    if ($20 ~ /^[0-9.]+$/) { n_rc[app,key]++;  rbc[app,key,n_rc[app,key]]   = $20 + 0 }
-    # Where each app started, and how far it travelled. Not scored -- these
-    # decide whether the scored metrics mean anything at all. A row from a TSV
-    # recorded before these columns existed reads as absent and is skipped,
-    # which is why the check counts what it saw rather than what it expected.
-    if ($22 ~ /^[0-9]+$/) {
-        n_sp2[app,key]++
-        if ($22 + 0 != 1) badstart[app,key]++
-        sp0[app,key] = $22 + 0
-    }
-    if ($22 ~ /^[0-9]+$/ && $23 ~ /^[0-9]+$/) {
-        d = $23 - $22; if (d < 0) d = -d
-        n_tr[app,key]++; trav[app,key] = trav[app,key] + d
-    }
-    seen[key] = 1
-}
-END {
-    order = "launch idle read page scroll swipe wheel"
-    nsc = split(order, sc, " ")
-
-    printf "=========================================================================\n"
-    printf "  POSTVIEW vs PREVIEW -- VERDICT\n"
-    printf "  %d runs per scenario, medians, lower is better throughout.\n", runs
-    printf "  A gap under %.0f%% is called a tie: below that the two apps are\n", band*100
-    printf "  doing the same thing and the difference is the machine.\n"
-    printf "=========================================================================\n\n"
-
-    wins = 0; losses = 0; ties = 0
-    bwins = 0; blosses = 0; bties = 0
-
-    for (s = 1; s <= nsc; s++) {
-        k = sc[s]
-        if (!(k in seen)) continue
-        printf "-- %s %s\n", k, substr("--------------------------------------------------------", 1, 60 - length(k))
-
-        emit(k, "cpu_seconds",  "CPU seconds",    cpu,  n_cpu, 1, "%.2f")
-        emit(k, "energy_mean",  "Energy Impact",  pw,   n_pw,  1, "%.2f")
-        emit(k, "idle_wakeups", "Idle wakeups",   iw,   n_iw,  1, "%d")
-        emit(k, "peak_rss_kb",  "Peak memory MB", rss,  n_rss, 0, "%.0f")
-        if (k == "launch") emit(k, "launch_seconds", "Launch seconds", lau, n_l, 0, "%.3f")
-        printf "\n"
-    }
-
-    # What Postview rasterised, for confirming the scheduler on hardware.
-    # Preview reports nothing comparable, so this is diagnosis, not a contest.
-    any = 0
-    for (s = 1; s <= nsc; s++) if ((sc[s] in seen) && n_rf["Postview",sc[s]] > 0) any = 1
-    if (any) {
-        printf "-- what Postview rasterised (Preview has no equivalent counter) ----\n"
-        for (s = 1; s <= nsc; s++) {
-            k = sc[s]
-            if (!(k in seen) || n_rf["Postview",k] == 0) continue
-            for (i = 1; i <= n_rf["Postview",k]; i++) a1[i] = rf["Postview",k,i]
-            for (i = 1; i <= n_mp["Postview",k]; i++) a2[i] = mpx["Postview",k,i]
-            for (i = 1; i <= n_sp["Postview",k]; i++) a3[i] = spr["Postview",k,i]
-            for (i = 1; i <= n_sm["Postview",k]; i++) a4[i] = spm["Postview",k,i]
-            printf "  %-8s %6.0f full renders   %8.1f Mpx   %6.0f suppressed (%.0f dwell + %.0f motion)\n",
-                k, med(a1, n_rf["Postview",k]), med(a2, n_mp["Postview",k]),
-                med(a3, n_sp["Postview",k]) + med(a4, n_sm["Postview",k]),
-                med(a3, n_sp["Postview",k]), med(a4, n_sm["Postview",k])
-        }
-        printf "\n  Reference, before the scheduler work (same machine, one run):\n"
-        printf "    read        51 full renders      380.7 Mpx        0 suppressed\n"
-        printf "    page        90 full renders      666.7 Mpx      323 suppressed\n"
-        printf "    scroll     126 full renders      962.2 Mpx       47 suppressed\n"
-        printf "  Zero DWELL suppression on 'read' is correct: 2.5 s between key\n"
-        printf "  presses leaves the document at rest, and a page being read wants to\n"
-        printf "  be sharp. The motion column is separate and was not counted at all\n"
-        printf "  before this run, which is why 'scroll' used to report zero while the\n"
-        printf "  motion gate was doing the suppressing.\n\n"
-    }
-
-    # Resident rendered pixels: the part of peak RSS Postview actually decides.
-    # Preview reports nothing comparable, so like the census above this is
-    # diagnosis and not a contest -- but it is the only way to tell a peak_rss_kb
-    # change caused by the render pipeline from one caused by the frameworks.
-    any = 0
-    for (s = 1; s <= nsc; s++) if ((sc[s] in seen) && n_rb["Postview",sc[s]] > 0) any = 1
-    if (any) {
-        printf "-- resident rendered pixels, high water (Postview only) -----------\n"
-        for (s = 1; s <= nsc; s++) {
-            k = sc[s]
-            if (!(k in seen) || n_rb["Postview",k] == 0) continue
-            for (i = 1; i <= n_rb["Postview",k]; i++) b1[i] = rbp["Postview",k,i]
-            for (i = 1; i <= n_ru["Postview",k]; i++) b2[i] = rbu["Postview",k,i]
-            for (i = 1; i <= n_rc["Postview",k]; i++) b3[i] = rbc["Postview",k,i]
-            for (i = 1; i <= n_rss["Postview",k]; i++) b4[i] = rss["Postview",k,i]
-            peakrss = med(b4, n_rss["Postview",k]) / 1024
-            resident = med(b1, n_rb["Postview",k])
-            printf "  %-8s %7.1f MB resident  (cache %6.1f, undelivered %5.1f)   peak rss %6.1f MB   non-bitmap %6.1f MB\n", k, resident, med(b3, n_rc["Postview",k]), med(b2, n_ru["Postview",k]), peakrss, peakrss - resident
-        }
-        printf "  The undelivered column is bounded by PV_MAX_INFLIGHT_FULL bitmaps.\n"
-        printf "  'non-bitmap' is everything else in the process: frameworks, the\n"
-        printf "  window backing store, the binary. It should be roughly constant\n"
-        printf "  across scenarios -- if it is not, the peak moved for a reason that\n"
-        printf "  has nothing to do with the render pipeline.\n\n"
-    }
-
-    # Fairness, checked before anything above is allowed to mean something.
-    #
-    # Two ways the same document produces two different workloads. Both are
-    # invisible in every metric this script scores, and both have happened:
-    #
-    #  - an app opened on a page it remembered instead of page 1, so the two
-    #    apps rasterised different parts of the file. The cost of one page
-    #    varies by up to 59x with its content (ENGINEERING.md), so this
-    #    can dwarf every real difference between the two programs.
-    #  - both started on page 1 but travelled different distances, because the
-    #    same key scrolls by a different amount in each app. Then the CPU
-    #    figures are per-keypress rather than per-page, and the app that moved
-    #    further did more work for its seconds.
-    #
-    # Reported, never silently corrected. The run is what it is; what changes is
-    # whether it is allowed to declare a winner.
-    unfair = 0
-    for (s = 1; s <= nsc; s++) {
-        k = sc[s]; if (!seen[k]) continue
-        if (badstart["Postview",k] > 0 || badstart["Preview",k] > 0) {
-            if (!unfair) { printf "\n"; printf "  FAIRNESS\n" }
-            unfair++
-            printf "  %-8s an app did not start on page 1 (Postview %d of %d trials, Preview %d of %d)\n",
-                   k, badstart["Postview",k]+0, n_sp2["Postview",k]+0,
-                      badstart["Preview",k]+0,  n_sp2["Preview",k]+0
-        }
-    }
-    for (s = 1; s <= nsc; s++) {
-        k = sc[s]; if (!seen[k]) continue
-        if (n_tr["Postview",k] > 0 && n_tr["Preview",k] > 0) {
-            ta = trav["Postview",k] / n_tr["Postview",k]
-            tb = trav["Preview",k]  / n_tr["Preview",k]
-            hi = (ta > tb) ? ta : tb; lo = (ta > tb) ? tb : ta
-            # Twice as far is not the same workload. Below that, the scenarios
-            # land close enough that the metric is still about the apps.
-            if (hi > 0 && lo * 2 < hi) {
-                if (!unfair) { printf "\n"; printf "  FAIRNESS\n" }
-                unfair++
-                printf "  %-8s unequal travel: Postview %.0f pages, Preview %.0f pages per trial\n",
-                       k, ta, tb
-                printf "           the same keystrokes move the two apps different distances, so\n"
-                printf "           these CPU figures are per-keypress and not per-page.\n"
-            }
-        }
-    }
-    printf "\n"
-
-    printf "=========================================================================\n"
-    if (unfair > 0) {
-        printf "  NO VERDICT -- %d fairness check(s) failed above.\n", unfair
-        printf "\n"
-        printf "  The two apps were not asked the same question, so the medians\n"
-        printf "  below describe two different workloads and no winner can be read\n"
-        printf "  from them. Fix the staging and re-run; they are recorded only so\n"
-        printf "  the failure is visible rather than averaged away.\n"
-        printf "\n"
-        printf "  (unscored) battery: %d/%d/%d   overall: %d/%d/%d  win/loss/tie\n",
-               bwins, blosses, bties, wins, losses, ties
-        printf "=========================================================================\n"
-        exit 0
-    }
-    printf "  BATTERY VERDICT   (CPU seconds, Energy Impact and wakeups only --\n"
-    printf "                     the three metrics that actually drain a battery)\n"
-    printf "  Postview wins %d, loses %d, ties %d\n", bwins, blosses, bties
-    if (blosses == 0 && bwins > 0) printf "  ==> Postview is at least equivalent on every battery metric.\n"
-    else if (blosses > 0)          printf "  ==> NOT YET. %d battery metric(s) still favour Preview.\n", blosses
-    printf "\n"
-    printf "  OVERALL           Postview wins %d, loses %d, ties %d\n", wins, losses, ties
-    if (losses == 0 && wins > 0) printf "  ==> Postview is equivalent or better on every metric measured.\n"
-    else if (losses > 0)         printf "  ==> %d metric(s) still favour Preview. Not done.\n", losses
-    printf "=========================================================================\n"
-}
-function emit(k, metric, label, arr, cnt, isbattery, fmt,   i, a, b, na, nb, ma, mb, sa, sb, verdict, delta, note, denom, gap, pa, pb, sa_txt, sb_txt) {
-    na = cnt["Postview",k]; nb = cnt["Preview",k]
-    if (na == 0 || nb == 0) { printf "  %-16s %s\n", label, "(not reported by both apps)"; return }
-    for (i = 1; i <= na; i++) a[i] = arr["Postview",k,i]
-    for (i = 1; i <= nb; i++) b[i] = arr["Preview",k,i]
-    sa = spread(a, na); sb = spread(b, nb)
-    ma = med(a, na); mb = med(b, nb)
-
-    if (ma == 0 && mb == 0)      { verdict = "TIE";  delta = 0 }
-    else {
-        denom = (ma > mb) ? ma : mb
-        delta = (mb - ma) / denom
-        if (delta > band)       verdict = "WIN"
-        else if (delta < -band) verdict = "LOSS"
-        else                    verdict = "TIE"
-    }
-
-    if (verdict == "WIN")  { wins++;  if (isbattery) bwins++ }
-    if (verdict == "LOSS") { losses++; if (isbattery) blosses++ }
-    if (verdict == "TIE")  { ties++;  if (isbattery) bties++ }
-
-    pa = ma; pb = mb
-    if (metric == "peak_rss_kb") { pa = ma/1024; pb = mb/1024 }
-
-    note = ""
-    # A spread wider than the gap between the apps means the run-to-run noise is
-    # larger than the effect, so the verdict is not yet trustworthy.
-    if (sa + sb > 0 && ma != mb) {
-        gap = (ma > mb) ? ma - mb : mb - ma
-        if ((sa > gap) || (sb > gap)) note = "   [noisy: spread exceeds the gap]"
-    }
-
-    # Formatted into strings first so that a %d metric and a %.2f metric still
-    # line up in the same column.
-    sa_txt = sprintf(fmt, pa); sb_txt = sprintf(fmt, pb)
-    printf "  %-16s Postview %10s   Preview %10s   %-4s %+.0f%%%s\n",
-        label, sa_txt, sb_txt, verdict, delta*100, note
-}
-' "$OUTPUT" | /usr/bin/tee "$VERDICT"
+VERDICT_WINDOW="${WIN_W}x${WIN_H}"
+VERDICT_HOST="$(/usr/bin/uname -s) $(/usr/bin/uname -r) $(/usr/bin/uname -m)"
+VERDICT_WHEN="$(/bin/date '+%Y-%m-%d %H:%M:%S %Z')"
+export VERDICT_WINDOW VERDICT_HOST VERDICT_WHEN
+render_verdict "$OUTPUT" "$TIE_BAND" "$RUNS" | /usr/bin/tee "$VERDICT"
 
 printf '\nRaw data: %s\nVerdict:  %s\n' "$OUTPUT" "$VERDICT"

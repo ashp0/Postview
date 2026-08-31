@@ -49,21 +49,36 @@ The app opens. Now, inside the app:
 
 A block of "PVSTAT ..." lines prints into the Terminal window. Check these:
 
-    PVSTAT power.source            should say  battery   (or ac if plugged in)
-    PVSTAT cost.render.samples     should be   bigger than 0
-    PVSTAT cost.ms.per.mpx         should be   some number, not 0.00
+    PVSTAT power.source              should say  battery  (or ac if plugged in)
+    PVSTAT cost.render.samples.full  should be   bigger than 0
+    PVSTAT cost.ms.per.mpx.full      should be   some number, not 0.00
+    PVSTAT cost.ms.per.mpx.preview   usually several times the .full one
+
+The last two are separate on purpose and the .full one is the one to quote.
+A preview is 1/9 the pixels but re-reads the whole page description, so it
+costs several times as much per megapixel; an ordinary reading session makes
+about three previews per page, so a single combined figure is mostly a
+statement about previews. The 2026-08-31 run reported one combined number of
+432.55 from 96 samples, 72 of which were previews, and it was read as the cost
+of a page. It was not.
+
+ALSO WRITE DOWN the window size and which PDF you used. A cost per megapixel
+only means something if you know what was being drawn.
 
 Cross-check the first one by running:  pmset -g batt
 It will say "Now drawing from 'Battery Power'" or "'AC Power'". Postview's
 power.source line must agree with it.
 
 >>> IF power.source SAYS "unknown", THAT IS THE THING TO REPORT BACK. <<<
-It means the power detection did not work on 10.9. The app is still safe — it
-falls back to the battery behaviour, which is the cautious one — but the
-feature is dead and needs fixing.
+It means the power detection did not work. The app is still safe — it falls
+back to the battery behaviour, which is the cautious one — but the feature is
+dead and needs fixing.
+
+It read "ac" correctly on the Mac Pro on 2026-08-31, so this does work on 10.9.
+"unknown" now means something broke, not something untested.
 
 SAVE THE OUTPUT: select the PVSTAT lines in Terminal, copy, paste into a text
-file on the Desktop called step2-stats.txt.
+file on the Desktop called stats.txt.
 
 NOTE: do NOT use the form `open -a Postview file.pdf --args -PVStats YES`.
 Mavericks' `open` command does not understand --args; it treats the words
@@ -75,6 +90,13 @@ STEP 3 — THE HEAD-TO-HEAD MEASUREMENT   (about 30-50 minutes, unattended)
 -------------------------------------------------------------------------
 This is the real test: Postview against Preview, same document, same window
 size, seven scenarios, five runs each, with a winner per metric.
+
+It ran on 2026-08-31 and REFUSED TO NAME A WINNER, because two fairness checks
+failed: the arrow key scrolled about half as far as Preview's, and the wheel
+test could not tell a 3% difference from a whole page. Both are fixed, so this
+run should be the first one that produces a verdict. Expect Postview's margin
+on the "scroll" line to be smaller than the +63% on record — that margin was
+partly bought by not travelling as far, and losing it means the fix worked.
 
 Preparation, all of it matters:
   - Quit Preview and Postview.
@@ -94,6 +116,10 @@ A long text-heavy PDF (a book, a manual, a paper) is the right choice.
 Check the header says:
 
     Power policy: Postview pinned to -PVPowerState battery
+
+The saved verdict file now records this itself, along with the document and the
+window size, so you do not have to rely on the Terminal window still being
+there afterwards.
 
 THEN DO NOT TOUCH THE MAC UNTIL IT FINISHES. Not the trackpad, not a key. It
 waits for the machine to be quiet before each trial and any input corrupts the
@@ -116,10 +142,16 @@ If it says "permission denied", run:  chmod +x ./pvband   and try again.
 
 This measures how long this machine actually takes to rasterise a page, and how
 that changes when a page is rendered in horizontal strips instead of all at
-once. Every timing figure in the project's documentation was measured on a
-different machine; this is the one that counts.
+once.
 
-SAVE THE OUTPUT: copy the whole thing into step4-band.txt on the Desktop.
+It ran on 2026-08-31 and the answer was decisive: on a text document, strips
+cost MORE than they save, which is what retired the biggest feature that was
+being planned. Re-run it only if you are using a DIFFERENT document, and
+especially a drawing-heavy one (maps, diagrams, CAD) — the project's own
+measurements predict the opposite answer there and nobody has checked it on
+this machine.
+
+SAVE THE OUTPUT: copy the whole thing into band.txt on the Desktop.
 
 
 STEP 5 — JUST USE IT
@@ -135,9 +167,9 @@ the association away from Preview on its own.
 
 WHAT TO BRING BACK
 ------------------
-  step2-stats.txt          the PVSTAT block from Step 2
+  stats.txt                the PVSTAT block, plus window size and document
   the .tsv file            from Step 3
-  step4-band.txt           the output from Step 4
+  band.txt                 the render cost probe, if you ran it
   any crash reports        ~/Library/Logs/DiagnosticReports/Postview*
   notes on anything odd
 
@@ -151,7 +183,8 @@ KNOWN LIMITS — NOT BUGS, DO NOT REPORT THESE
     export, no encrypted PDFs. It is a reader, not a PDF application.
   - Zooming past about 1.1x on an 8 GB machine renders pages slightly soft.
     This is a known, deliberate memory limit, recorded and pinned by tests.
-  - Peak memory use is higher than Preview's. Known, measured, being worked on.
+  - Peak memory use is higher than Preview's. It is the one measurement it
+    loses on across the board. Known, measured, still open.
   - Right-click → Open being needed on first launch is normal for an unsigned
     app. There is no way around it without a paid Apple Developer ID, and
     Mavericks predates notarization entirely.

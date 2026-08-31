@@ -235,15 +235,28 @@ memory on a photograph is a preference no measurement resolves. Not built.
 | gate | result |
 |---|---|
 | Clang static analyser | clean |
-| `pvtest` (unit) | 307 passed, 0 failed |
-| `pvuitest` (drives a real controller) | 134 passed, 0 failed |
+| `pvtest` (unit) | 319 passed, 0 failed |
+| `pvuitest` (drives a real controller) | 140 passed, 0 failed |
 | `pvsoak` (175 document cycles) | 20 passed, 0 failed |
 | `pvstress` | 14 passed, 0 failed |
 | `pvstress` + AddressSanitizer + UBSan | 14 passed, 0 failed |
 | `pvstress` + ThreadSanitizer | 14 passed, 0 failed, no data races |
 | leak census | no Postview-owned object leaked |
-| showdown self-test | 22 instrument checks passed |
+| showdown self-test | 26 instrument checks passed |
 | `make verify` (Mach-O 10.9 compatibility) | OK |
+
+**The AddressSanitizer row above was false until 2026-08-31, and `verify-all`
+was reporting it as passing.** §9.6. The row is true now, and the harness can no
+longer make that particular mistake.
+
+Two gates were also flaky rather than wrong, in the same way and for the same
+reason — an asynchronous teardown asserted against a fixed wall-clock budget.
+`pvstress`'s deadlines are now scaled for sanitized builds (§9.6), and
+`pvuitest` `[8]` waits for the cache and the PDF source instead of sampling them
+once the page view has gone. That one lost about one run in three on this host,
+and it is the reason the whole class matters: **a flaky gate is worse than a
+missing one, because it teaches you to re-run until green** — which is precisely
+how the AddressSanitizer failure survived.
 
 Soak footprint, 175 cycles, measured on this host on 2026-08-30 — the same
 command run against the previous commit and against the current tree:
@@ -279,25 +292,28 @@ Checked by reverting the change and re-running:
 
 ## 7. Still open
 
-- **The showdown has not been run on the Mavericks machine since any of this.**
-  Every comparative CPU, energy and peak-RSS claim against Preview is stale. Run
-  `./Postview-Showdown.command <document.pdf>` there. This is the single most
-  valuable outstanding item.
-- **`make band` has never run on the Mac Pro.** Two minutes, and it converts
-  every absolute millisecond in §2 from proxy to fact. Do it in the same session.
-- **Banding (stage 2) is not built.** §2 shows it pays on vector content (0.39 of
-  a page render per band) and costs on text (1.024× at K=2, worse with K), and
-  the `read` workload is text. It is now gateable on measured cost, which is the
-  precondition that was missing — but it changes the cache key, the wanted-set
-  builder, delivery pruning and `-drawRect:`, and building that on an unmeasured
-  baseline would make the result unattributable. Concurrency should land with it:
-  bands are independent, and the Mac Pro has 8–24 hardware threads idle during
-  every render.
+- ~~**The showdown has not been run on the Mavericks machine.**~~ Run
+  2026-08-31; it returned no verdict on two fairness checks, both since fixed.
+  **Run it again** — this is still the most valuable outstanding item, because
+  no run has yet been allowed to name a winner. See §9.2 and §9.5.
+- ~~**`make band` has never run on the Mac Pro.**~~ Run 2026-08-31. §9.3.
+- **Banding (stage 2) is not built, and §9.3 is now the argument against
+  building it.** Measured on the target: one band at K=2 costs 0.680 of a whole
+  page render, so the `read` workload would cost +1.99 s against a surplus over
+  Preview of 1.73 s. It pays on vector content and costs on text, §2 said so,
+  and the `read` workload is text. Do not build it as a cost reduction. It
+  remains arguable as a *latency* change bought with 36% more CPU, which is a
+  different case and needs a different measurement.
 - **Rendering is single-threaded by construction.** `_queue` is
   `DISPATCH_QUEUE_SERIAL` and `CGContextDrawPDFPage` interprets a sequential
   program with no internal parallelism. During the delay a user notices, one
-  core is working. This is the largest remaining Mac Pro win and it is the same
-  change as banding.
+  core is working. Still the largest untaken Mac Pro win, and still the same
+  change as banding — but §9.3 removes the CPU justification that made the pair
+  look like one obvious win, so the latency case now has to stand on its own.
+- **Peak memory is the only metric Postview loses on everywhere** — all seven
+  scenarios, 22–43%. Until §9.4 it was being reasoned about with a column that
+  was the difference of two independently-timed maxima. The instrument is fixed;
+  the question is untouched.
 - **A middle preview rung** at 1/2 linear (1/4 pixels) would land far sooner than
   a full render. *Unverified* — `pvband` varies band count, not scale.
 - **A speed-dependent preview divisor.** At 3000 pt/s nothing at 1/3 linear is
@@ -329,3 +345,294 @@ Checked by reverting the change and re-running:
   third-party code injected. Read crash reports accordingly.
 - **`Postview-Showdown.command` is the arbiter**, and it must run on the
   Mavericks machine, not here.
+
+---
+
+## 9. The Mavericks run, 2026-08-31
+
+The first time any of this executed on a 2013 Mac. Raw files are in
+`Tests/Mavericks Testing/`. Machine: the Mac Pro, 64 GB, mains power, SIMBL
+present as always.
+
+Four things were settled and three instruments were found to be wrong. The
+instrument faults matter as much as the results, because two of them had been
+reporting confidently for weeks.
+
+### 9.1 The power lookup works on 10.9
+
+`power.source ac`, from the Step 1 session. This was §7's most-likely-broken
+item — the one call that could not be tested on a modern OS — and the value
+proves the lookup succeeded rather than merely defaulted, because a failed
+`dlsym` reports `unknown` and not `ac` (§4.2). The Mac Pro has no battery and
+always draws from mains, so `ac` is also the right answer.
+
+**Measured. Closed.** The AC branch of `PVRenderPolicyFor` is live code on the
+target, not a code path that has only ever run in a test.
+
+### 9.2 The showdown returned no verdict, and was right to
+
+Seven scenarios, five runs each, and two fairness checks failed. One was the
+app and one was the instrument.
+
+**`scroll` — the app.** 200 arrow presses moved Preview 13 pages and Postview
+6. Working back through the geometry — the document's page is 3695 px tall at
+a backing scale of 2, so 1847.5 pt, and 1859.5 pt with `PV_PAGE_GAP` — Preview
+scrolls about 121 pt per press and Postview scrolled a flat 60. **A reader
+holding Down in Postview covered half the ground per press**, which is a real
+defect in its own right and not merely a staging problem. The 60 was not
+derived from anything; `Page Down` and `Space` were already a viewport less a
+40 pt overlap, and the arrow key was the one scroll unit in the program with no
+argument behind it.
+
+Now `PVArrowScrollForViewportHeight`: one eighth of the viewport, bounded to
+[40, 160] pt, so eight presses cover a screenful and the step keeps its meaning
+at any zoom and window size. At the showdown's 800 pt window that is 96 pt.
+*Derived* — 200 presses then travel 10.3 pages against Preview's 13, a ratio of
+1.26 where the gate trips at 2.
+
+**Expect the `scroll` CPU margin to shrink, and take that as the fix working.**
+The recorded +63% was partly bought by travelling half as far. Per page
+travelled the recorded run is Postview 0.54 s against Preview 0.67 s, so a
+*projected* honest margin is nearer +20%. That number is arithmetic on a run
+made under the old behaviour and is not a measurement; the next run replaces it.
+
+**`wheel` — the instrument.** Postview travelled 0 pages, Preview 1, and the
+ratio test read that as an infinite disparity. It is not one. Both apps scroll
+the AppKit default of 10 pt per line — Postview because it deliberately does
+not override `-scrollWheel:`, which is the precondition for responsive
+scrolling — so 60 events of 3 lines is 1800 pt in Postview against a page pitch
+of 1859.5. **The two apps were 3% apart and landed on opposite sides of a page
+boundary.**
+
+The travel instrument reads a page number out of a window title, so its
+resolution is one page and nothing finer, and two apps that travel the *same*
+distance still report a page apart whenever that distance straddles a boundary.
+A one-page gap is therefore exactly what equal travel looks like, and no ratio
+computed from it is evidence. The gate now says so and does not count it; a gap
+of two pages or more cannot be manufactured that way and is still the app.
+
+Verified against the recorded TSV: the two failures become one, and `scroll`
+— the real one — still fails, which is the property that matters.
+
+### 9.3 Banded rendering does not pay on this document
+
+`pvband`, 528-page Russian-language text document, 8.66 Mpx per page:
+
+| K | ms/render | page-equivalents |
+|---|---|---|
+| 1 | 156.7 | 1.000 |
+| 2 | 106.5 | **1.359** |
+| 4 | 81.4 | 2.079 |
+| 8 | 69.6 | 3.552 |
+
+One band at K=2 costs 0.680 of a whole-page render against the 0.500 it would
+cost if band cost were proportional to pixels. The marginal cost of each extra
+split is a steady +0.35 page-equivalents, i.e. the per-render fixed cost is real
+and roughly constant. Ink agrees to 0.0005 across every K, so the bands are
+drawing the document and not a fraction of it.
+
+Applied to the `read` workload: today's 7 page renders become 17 renders and
+16% more pixels, costing 11.04 page-equivalents against 8.12 today — **+1.99 s
+against a recorded surplus over Preview of 1.73 s.** On the run actually
+recorded here the surplus is smaller still (`read` was 3.48 s against Preview's
+3.96 s, not the 5.18 s the probe's model assumed), so banding looks worse rather
+than better once the current numbers are used.
+
+**This retires §7's largest planned item for text documents.** §2 predicted it:
+banding pays on vector content (0.686× at K=4) and costs on text (1.177×), and
+the `read` workload is text. The measurement now exists on the machine that
+decides, and it agrees. Concurrency across bands is a separate argument and is
+still open — the Mac Pro's idle cores are still idle — but it can no longer be
+justified as a *cost* reduction on documents like this one, only as a latency
+one, and it would be paying 36% more CPU to get it.
+
+### 9.4 Three instruments were reporting numbers that were not what they said
+
+Each of these had been in the report for weeks, and each was confidently wrong.
+
+**The cost rate mixed the two populations the model exists to keep apart.**
+`cost.ms.per.mpx` divided total render seconds by total megapixels across both
+full renders and previews. `PVCostModel.h` calls mixing them "the real defect"
+and keeps two independent estimates for exactly this reason; the census then
+averaged them back together on the way out. The recorded 432.55 ms/Mpx came
+from 96 samples of which **72 were previews**, so the headline figure — the one
+`INSTRUCTIONS.md` told the tester to check — largely described previews and was
+read as the cost of a page. Now reported as `cost.ms.per.mpx.full` and
+`cost.ms.per.mpx.preview`, each dividing its own population's seconds by its own
+population's pixels.
+
+That run's figure cannot be recovered by arithmetic and **should not be quoted**.
+Nor is it comparable with §9.3's 18.1 ms/Mpx: the Step 1 session averaged
+2.03 Mpx per full render against the probe's 8.66, so it was a different window
+or a different document, and neither was recorded. `INSTRUCTIONS.md` now asks
+for both.
+
+**The "non-bitmap" column was the difference of two clocks.** It was computed as
+`max(peak RSS) − max(resident bitmaps)`, two high-water marks taken by different
+samplers at different moments. `max(A+B) − max(B)` equals `max(A)` only when the
+two maxima coincide and collapses towards zero when they do not, so the column
+measured how well two clocks happened to line up. The recorded run shows it:
+68.8 MB on `idle` to 177.6 MB on `read`, a 109 MB swing, printed underneath a
+note saying the quantity should be roughly constant across scenarios.
+
+The app now samples its own RSS at the instant the bitmap census sets a new
+high-water mark and reports it as `resident.peak.rss.mb`, so the pair is
+simultaneous by construction. Rows from older TSVs still render, marked `?`,
+with the difference stated rather than presented as the same quantity.
+
+**Nothing here says whether peak memory is actually a problem.** It says the
+column that was being used to reason about it did not mean what it claimed.
+That question is still open and is now measurable.
+
+**A saved verdict did not record which power branch it measured.** §4.2 makes
+battery and AC two different scheduling policies, and the `.txt` recorded none
+of the run's conditions — the power pin, the document, the window size — because
+they were printed to a terminal that had scrolled away by the time anyone read
+the file. The battery pin on the 2026-08-31 run had to be inferred from the
+script's default. Now written into the verdict itself.
+
+### 9.5 What the next run has to settle
+
+- **Re-run the showdown.** Both fairness checks should now pass and a verdict
+  should print for the first time. `scroll`'s CPU margin should fall; if it
+  does not fall at all, the arrow change did not reach the binary being measured.
+- **Peak memory**, with a `non-bitmap` column that is now a real quantity. This
+  is the only metric Postview loses on in all seven scenarios, by 22–43%.
+- **`cost.ms.per.mpx.full`**, alongside the window size and document, so it can
+  finally be compared with `pvband`'s 18.1 ms/Mpx on the same page.
+- **The AC branch**, via `POWERSTATE=ac`. §9.1 makes it live code on this
+  machine and it has never been measured there.
+
+### 9.6 `verify-all` was reporting success over a gate that failed
+
+Found while re-running the gates for the changes in §9.2 and §9.4, and the worst
+thing in this section, because everything else here rests on the harness.
+
+Each gate was run as
+
+```
+@echo "== unit tests ==" && $(MAKE) --no-print-directory test | tail -1
+```
+
+and a shell pipeline exits with the status of its **last** command. `tail`
+always succeeds, so make never saw a failing sub-make. The evidence was on
+screen the whole time:
+
+```
+== stress + address,undefined ==
+make[1]: *** [stress] Error 1
+12 passed, 2 failed
+== stress + thread ==
+...
+verify-all: every gate passed
+```
+
+The failure printed, four more gates ran, and the run concluded that every gate
+passed. §6 has been carrying `pvstress + AddressSanitizer + UBSan | 14 passed,
+0 failed` on the strength of that.
+
+Each gate now runs through a `gate` function that captures the log, echoes the
+summary line, and on a non-zero status prints the last 40 lines and stops. Not
+`bash -c 'set -o pipefail'`: macOS ships GNU Make 3.81, which has no
+`.SHELLFLAGS`, and keeping the whole log of a failing gate is worth more than
+its last line anyway.
+
+**What was actually failing was the harness, not the app.** The two failing
+assertions were the 60-round teardown unwinds — `abandoned queues all
+deallocated` (18 objects still live) and `both render queues deallocated` (10) —
+and both are `SettlesToZero` waiting a fixed number of seconds. That deadline is
+a claim about how long an unwind takes, which is a property of the code, checked
+against wall-clock time, which is a property of the build: a page render under
+address+undefined is roughly an order of magnitude slower than the shipping
+configuration, and the constant was sized for ThreadSanitizer.
+
+Established rather than assumed, three ways: the plain and ThreadSanitizer
+builds pass the same assertions, `leakcheck` reports nothing leaked, and the
+address+undefined build passes **14 of 14** at an 8× deadline. The objects were
+unwinding; they were not unwinding inside a number chosen for a faster build.
+
+`PVSTRESS_DEADLINE_SCALE` now multiplies every deadline, and the Makefile sets
+it to 8 for any sanitized build. Deliberately a multiplier and not a bigger
+constant — a real leak still fails, it just takes proportionally longer to say
+so, which is exactly the property the original comment claimed and the fixed
+constant had quietly stopped providing.
+
+The failure was pre-existing: verified by running the same gate on an unmodified
+checkout of the previous commit, which fails the same two assertions.
+
+### 9.7 A fourth instrument: an unmeasured metric was scored as a tie
+
+Found while answering "so did we beat Preview". **Energy Impact reads 0.00 for
+both apps in all 70 rows of the recorded run** — the sampler returns zero on a
+machine that does not report the figure, and this one does not. The analysis
+guarded against a *missing* field (`-`) but a reported `0.00` is not missing, so
+it fell through to `ma == 0 && mb == 0` and was scored `TIE +0%`, once per
+scenario.
+
+**Seven of the run's nine ties came from a metric nobody measured.** Corrected,
+the same TSV reads:
+
+| | before | after |
+|---|---|---|
+| battery (CPU, energy, wakeups) | 10 / 2 / 9 | **10 / 2 / 2** |
+| overall | 11 / 9 / 9 | **11 / 9 / 2** |
+
+The wins and losses were never wrong; the ties were padding, and padding in the
+direction of "the two apps are much the same" is the flattering direction for
+whichever app is behind. A metric that is identically zero for both apps in
+every trial is now printed as `(not reported by this machine -- not scored)`.
+
+Checked against every sample rather than the median, so a metric that genuinely
+rests at zero for most of a scenario is still scored on the trials where it
+moved. Of the five metrics, only Energy Impact trips it.
+
+### 9.8 What the run supports, and what it does not
+
+The showdown named no winner, and that is the formal position. It is not the
+same as having learned nothing, and the distinction is worth stating precisely
+because "no verdict" is easy to read as "no evidence".
+
+**Only `scroll` was invalidated.** The arrow-key defect (§9.2) affects one
+scenario of seven. In four others the two apps travelled equal distances or
+Preview travelled *less*, so their CPU figures compare like with like:
+
+| scenario | travel P / Pv | Postview | Preview | |
+|---|---|---|---|---|
+| `idle` | 0 / 0 | 0.02 s | 0.33 s | −94% |
+| `read` | 4 / 4 | 3.48 s | 3.96 s | −12% |
+| `page` | 26 / 23 | 3.27 s | 8.15 s | −60% |
+| `swipe` | 6 / 6 | 3.42 s | 6.82 s | −50% |
+
+`page` is the strongest of these in one specific sense: Postview travelled 13%
+*further* than Preview and still used 60% less CPU, so the staging error there
+runs against Postview rather than for it.
+
+**`swipe` is the control for `scroll`, and it is clean.** The two scenarios were
+deliberately sized to the same rate — 240 trackpad events at ~60 Hz is 3125 pt/s
+against 200 arrows at 50 Hz — precisely so the keyboard and the trackpad could
+be read against each other. `swipe` travelled 6 pages in both apps and Postview
+used half the CPU. So the claim `scroll` was making is independently supported
+by a scenario the fairness gate passed, which is why §9.2 fixes the arrow key
+rather than treating the whole fast-scroll result as suspect.
+
+**The losses are equally real, and one of them is not a staging artifact.**
+Peak memory loses in all seven scenarios by 22–43%, including `launch` and
+`idle`, where no input is sent and no travel happens at all. At launch
+Postview's bitmap cache alone (102.5 MB) is about the size of Preview's entire
+process (102 MB). That is the trade the program makes on purpose — §1 ranks
+"keeping what was expensive to make" fourth of four levers, and §4.1 sets the
+budget by RAM tier — but it is a trade, not a misreading.
+
+Note also that the recorded machine is 64 GB, which is the **Huge** tier and the
+most generous budget the program ever grants. *Derived, not measured:* an 8 GB
+machine gets 96 MB and a 2 GB machine 32 MB (§4.1), so this is the largest the
+memory gap should ever be. Nobody has measured it at a lower tier.
+
+**Idle wakeups are genuinely mixed** — Postview wins `launch`, `idle`, `read`
+and `wheel`, loses `scroll` and `swipe`, ties `page`. The `swipe` loss (129
+against 67) carries a 4× run-to-run spread and is flagged noisy; the `scroll`
+one (26 against 16) is small in absolute terms and sits inside the scenario the
+fairness gate rejected.
+
+**What no run has established:** anything about energy directly (§9.7), and
+anything about a machine other than a 64 GB Mac Pro on mains power.

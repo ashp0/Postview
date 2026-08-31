@@ -980,6 +980,113 @@ static void TestArbitrary(NSString *path)
 // process cannot survive that by construction. What is testable is the
 // decision that keeps the app out of that situation, so that is what is
 // pinned here -- the whole truth table, and the one volume every machine has.
+// A page too large to lay out is presented smaller, not reshaped.
+//
+// PVPDFSource caps a page's point size so the layout arithmetic downstream --
+// frame rectangles, pixel sizes, the render ceiling -- stays inside numbers it
+// can carry. The cap used to be applied per axis, replacing whichever dimension
+// was out of range with the corresponding US Letter one, which for a page that
+// is oversized on ONE axis substitutes an aspect ratio the document does not
+// have. The page is then drawn correctly proportioned inside a frame of the
+// wrong shape, so it appears as a thin strip in a mostly blank page with
+// nothing anywhere reporting a problem.
+//
+// The fixture is built here rather than shipped, because the geometry that
+// triggers it is out of spec: PDF's own limit is 14400 pt, and no generator
+// this project could reasonably keep around emits 25000.
+static NSString *PVWriteOversizedFixture(void)
+{
+    // Three pages: oversized on width only, oversized on height only, and one
+    // ordinary page, so the cap is exercised in both directions and the
+    // untouched path is checked in the same document.
+    const char *boxes[3] = { "[0 0 25000 300]", "[0 0 300 25000]", "[0 0 612 792]" };
+    NSMutableString *pdf = [NSMutableString string];
+    NSUInteger offsets[5];
+    int i;
+
+    [pdf appendString:@"%PDF-1.4\n"];
+    offsets[1] = [pdf length];
+    [pdf appendString:@"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"];
+    offsets[2] = [pdf length];
+    [pdf appendString:@"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>\nendobj\n"];
+    for (i = 0; i < 3; i++) {
+        offsets[3 + i] = [pdf length];
+        [pdf appendFormat:@"%d 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox %s >>\nendobj\n",
+                          3 + i, boxes[i]];
+    }
+    NSUInteger xref = [pdf length];
+    [pdf appendString:@"xref\n0 6\n0000000000 65535 f \n"];
+    for (i = 1; i <= 5; i++)
+        [pdf appendFormat:@"%010lu 00000 n \n", (unsigned long)offsets[i]];
+    [pdf appendFormat:@"trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n%lu\n%%%%EOF\n",
+                      (unsigned long)xref];
+
+    NSString *path = @"/tmp/postview-selftest-oversized.pdf";
+    if (![pdf writeToFile:path atomically:YES encoding:NSASCIIStringEncoding error:NULL])
+        return nil;
+    return path;
+}
+
+static void TestOversizedPageGeometry(void)
+{
+    printf("\n[page geometry past the layout cap]\n");
+    NSString *path = PVWriteOversizedFixture();
+    OK(path != nil, "oversized fixture written");
+    if (!path) return;
+
+    NSError *err = nil;
+    PVPDFSource *src = [[PVPDFSource alloc] initWithURL:[NSURL fileURLWithPath:path]
+                                                  error:&err];
+    OK(src != nil, "a document with out-of-spec page sizes still opens");
+    if (!src) return;
+    OK([src pageCount] == 3, "all three pages are present");
+
+    // Both axes are inside what layout will carry.
+    NSUInteger i;
+    BOOL bounded = YES;
+    for (i = 0; i < [src pageCount]; i++) {
+        CGSize s = [src pointSizeOfPage:i];
+        if (!(s.width > 1) || !(s.height > 1) || s.width > 20000.5 || s.height > 20000.5)
+            bounded = NO;
+    }
+    OK(bounded, "every reported page size is inside the layout cap");
+
+    // ...and the shape survives, which is the part that used to be lost. The
+    // tolerance is a rounding allowance on a ratio of ~83, not a margin for a
+    // different answer: the old behaviour reported 612 x 300, a ratio of 2.04.
+    CGSize wide = [src pointSizeOfPage:0];
+    CGSize tall = [src pointSizeOfPage:1];
+    CGSize norm = [src pointSizeOfPage:2];
+
+    double wantWide = 25000.0 / 300.0;
+    double gotWide  = (double)wide.width / (double)wide.height;
+    OK(fabs(gotWide - wantWide) < 0.01,
+       "an over-wide page keeps its aspect ratio (25000:300)");
+
+    double wantTall = 300.0 / 25000.0;
+    double gotTall  = (double)tall.width / (double)tall.height;
+    OK(fabs(gotTall - wantTall) < 0.0001,
+       "an over-tall page keeps its aspect ratio (300:25000)");
+
+    // The scale is the one that just fits, so the long axis lands on the cap
+    // rather than somewhere arbitrary below it.
+    OK(fabs((double)wide.width  - 20000.0) < 0.5, "the over-wide page is scaled to the cap");
+    OK(fabs((double)tall.height - 20000.0) < 0.5, "the over-tall page is scaled to the cap");
+
+    // A page that was never out of range is not touched at all.
+    OK(fabs((double)norm.width - 612.0) < 0.5 && fabs((double)norm.height - 792.0) < 0.5,
+       "an ordinary page beside them is reported exactly as it is");
+
+    // The cap is a layout decision, and the renderer has to agree with it: a
+    // bitmap asked for at the reported size must actually come back.
+    CGImageRef img = [src createImageForPage:0 pixelSize:CGSizeMake(400, 5)];
+    OK(img != NULL, "the capped page still rasterises");
+    if (img) CGImageRelease(img);
+
+    [src release];
+    [[NSFileManager defaultManager] removeItemAtPath:path error:NULL];
+}
+
 static void TestRunningLocation(void)
 {
     printf("\n[where the app is running from]\n");
@@ -1487,12 +1594,73 @@ static double ReplaySpeed(int presses, double delay, double travel)
     return speed;
 }
 
+// How far one arrow press scrolls.
+//
+// Pinned here because it is a number the showdown's fairness gate compares
+// against Preview, and the comparison is only meaningful if the number is
+// stable. The recorded failure: 200 arrow presses moved Preview 13 pages and
+// Postview 6, so the two apps were not doing the same work and the run could
+// not name a winner. See ENGINEERING.md section 9.
+static void TestArrowScrollStep(void)
+{
+    printf("\nArrow-key scroll step\n");
+
+    // The showdown's window: 1200x800, viewport about 770 pt after the chrome.
+    // A page of the measured document is 1847.5 pt tall at that width and a
+    // page pitch is 1859.5 with the gap, so 200 presses must land nearer to
+    // Preview's 13 pages than the old 60 pt did.
+    const double kPitch = 1847.5 + PV_PAGE_GAP;
+    CGFloat step = PVArrowScrollForViewportHeight(770.0);
+    OK(fabs(step - 770.0 / 8.0) < 0.001,
+       "a 770 pt viewport gives one eighth of itself per press");
+    double pages = 200.0 * step / kPitch;
+    OK(pages > 13.0 / 2.0,
+       "200 presses travel more than half of Preview's 13 pages (the gate)");
+    OK(pages < 13.0 * 2.0,
+       "...and less than twice it, from the other side");
+    OK(200.0 * 60.0 / kPitch <= 13.0 / 2.0,
+       "the 60 pt step this replaced does NOT clear that gate");
+
+    // Monotonic in the viewport, so a taller window scrolls further per press,
+    // and clamped at both ends so neither extreme is unusable.
+    OK(PVArrowScrollForViewportHeight(1000.0) > PVArrowScrollForViewportHeight(600.0),
+       "a taller viewport scrolls further per press");
+    OK(PVArrowScrollForViewportHeight(100.0) == PV_ARROW_SCROLL_MIN,
+       "a very short viewport is held at the floor");
+    OK(PVArrowScrollForViewportHeight(4000.0) == PV_ARROW_SCROLL_MAX,
+       "a very tall viewport is held at the ceiling");
+
+    // Degenerate geometry reaches -scrollToPoint: as a number, never a NaN.
+    OK(PVArrowScrollForViewportHeight(0.0) == PV_ARROW_SCROLL_MIN,
+       "a zero viewport returns the floor");
+    OK(PVArrowScrollForViewportHeight(-50.0) == PV_ARROW_SCROLL_MIN,
+       "a negative viewport returns the floor");
+    OK(PVArrowScrollForViewportHeight((CGFloat)NAN) == PV_ARROW_SCROLL_MIN,
+       "a non-finite viewport returns the floor, not NaN");
+    OK(isfinite(PVArrowScrollForViewportHeight((CGFloat)INFINITY)),
+       "an infinite viewport returns a finite step");
+
+    // The arrow stays smaller than Page Down at every size, or the two keys
+    // would have swapped roles somewhere in the middle of the range.
+    int i; BOOL ordered = YES;
+    for (i = 200; i <= 2000; i += 50) {
+        CGFloat vp = (CGFloat)i;
+        CGFloat pageStep = (vp - 40.0 < 40.0) ? vp : vp - 40.0;
+        if (PVArrowScrollForViewportHeight(vp) >= pageStep) ordered = NO;
+    }
+    OK(ordered, "an arrow press is smaller than a Page Down at every window size");
+}
+
 static void TestScenarioReplay(void)
 {
     printf("\nScenario replay (profiler workloads)\n");
 
     const double kPageTravel = 760.0;   // roughly one viewport per Page Down
-    const double kLineTravel = 24.0;    // one line per arrow key
+    // One arrow press in the showdown's 800 pt window. Taken from the function
+    // the app calls rather than written down again, so this replay cannot go
+    // on modelling a step the app has stopped using -- which is what it was
+    // doing at 24 pt against the app's 60.
+    const double kLineTravel = (double)PVArrowScrollForViewportHeight(770.0);
 
     // read: 12 Page Downs, 2.5 s apart. Every gap exceeds half a second, so
     // each one ends the previous scroll and the speed returns to rest.
@@ -2090,6 +2258,7 @@ int main(int argc, const char *argv[])
         TestRenderQueue(src, url);
         TestStateStore();
         TestStateStoreCorruptFile();
+        TestOversizedPageGeometry();
         TestRunningLocation();
         TestRenderSuppressionPolicy();
         TestRamTierInvariants();
@@ -2101,6 +2270,7 @@ int main(int argc, const char *argv[])
         TestCostAwareGate();
         TestCostAwareEviction();
         TestInFlightFullCap(src, url);
+        TestArrowScrollStep();
         TestScenarioReplay();
         if (argc > 2) TestRotation([NSString stringWithUTF8String:argv[2]]);
         if (argc > 3) TestArbitrary([NSString stringWithUTF8String:argv[3]]);

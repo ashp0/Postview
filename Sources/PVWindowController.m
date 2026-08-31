@@ -33,6 +33,7 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
 - (void)cancelSettle;
 - (void)scheduleSettle;
 - (void)settleFired:(NSTimer *)timer;
+- (void)scrollClipTo:(NSPoint)p;
 @end
 
 @implementation PVWindowController
@@ -373,6 +374,36 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
     [self updatePageIndicator];
 }
 
+// Move the viewport, and record where it actually ended up.
+//
+// The recording is the point of this existing. Every programmatic scroll rounds
+// its target to a whole point, and AppKit constrains the result again to the
+// document's own bounds -- so the place the clip lands is not in general the
+// place it was asked for. Both callers used to store the number they had asked
+// for, and -clipBoundsChanged: then compared it against the number the clip
+// reported, which is a different one.
+//
+// That difference is small and it is not harmless. The direction test is
+// `y > _lastScrollY + 0.5`, so half a point of disagreement sits exactly on the
+// threshold and can flip _lastDirection -- which decides which way prefetch
+// looks and which side of the visible range an arriving bitmap is kept on. The
+// speed sample is worse: -clipBoundsChanged: divides that phantom travel by an
+// interval as short as 2 ms, so up to half a point of rounding can be reported
+// as ~250 pt/s of scrolling that never happened, seeding _scrollSpeed (which is
+// seeded from its first sample, deliberately) with a measurement of arithmetic.
+//
+// Reading the clip back makes the recorded position true by construction rather
+// than by both sides agreeing about rounding. A programmatic scroll now produces
+// a delta of exactly zero on the notification it causes, which is what it is.
+- (void)scrollClipTo:(NSPoint)p
+{
+    NSClipView *clip = [_scrollView contentView];
+    if (!clip) return;
+    [clip scrollToPoint:NSMakePoint(floor(p.x + 0.5), floor(p.y + 0.5))];
+    [_scrollView reflectScrolledClipView:clip];
+    _lastScrollY = NSMinY([clip documentVisibleRect]);
+}
+
 - (void)scrollToPage:(NSUInteger)page fraction:(CGFloat)fraction
 {
     NSUInteger pageCount = [_source pageCount];
@@ -392,9 +423,7 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
     CGFloat x = (NSWidth([_pageView frame]) - NSWidth(cb)) / 2.0;
     if (x < 0) x = 0;
 
-    [clip scrollToPoint:NSMakePoint(floor(x + 0.5), floor(y + 0.5))];
-    [_scrollView reflectScrolledClipView:clip];
-    _lastScrollY = y;
+    [self scrollClipTo:NSMakePoint(x, y)];
 }
 
 #pragma mark - Unrenderable pages
@@ -652,6 +681,20 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
         // geometry that no longer exists.
         [_pageCache setPinnedPages:NSMakeRange(0, 0)];
         [_pageQueue setDesiredRequests:nil];
+        // And say that the recorded set no longer describes anything.
+        //
+        // _lastRequestRange / _haveRequestState are the record of what was last
+        // asked for, and -clipBoundsChanged: skips the rebuild whenever the
+        // range it computes matches them. Leaving them describing the set that
+        // was just discarded means a viewport that becomes empty and then comes
+        // back to the SAME page range is recognised as unchanged -- so no
+        // rebuild happens, and the queue is left with nothing pending and the
+        // cache with nothing pinned for pages that are on screen.
+        //
+        // Every other path that invalidates the request set already clears this
+        // flag; this one cleared the two things the flag is a record OF and left
+        // the flag alone, which is the one combination that cannot be right.
+        _haveRequestState = NO;
         return;
     }
 
@@ -1517,9 +1560,7 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
         if (x < 0)    x = 0;
     }
 
-    [clip scrollToPoint:NSMakePoint(floor(x + 0.5), floor(y + 0.5))];
-    [_scrollView reflectScrolledClipView:clip];
-    _lastScrollY = y;
+    [self scrollClipTo:NSMakePoint(x, y)];
 }
 
 - (void)pageViewWillMagnify:(PVPageView *)view atPoint:(NSPoint)pointInView

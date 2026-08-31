@@ -27,6 +27,8 @@
 #import "PVRenderQueue.h"
 #import "PVWindowController.h"
 #import "PVStateStore.h"
+#include <stdlib.h>          // getenv, atof -- see DeadlineScale()
+#include <math.h>
 
 @interface PVWindowController (PVStressHooks)
 - (void)updateVisibleContent;
@@ -59,8 +61,40 @@ static void Pump(double s)
 // deadline, because "eventually" is exactly the bug this is looking for.
 // Under ThreadSanitizer a page render is an order of magnitude slower, so the
 // deadline is generous; a real leak still fails, it just fails at the end.
+// Multiplier on every deadline below, from PVSTRESS_DEADLINE_SCALE.
+//
+// The deadlines are a claim about how long an unwind should take, and that is a
+// property of the code. What they were being compared against is wall-clock
+// time, which is a property of the build: a page render under a sanitizer is
+// an order of magnitude slower than in the shipping configuration, and
+// address+undefined is slower again than thread. One constant across all three
+// is a constant that means three different things.
+//
+// Recorded 2026-08-31: the address+undefined build failed the two 60-round
+// unwinds on this host -- 18 and 10 objects still live at the deadline -- while
+// the plain and thread builds passed the same assertions, and `leakcheck`
+// reported nothing leaked. Everything unwound; it did not unwind inside a
+// number chosen for a faster build. The failure was invisible for as long as it
+// was because `verify-all` piped each gate through `tail` and read the
+// pipeline's status instead of the gate's, so it printed "every gate passed"
+// two lines after printing the error.
+//
+// Deliberately a multiplier and not a longer constant: a real leak has to keep
+// failing, and it does -- it just takes proportionally longer to say so.
+static double DeadlineScale(void)
+{
+    static double scale = 0;
+    if (scale > 0) return scale;
+    const char *env = getenv("PVSTRESS_DEADLINE_SCALE");
+    double v = env ? atof(env) : 1.0;
+    if (!(v >= 1.0) || !isfinite(v)) v = 1.0;
+    scale = v;
+    return scale;
+}
+
 static BOOL SettlesToZero(const char *cls, double deadline)
 {
+    deadline *= DeadlineScale();
     double waited = 0;
     while (waited < deadline) {
         if (PVLiveCount(cls) == 0) return YES;

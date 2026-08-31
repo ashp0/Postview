@@ -46,9 +46,10 @@ make verify-all  # every test gate; takes a while
 
 ## Step 1 — prove the new code runs on Mavericks (5 min)
 
-**This is the most important step.** All of the recent work was verified on a
-modern Mac under Rosetta, on a host that cannot even display the app's windows.
-None of it had ever executed on a 2013 Mac.
+Two minutes, and it confirms the app still starts and still instruments itself
+on 10.9 after the latest changes. The 2026-08-31 run already established that it
+does; this is the cheap check that nothing since has broken it, and it produces
+the cost figures Step 2 is read against.
 
 ```bash
 POSTVIEW_STATS=1 /Applications/Postview.app/Contents/MacOS/Postview
@@ -62,19 +63,35 @@ A block of `PVSTAT` lines prints into Terminal. Check three:
 | line | expected | meaning |
 |---|---|---|
 | `power.source` | `battery` or `ac` | the IOKit power detection worked on 10.9 |
-| `cost.render.samples` | greater than 0 | the cost model measured real renders |
-| `cost.ms.per.mpx` | a real number, not `0.00` | it produced a usable rate |
+| `cost.render.samples.full` | greater than 0 | the cost model measured real page renders |
+| `cost.ms.per.mpx.full` | a real number, not `0.00` | it produced a usable rate for pages |
+| `cost.ms.per.mpx.preview` | usually several times the `.full` rate | the two populations are being kept apart |
+
+The last two are reported separately on purpose, and the `.full` one is the one
+to quote. A preview is 1/9 the pixels but re-walks the whole content stream, so
+its cost per megapixel is several times a page's; an ordinary reading session
+produces about three previews per page render, so a single combined rate is
+mostly a statement about previews. The 2026-08-31 run reported one combined
+`cost.ms.per.mpx` of 432.55 from 96 samples, 72 of which were previews — a
+number that was read as the cost of a page and was not.
+
+Also record **the window size and the document** you used. A rate in
+milliseconds per megapixel is comparable between runs only if you know what was
+being rasterised; the same session at half the window width is a different
+measurement.
 
 Cross-check with `pmset -g batt` — it will say "Now drawing from 'Battery
 Power'" or "'AC Power'", and `power.source` must agree.
 
 > **If `power.source` says `unknown`, that is the finding to report.** The
-> runtime IOKit lookup failed on 10.9. The app is still safe — it falls back to
-> the cautious battery behaviour — but the power feature is dead and needs
-> fixing. This is the single most likely thing to be wrong, because it is the
-> one call that could only be tested on a modern OS.
+> runtime IOKit lookup failed. The app is still safe — it falls back to the
+> cautious battery behaviour — but the power feature is dead and needs fixing.
+>
+> It read `ac` correctly on the Mac Pro on 2026-08-31, so the lookup does work
+> on 10.9 (`ENGINEERING.md` §9.1). `unknown` now means a regression rather than
+> an untested call.
 
-Save the output into `step1-stats.txt`.
+Save the output into `stats.txt`.
 
 **Do not use** `open -a Postview file.pdf --args -PVStats YES`. Mavericks'
 `open` has no `--args`: it reads it as `--` plus a filename `args` and you get
@@ -85,8 +102,15 @@ Save the output into `step1-stats.txt`.
 ## Step 2 — the head-to-head measurement (30–50 min, unattended)
 
 Postview against Preview: same document, same window size, seven scenarios,
-five runs each, a winner per metric. This is the project's own arbiter and it
-has **never been run against any of the recent work**.
+five runs each, a winner per metric. This is the project's own arbiter.
+
+It ran on 2026-08-31 and **refused to name a winner**, because two fairness
+checks failed: the arrow key scrolled half as far as Preview's, and the wheel
+scenario tripped a check that could not tell 3% from a page. Both are fixed
+(`ENGINEERING.md` §9.2), so this run should be the first one that returns a
+verdict. Expect `scroll`'s CPU margin to be smaller than the +63% on record —
+that margin was partly bought by travelling half as far, and losing it is the
+fix working.
 
 Preparation, all of it matters:
 
@@ -103,6 +127,8 @@ page content, so a synthetic file measures the wrong thing. A long, text-heavy
 PDF is the right choice.
 
 Confirm the header says `Power policy: Postview pinned to -PVPowerState battery`.
+The saved verdict now records this too, along with the document and window size,
+so the file can be read months later without the terminal it scrolled past.
 
 **Then do not touch the Mac until it finishes.** It waits for a quiet machine
 before each trial; any input corrupts the measurement.
@@ -128,8 +154,11 @@ chmod +x ./pvband
 ./pvband /path/to/the/same/document.pdf 6 3
 ```
 
-Every timing figure in `ENGINEERING.md` §2 was measured on a different machine.
-This is the one that counts. Save the output as `step3-band.txt`.
+This ran on 2026-08-31 and its answer was decisive: banding costs more than it
+saves on a text document, which is what retired the largest planned feature
+(`ENGINEERING.md` §9.3). Re-run it only if you are using a **different**
+document — particularly a vector-heavy one, where §2 predicts the opposite sign
+and nobody has measured it on this machine. Save the output as `band.txt`.
 
 ---
 
@@ -142,9 +171,15 @@ blurry when it should not, or feels slow.
 
 ## What to bring back
 
-- `step1-stats.txt` — the `PVSTAT` block
+Named for what they contain, not for the step that produced them. The two
+copies of these instructions have historically numbered the same procedure
+differently — this file called the head-to-head Step 2 and `INSTRUCTIONS.txt`
+called it Step 3 — so the 2026-08-31 band probe came back as `step4-stats.txt`,
+which is neither document's name for it and reads like a second stats file.
+
+- `stats.txt` — the `PVSTAT` block, plus the window size and document
 - the `.tsv` from the showdown (both, if you ran the AC one)
-- `step3-band.txt`
+- `band.txt` (only if you ran the probe on a new document)
 - any crash reports from `~/Library/Logs/DiagnosticReports/Postview*`
 
 Those decide whether this is finished or whether there is more to do.
@@ -157,7 +192,8 @@ Those decide whether this is finished or whether there is more to do.
   PDFs. It is a reader, not a PDF application.
 - Zooming past ~1.1× on an 8 GB machine renders slightly soft. Deliberate memory
   limit, recorded and pinned by tests (`ENGINEERING.md` §4.1).
-- Peak memory is higher than Preview's. Known, measured, still open.
+- Peak memory is higher than Preview's — the one metric it loses on across the
+  board. Known, measured, still open (`ENGINEERING.md` §9.5).
 - Right-click → Open on first launch is normal for an unsigned app.
 
 ## If something goes wrong
@@ -180,35 +216,50 @@ git clone https://github.com/ashp0/Postview.git
 
 Open the folder and start with:
 
-> Read ENGINEERING.md, then §7 "Still open". Here are the results from the
-> Mavericks machine: [paste step1-stats.txt, the .tsv, and step3-band.txt].
-> Tell me what they say and what to do next.
+> Read ENGINEERING.md, then §9 "The Mavericks run" and §7 "Still open". Here are
+> the results from the Mavericks machine: [paste stats.txt, the .tsv, and
+> band.txt]. Tell me what they say and what to do next.
 
 ### State as of the last session
 
-Four features landed, all adaptive, none exposed as a user-visible mode:
+The 2026-08-31 Mavericks run happened, and `ENGINEERING.md` §9 is what it said.
+In short:
 
-1. **A measured cost model** (`Sources/PVCostModel.{h,m}`) — ms-per-megapixel per
-   document; the scheduler's gates are expressed in time instead of a constant
-   that is wrong by 59× between documents.
-2. **Power-source awareness** — battery is byte-for-byte the old behaviour; AC
-   turns the blanket motion gate into a per-page cost question.
-3. **A fourth RAM tier** (> 8 GB) — moves the silent zoom cliff from 1.09× to
-   1.54× on the 64 GB Mac Pro. Tiers at 8 GB and below are unchanged to the byte.
-4. **Cost-aware eviction** — GreedyDual-Size; keeps the page that is expensive to
-   rebuild over the one that is cheap, at identical bytes.
+- **The power lookup works on 10.9** (`power.source ac`). That was the single
+  most-likely-broken thing in the program and it is now closed.
+- **The showdown returned no verdict**, on two fairness checks. One was a real
+  defect — the arrow key scrolled 60 pt against Preview's ~121, so a reader
+  holding Down covered half the ground — and is fixed. The other was the
+  instrument: `wheel` moved the two apps 3% apart across a page boundary and a
+  page-resolution counter read that as 0 pages against 1. The gate no longer
+  treats a one-page gap as evidence.
+- **Banding does not pay on text documents**, measured on the target. It would
+  cost the `read` workload +1.99 s against a surplus of 1.73 s. This retires
+  what used to be the biggest planned feature; see below.
+- **Three instruments were reporting numbers that were not what they claimed** —
+  the cost rate mixed full renders with previews, the "non-bitmap" memory column
+  subtracted two maxima taken at different moments, and a saved verdict recorded
+  neither the power branch nor the document. All three are fixed, and the
+  affected figures from that run should not be quoted.
 
-All gates green on the development host: analyser clean, **pvtest 307**,
-**pvuitest 134**, soak 20, stress 14 + ASan/UBSan + TSan (no races), no leaks,
-showdown self-test. Soak improved against the previous commit: settled
-179.3 → 169.4 MB, peak 210.2 → 198.8 MB, drift +0.084 → +0.002 MB/cycle.
+Before that, four adaptive features landed, none exposed as a user-visible mode:
+a measured cost model, power-source awareness, a fourth RAM tier (> 8 GB), and
+cost-aware eviction. `ENGINEERING.md` §3, §4.2, §4.1 and §4.3 respectively.
 
-**Not verified on any 2013 Mac.** That is what the steps above are for.
+All gates green on the development host: analyser clean, **pvtest 319**,
+**pvuitest 140**, soak 19, stress 14 + ASan/UBSan + TSan (no races), no leaks,
+showdown self-test 26 checks.
 
 ### The biggest remaining piece of work
 
-Banded rendering with concurrent workers — the only change that improves
-latency, CPU *and* memory at once on vector documents, and the one that would
-finally use the Mac Pro's idle cores (rendering is single-threaded by
-construction today). `ENGINEERING.md` §7 has the detail and the caveats; it is
-gated on the Step 2 and Step 3 numbers above.
+**Re-run Step 2.** No showdown has yet been allowed to name a winner, and both
+fairness checks should now pass. Expect `scroll`'s CPU margin to fall — it was
+partly bought by travelling half as far — and take that as the fix working.
+
+After that, **peak memory**: the only metric Postview loses on in all seven
+scenarios, by 22–43%, and the one that was being reasoned about with a broken
+column until §9.4. The column is now a real quantity and the question is
+untouched.
+
+Banded rendering *was* the answer here and the measurement says it is not, at
+least not for text. §9.3 has the numbers.

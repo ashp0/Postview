@@ -13,6 +13,7 @@
 #   make verify     check the built binary really is Mavericks-compatible
 #   make clean
 
+comma    := ,
 APP      := Postview
 BUNDLE   := $(APP).app
 BUILD    := build
@@ -269,13 +270,29 @@ STRESSLD := $(STRESSARCH) -isysroot $(SDK) $(SAN) -framework Cocoa -framework Co
 STRESSSRC := $(filter-out Sources/main.m Sources/PVAppDelegate.m Sources/PVDocument.m,$(SOURCES))
 STRESSSCALE ?= 1
 
+# Multiplier on pvstress's teardown deadlines, in a sanitized build only.
+#
+# The deadlines assert how long an unwind takes, which is a property of the
+# code; they were being checked against wall-clock time, which is a property of
+# the build. A page render under address+undefined is roughly an order of
+# magnitude slower than the shipping configuration, so the same constant is a
+# different assertion in each of the three builds this target produces.
+#
+# Recorded 2026-08-31: the address+undefined build failed two 60-round unwinds
+# on this host while the plain and thread builds passed them and `leakcheck`
+# found nothing leaked; at 8x it passes 14/14, so the objects were unwinding and
+# not inside a number chosen for a faster build. See DeadlineScale() in
+# Tests/pvstress.m -- it multiplies deadlines and never removes them, so a real
+# leak still fails, just later.
+DEADLINE_SCALE ?= $(if $(SAN),8,1)
+
 stress: | $(BUILD)
 	@mkdir -p $(BUILD)/stress
 	@test -f $(BUILD)/heavy.pdf || ( 	   $(CC) -isysroot $(SDK) -fobjc-arc -framework Cocoa 	     -o $(BUILD)/mkheavy Tests/make_heavy_fixture.m && 	   $(BUILD)/mkheavy $(BUILD)/heavy.pdf 60 )
 	@for f in $(STRESSSRC) Tests/pvstress.m; do 	   o=$(BUILD)/stress/$$(basename $$f .m).o; 	   $(CC) $(STRESSCFLAGS) -c $$f -o $$o || exit 1; 	 done
 	@$(CC) $(STRESSLD) $(BUILD)/stress/*.o -o $(BUILD)/pvstress
 	@cp Resources/TB_*.pdf $(BUILD)/ 2>/dev/null || true
-	@$(BUILD)/pvstress $(PDF) $(STRESSSCALE)
+	@PVSTRESS_DEADLINE_SCALE=$(DEADLINE_SCALE) $(BUILD)/pvstress $(PDF) $(STRESSSCALE)
 
 # Same loop under the leak checker. Any Objective-C object or CG bitmap that
 # manual retain/release drops on the floor is reported here by name.
@@ -326,16 +343,44 @@ release:
 # Runs the stress suite three times because each sanitizer excludes the others:
 # ASan and TSan cannot be linked together, so a single pass can only ever cover
 # one class of fault.
-verify-all: $(SHOWDOWN)
-	@echo "== static analyser =="        && $(MAKE) --no-print-directory analyze
-	@echo "== unit tests =="             && $(MAKE) --no-print-directory test      | tail -1
-	@echo "== UI tests =="               && $(MAKE) --no-print-directory uitest    | tail -1
-	@echo "== soak =="                   && $(MAKE) --no-print-directory soak      | tail -1
-	@echo "== stress =="                 && $(MAKE) --no-print-directory stress    | tail -1
-	@echo "== stress + address,undefined ==" && $(MAKE) --no-print-directory stress SAN="-fsanitize=address,undefined" | tail -1
-	@echo "== stress + thread =="        && $(MAKE) --no-print-directory stress SAN="-fsanitize=thread" | tail -1
-	@echo "== leaks =="                  && $(MAKE) --no-print-directory leakcheck | tail -1
-	@echo "== showdown self-test =="     && SELFTEST=1 ./$(SHOWDOWN) --selftest $(PDF) | tail -1
+# Every gate, and a claim at the end that they all passed.
+#
+# Each one runs through `gate`, which exists because `$(MAKE) ... | tail -1` does
+# not do what it looks like: a pipeline exits with the status of its LAST
+# command, so `tail` succeeding hid whatever the sub-make did. Recorded
+# 2026-08-31 -- the ASan stress gate printed "make[1]: *** [stress] Error 1",
+# verify-all carried on through four more gates and ended with "every gate
+# passed". A verification harness that reports success over a failure it printed
+# two lines earlier is worse than not having one.
+#
+# So: the full log goes to a file, only the summary line is echoed, and a
+# non-zero status prints the tail of that log and stops the run. bash -c with
+# pipefail would be shorter, but GNU Make 3.81 -- what macOS ships -- has no
+# .SHELLFLAGS, and this also keeps the whole log of a failing gate instead of
+# its last line.
+define gate
+	@printf '== %s ==\n' "$(1)"; \
+	if $(2) > $(BUILD)/gate.log 2>&1; then \
+	    tail -1 $(BUILD)/gate.log; \
+	else \
+	    tail -1 $(BUILD)/gate.log; \
+	    echo ""; \
+	    echo "verify-all: FAILED at '$(1)'. Last 40 lines:"; \
+	    tail -40 $(BUILD)/gate.log; \
+	    exit 1; \
+	fi
+endef
+
+verify-all: $(SHOWDOWN) | $(BUILD)
+	$(call gate,static analyser,$(MAKE) --no-print-directory analyze)
+	$(call gate,unit tests,$(MAKE) --no-print-directory test)
+	$(call gate,UI tests,$(MAKE) --no-print-directory uitest)
+	$(call gate,soak,$(MAKE) --no-print-directory soak)
+	$(call gate,stress,$(MAKE) --no-print-directory stress)
+	$(call gate,stress + address$(comma)undefined,$(MAKE) --no-print-directory stress SAN="-fsanitize=address$(comma)undefined")
+	$(call gate,stress + thread,$(MAKE) --no-print-directory stress SAN="-fsanitize=thread")
+	$(call gate,leaks,$(MAKE) --no-print-directory leakcheck)
+	$(call gate,showdown self-test,./$(SHOWDOWN) --selftest $(PDF))
 	@echo "" && echo "verify-all: every gate passed"
 
 clean:

@@ -26,9 +26,18 @@ Postview-Showdown.command
 # changes.
 dist/
 
-# Benchmark and profile output
+# Benchmark and profile output. A showdown or profile run drops one of these
+# wherever it was run from, and they are not history.
 *.tsv
 Benchmarks/
+
+# ...with the exception of the ones that ARE history. Runs taken on the
+# Mavericks machine are the evidence ENGINEERING.md argues from -- §9 quotes
+# this file by name -- and a document that cites data the repository excludes
+# is a document nobody can check. Same reasoning as Postview.zip above: a clone
+# has to be sufficient on its own.
+!Tests/Mavericks Testing/
+!Tests/Mavericks Testing/*.tsv
 
 # macOS
 .DS_Store

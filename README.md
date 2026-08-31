@@ -538,19 +538,26 @@ either. What does help, whatever the mechanism, is that the harness no longer
 score the run if the answer is wrong. That is the part to keep.
 
 The architectural claims in this README do not rest on that harness. They are
-asserted by `make verify-all` — a static-analysis pass, 212 unit checks, 128 UI
+asserted by `make verify-all` — a static-analysis pass, 319 unit checks, 140 UI
 checks that drive a real window controller, a 150-cycle soak, a stress suite
 under ASan/UBSan and TSan, and a leak census — all of which run on any Mac and
-none of which involve Preview. The *comparative* claims do rest on it, and until
-the showdown is re-run on the Mavericks machine with the fixed staging, the
-honest statement is that they are unmeasured.
+none of which involve Preview.
+
+The *comparative* claims do rest on it. The showdown ran on the Mavericks
+machine on 2026-08-31 and **refused to name a winner**: two fairness checks
+failed, one a real defect in Postview's arrow-key scrolling and one a limit of
+the travel instrument itself. Both are fixed and neither has been re-measured,
+so the honest statement remains that the comparative claims are unmeasured.
+`ENGINEERING.md` §9 is the full account.
 
 ---
 
 ## Is it actually faster than Preview?
 
-**Start here: `Postview-Showdown.command`.** One command, both apps, five
-workloads, and a winner named per metric:
+**Start here: `Postview-Showdown.command`.** One command, both apps, seven
+workloads, and a winner named per metric — when the run earns one. It checks
+first that both apps were asked the same question, and says so instead of
+scoring when they were not:
 
 ```
 ./Postview-Showdown.command ~/Documents/something.pdf
@@ -566,7 +573,9 @@ broken sampler before:
 It measures the three things that actually drain a battery — exact CPU seconds
 from the kernel's own counter, Mavericks' Energy Impact figure, and idle wakeups
 as a delta — plus peak memory and launch time, across `launch`, `idle`, `read`,
-`page` and `scroll`. It equalises both windows to the same size, opens a fresh
+`page`, `scroll`, `swipe` and `wheel` — the last two synthesised as real
+trackpad and mouse-wheel events, because those take a different path through
+AppKit than the keyboard does. It equalises both windows to the same size, opens a fresh
 **copy** of the document per trial so neither app restores a page position,
 waits for a quiet machine, and alternates which app goes first so a
 session-long thermal trend is not handed to one side. A metric whose

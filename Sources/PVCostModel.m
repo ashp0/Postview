@@ -64,8 +64,8 @@
     // Recorded outside the lock: PVStatAdd takes a lock of its own, and taking
     // two in a fixed order here would be one more ordering for anyone changing
     // either to have to know about. Nothing reads these two back as a pair.
-    PVStatAdd(PVStatRenderSeconds, seconds);
-    PVStatAdd(PVStatRenderSamples, 1);
+    PVStatAdd(preview ? PVStatRenderSecondsPreview : PVStatRenderSecondsFull, seconds);
+    PVStatAdd(preview ? PVStatRenderSamplesPreview : PVStatRenderSamplesFull, 1);
 }
 
 - (double)predictedSecondsForPixels:(CGSize)px preview:(BOOL)preview

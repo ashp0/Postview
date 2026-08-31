@@ -320,13 +320,16 @@
     NSRect vis = [[[self enclosingScrollView] contentView] documentVisibleRect];
     CGFloat page = NSHeight(vis) - 40.0;
     if (page < 40) page = NSHeight(vis);
+    // One eighth of a screenful, bounded. See PV_ARROW_VIEWPORT_FRACTION for
+    // why this is a fraction of the viewport and not the flat 60 pt it was.
+    CGFloat line = PVArrowScrollForViewportHeight(NSHeight(vis));
 
     switch (c) {
         case ' ':                       [self scrollByPoints:shift ? -page : page]; return;
         case NSPageDownFunctionKey:     [self scrollByPoints:page];   return;
         case NSPageUpFunctionKey:       [self scrollByPoints:-page];  return;
-        case NSDownArrowFunctionKey:    [self scrollByPoints:60];     return;
-        case NSUpArrowFunctionKey:      [self scrollByPoints:-60];    return;
+        case NSDownArrowFunctionKey:    [self scrollByPoints:line];   return;
+        case NSUpArrowFunctionKey:      [self scrollByPoints:-line];  return;
         case NSHomeFunctionKey:         [self scrollByPoints:-1e9];   return;
         case NSEndFunctionKey:          [self scrollByPoints:1e9];    return;
         default: break;

@@ -2,6 +2,7 @@
 #import <pthread.h>
 #import <string.h>
 #import <dlfcn.h>
+#import <mach/mach.h>
 
 NSString * const PVMemoryPressureNotification = @"PVMemoryPressureNotification";
 
@@ -270,6 +271,16 @@ void PVStatMax(PVStatKey key, double value)
     pthread_mutex_unlock(&sPVStatsLock);
 }
 
+void PVStatSet(PVStatKey key, double value)
+{
+    if (!PVStatsEnabled()) return;
+    if (key < 0 || key >= PVStatCount) return;
+    if (!isfinite(value)) return;
+    pthread_mutex_lock(&sPVStatsLock);
+    sPVStats[key] = value;
+    pthread_mutex_unlock(&sPVStatsLock);
+}
+
 double PVStatValue(PVStatKey key)
 {
     if (!PVStatsEnabled()) return 0;
@@ -293,6 +304,23 @@ static size_t          sPVResidentTotal;
 static size_t          sPVResidentTotalPeak;
 static pthread_mutex_t sPVResidentLock = PTHREAD_MUTEX_INITIALIZER;
 
+// Resident set size of this process, or 0 if the kernel declines to say.
+//
+// MACH_TASK_BASIC_INFO rather than TASK_BASIC_INFO: the older flavour reports a
+// 32-bit resident size that saturates, and this process routinely holds more
+// than 4 GB of address space mapped. Present since 10.7, so it needs no runtime
+// resolution to run on 10.9, and it lives in libSystem, so it adds nothing to
+// the dylib list `make verify` allow-lists.
+static size_t PVProcessResidentBytes(void)
+{
+    mach_task_basic_info_data_t info;
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    kern_return_t kr = task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                                 (task_info_t)&info, &count);
+    if (kr != KERN_SUCCESS) return 0;
+    return (size_t)info.resident_size;
+}
+
 void PVResidentAdd(PVResidentBucket bucket, size_t bytes)
 {
     if (bucket < 0 || bucket >= PVResidentBucketCount) return;
@@ -311,8 +339,11 @@ void PVResidentAdd(PVResidentBucket bucket, size_t bytes)
 
     if (sPVResident[bucket] > sPVResidentPeak[bucket])
         sPVResidentPeak[bucket] = sPVResident[bucket];
-    if (sPVResidentTotal > sPVResidentTotalPeak)
+    BOOL newTotalPeak = NO;
+    if (sPVResidentTotal > sPVResidentTotalPeak) {
         sPVResidentTotalPeak = sPVResidentTotal;
+        newTotalPeak = YES;
+    }
 
     double total       = (double)sPVResidentTotal;
     double undelivered = (double)sPVResident[PVResidentUndelivered];
@@ -325,6 +356,18 @@ void PVResidentAdd(PVResidentBucket bucket, size_t bytes)
     PVStatMax(PVStatPeakResidentBytes,    total);
     PVStatMax(PVStatPeakUndeliveredBytes, undelivered);
     PVStatMax(PVStatPeakCacheBytes,       cached);
+
+    // Only on a new high-water mark, and only when the census is switched on.
+    // task_info is a mach trap rather than a syscall, but this function runs on
+    // every bitmap allocation and free, and a peak advances a few dozen times
+    // in a session -- so the cost is paid where it buys something and nowhere
+    // else. PVStatSet, not PVStatMax: this is a reading taken AT that instant,
+    // and a maximum over readings would put it back out of step with the number
+    // it exists to be subtracted from.
+    if (newTotalPeak && PVStatsEnabled()) {
+        size_t rss = PVProcessResidentBytes();
+        if (rss > 0) PVStatSet(PVStatRSSAtPeakResident, (double)rss);
+    }
 }
 
 void PVResidentSub(PVResidentBucket bucket, size_t bytes)
@@ -432,15 +475,26 @@ NSString *PVStatsReport(void)
          "PVSTAT resident.peak.cache.mb %.2f\n"
          "PVSTAT resident.peak.undelivered.mb %.2f\n"
          "PVSTAT resident.peak.render.mb %.2f\n"
+         // Process RSS as it stood at that peak, so the two can be subtracted.
+         // Zero means the census never saw a bitmap peak, or the kernel refused
+         // the reading -- either way, not a measurement of an empty process.
+         "PVSTAT resident.peak.rss.mb %.2f\n"
          // The cost model, in the terms it actually decides in. Both directions
          // and the measurement behind them, because a model that only ever
          // suppressed would be indistinguishable in these totals from a tighter
          // constant, and one that only ever admitted from a looser one.
          "PVSTAT cost.suppressed %.0f\n"
          "PVSTAT cost.admitted %.0f\n"
-         "PVSTAT cost.render.seconds %.3f\n"
-         "PVSTAT cost.render.samples %.0f\n"
-         "PVSTAT cost.ms.per.mpx %.2f\n"
+         // Two populations, never summed into one rate. A run whose previews
+         // outnumber its full renders three to one -- which is an ordinary
+         // reading session -- produces a mixed rate that is mostly a statement
+         // about previews, and the reader has no way to tell from the line.
+         "PVSTAT cost.render.seconds.full %.3f\n"
+         "PVSTAT cost.render.samples.full %.0f\n"
+         "PVSTAT cost.ms.per.mpx.full %.2f\n"
+         "PVSTAT cost.render.seconds.preview %.3f\n"
+         "PVSTAT cost.render.samples.preview %.0f\n"
+         "PVSTAT cost.ms.per.mpx.preview %.2f\n"
          "PVSTAT power.source %s\n",
         v[PVStatRendersFull], v[PVStatRendersPreview], v[PVStatRendersFailed],
         v[PVStatPixelsFull], v[PVStatPixelsPreview],
@@ -450,15 +504,19 @@ NSString *PVStatsReport(void)
         suppressed,
         (total > 0) ? (suppressed / total) : 0.0,
         peakResident, peakCache, peakUndelivered, peakRender,
+        v[PVStatRSSAtPeakResident] / (1024.0 * 1024.0),
         v[PVStatCostSuppressed], v[PVStatCostAdmitted],
-        v[PVStatRenderSeconds], v[PVStatRenderSamples],
         // Measured over the whole run rather than taken from any one document's
-        // EWMA: this line is for reading a recorded run back afterwards, and a
-        // decaying average has no defined value once the process has exited.
-        ((v[PVStatPixelsFull] + v[PVStatPixelsPreview]) > 0)
-            ? (v[PVStatRenderSeconds] * 1000.0
-               / (v[PVStatPixelsFull] + v[PVStatPixelsPreview]))
-            : 0.0,
+        // EWMA: these lines are for reading a recorded run back afterwards, and
+        // a decaying average has no defined value once the process has exited.
+        // Each rate divides its own population's seconds by its own population's
+        // pixels; neither numerator nor denominator crosses over.
+        v[PVStatRenderSecondsFull], v[PVStatRenderSamplesFull],
+        (v[PVStatPixelsFull] > 0)
+            ? (v[PVStatRenderSecondsFull] * 1000.0 / v[PVStatPixelsFull]) : 0.0,
+        v[PVStatRenderSecondsPreview], v[PVStatRenderSamplesPreview],
+        (v[PVStatPixelsPreview] > 0)
+            ? (v[PVStatRenderSecondsPreview] * 1000.0 / v[PVStatPixelsPreview]) : 0.0,
         (PVCurrentPowerSource() == PVPowerAC)      ? "ac"
         : (PVCurrentPowerSource() == PVPowerBattery) ? "battery" : "unknown"];
 }
@@ -717,9 +775,24 @@ PVRenderPolicy PVRenderPolicyFor(PVPowerSource power, PVRamTier tier,
 
     // The prefetch depth is the one field that can put the cache into the
     // thrash loop, so it is clamped here rather than trusted to the table
-    // above. A policy that does not fit is reduced until it does, and pvtest
-    // asserts that the reduction was never needed -- a silent clamp that is
-    // load-bearing would be a constant nobody could find.
+    // above. A policy that does not fit is reduced until it does.
+    //
+    // This clamp is LOAD-BEARING, and on most machines. PV_AC_FULL_PREFETCH_PAGES
+    // is 2, and only the Huge tier's budget holds four ceiling-sized pages; the
+    // other three hold exactly three, so on a 2, 4 or 8 GB machine the AC branch
+    // above asks for a depth the cache cannot take and this line is the only
+    // thing that reduces it. An 8 GB laptop with the charger in gets the motion
+    // gate opened and prefetch left at PV_FULL_PREFETCH_PAGES, and it gets that
+    // here rather than from the table.
+    //
+    // Said explicitly because this comment used to claim the opposite -- that
+    // pvtest asserts the reduction is never needed. pvtest asserts that it IS:
+    // see "AC does not deepen prefetch on the large tier: the budget cannot hold
+    // it", and the exhaustive sweep beside it which walks all 36 combinations
+    // through PVRenderPolicyFitsCache. A clamp documented as dead code is a
+    // clamp somebody deletes, and deleting this one reintroduces the loop that
+    // produced 51 full renders to display 6 pages -- silently, on exactly the
+    // machines that are not the one this was last measured on.
     while (p.fullPrefetchPages > 0 && !PVRenderPolicyFitsCache(p, tier))
         p.fullPrefetchPages--;
 
@@ -781,6 +854,16 @@ CGSize PVClampPixelSize(CGSize px)
         if (!(dh >= 1)) dh = 1;
     }
     return CGSizeMake((CGFloat)dw, (CGFloat)dh);
+}
+
+CGFloat PVArrowScrollForViewportHeight(CGFloat viewportHeight)
+{
+    if (!isfinite(viewportHeight) || viewportHeight <= 0)
+        return PV_ARROW_SCROLL_MIN;
+    CGFloat step = viewportHeight / PV_ARROW_VIEWPORT_FRACTION;
+    if (step < PV_ARROW_SCROLL_MIN) step = PV_ARROW_SCROLL_MIN;
+    if (step > PV_ARROW_SCROLL_MAX) step = PV_ARROW_SCROLL_MAX;
+    return step;
 }
 
 size_t PVImageBytes(CGImageRef img)

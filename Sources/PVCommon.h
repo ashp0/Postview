@@ -10,6 +10,28 @@
 #define PV_PREVIEW_DIVISOR   3.0    // preview pass renders 1/3 linear size (9x fewer pixels)
 #define PV_MAX_PIXELS        (36000000.0)  // hard ceiling on one rendered bitmap
 
+// How far one arrow key scrolls, as a fraction of the viewport: eight presses
+// cover one screenful. Space and Page Down already scroll a viewport less a
+// 40 pt overlap, so this states the arrow in the same unit rather than in a
+// second one, and it keeps its meaning at any zoom and any window size --
+// a fixed number of points is a different fraction of the page every time
+// either changes.
+//
+// It replaces a flat 60 pt, which was not derived from anything and was about
+// half of what OS X's own PDF reader does. Measured, on the arbiter machine:
+// 200 arrow presses moved Preview 13 pages and Postview 6 (ENGINEERING.md
+// section 9), i.e. ~121 pt against 60 -- a reader holding Down in Postview
+// covered half the ground per press. At the showdown's 800 pt window this is
+// 96 pt, which lands 1.26x short of Preview instead of 2.17x.
+//
+// The bounds are for window sizes the fraction alone handles badly. The floor
+// matches -keyDown:'s own degenerate-viewport guard: below 40 pt of travel a
+// press stops reading as movement at all. The ceiling stops a full-height
+// display from turning one press into most of a page.
+#define PV_ARROW_VIEWPORT_FRACTION  8.0
+#define PV_ARROW_SCROLL_MIN        40.0
+#define PV_ARROW_SCROLL_MAX       160.0
+
 // A page that will be on screen for less time than this, during a scroll, is
 // not worth rasterising: the bitmap cannot be finished and delivered before
 // the page has gone, so the work is spent on pixels nobody ever sees. A
@@ -278,6 +300,16 @@ double PVMaxRenderPixels(void);
 // clamped to, is a cache whose accounting is wrong in the one case that
 // matters. It is also what makes the ceiling testable without a PDF.
 CGSize PVClampPixelSize(CGSize px);
+
+// How far one arrow press scrolls in a viewport this tall, in points. Split out
+// of -[PVPageView keyDown:] so the travel a scenario produces can be asserted
+// without a window: the showdown's fairness gate compares this against what
+// Preview does with the same 200 keystrokes, and a number only reachable
+// through a real NSScrollView is a number no test can hold still.
+//
+// A non-finite or non-positive height is the degenerate case and returns the
+// floor rather than a NaN that would propagate into -scrollToPoint:.
+CGFloat PVArrowScrollForViewportHeight(CGFloat viewportHeight);
 
 // ---------------------------------------------------------------------------
 // Power source.
@@ -548,14 +580,39 @@ typedef enum {
     // count behind it. The cost model's input, recorded so a run can be checked
     // against the model's own predictions after the fact rather than only from
     // inside the process.
-    PVStatRenderSeconds,
-    PVStatRenderSamples,
+    //
+    // Split by population, and split for the same reason PVCostModel keeps two
+    // estimates: a preview is 1/9 the pixels and re-walks the whole content
+    // stream, so its milliseconds-per-megapixel is several times a full page's
+    // and the two do not average into anything. PVCostModel.h calls mixing them
+    // "the real defect"; the census used to do it anyway, and the recorded
+    // 2026-08-31 Mavericks run is what that costs -- 72 of its 96 samples were
+    // previews, so the single rate it reported described the previews and was
+    // read as though it described the pages. See ENGINEERING.md section 9.
+    PVStatRenderSecondsFull,
+    PVStatRenderSamplesFull,
+    PVStatRenderSecondsPreview,
+    PVStatRenderSamplesPreview,
     // High-water marks, in bytes, of resident rendered pixels. Fed by the
     // resident census below rather than accumulated here, so they are maxima
     // and not sums: see PVStatMax().
     PVStatPeakResidentBytes,    // cache + in-flight + undelivered, summed
     PVStatPeakUndeliveredBytes, // rasterised, dispatched, not yet handed over
     PVStatPeakCacheBytes,       // held by the image caches
+    // Process RSS, sampled at the instant the line above set a new high-water
+    // mark -- not a maximum of its own.
+    //
+    // The showdown wants to say how much of the peak is rendered pixels and how
+    // much is everything else, and it was doing that by subtracting one
+    // independently-timed maximum from another. max(bitmaps + rest) - max(rest)
+    // is not "bitmaps"; it is only equal to it when the two maxima happen to
+    // coincide, and it collapses towards zero when they do not. That is why the
+    // 2026-08-31 run's derived "non-bitmap" column swings from 68.8 MB to
+    // 177.6 MB across scenarios while the note beside it says the quantity
+    // should be roughly constant -- the column was measuring how well two
+    // clocks lined up. Sampled here, the pair is simultaneous by construction
+    // and the subtraction means what it claims.
+    PVStatRSSAtPeakResident,
     PVStatCount
 } PVStatKey;
 
@@ -565,6 +622,12 @@ void PVStatAdd(PVStatKey key, double delta);
 // that use it; adding a high-water mark with PVStatAdd would report the sum of
 // every peak ever reached, which is a number about nothing.
 void PVStatMax(PVStatKey key, double value);
+// Overwrite rather than accumulate or maximise. For a reading whose value is
+// only meaningful together with the moment it was taken: PVStatRSSAtPeakResident
+// has to be the RSS at the LAST bitmap peak, because that is the one the
+// resident figure beside it also describes. Maximising it independently would
+// reintroduce exactly the two-different-clocks error it exists to remove.
+void PVStatSet(PVStatKey key, double value);
 // One counter's current value, or 0 when the census is disabled or the key is
 // out of range. For tests: a counter nothing can read is a counter nothing can
 // prove counts, and the suppression keys exist precisely to be read.
