@@ -238,7 +238,7 @@ constraint rather than an afterthought.
   it said, so suppression cannot outlive the evidence for it even if the timer
   is never delivered at all. Rendering is the default and suppression is the
   exception that has to be justified, which is the opposite way round from how
-  it was written the first time. `pvtest` sweeps the whole input space and
+  it was written the first time. `pvsuite unit` sweeps the whole input space and
   asserts that no combination of speed, age and dwell suppresses without fresh
   evidence — including NaN, infinity, and a clock that has moved backwards.
 
@@ -772,9 +772,17 @@ make test       # headless checks of layout, cache, render queue, persistence
 make uitest     # drive a real window; toolbar, gestures, drag-and-drop, screenshots
 make soak       # repeat the whole document lifecycle and assert nothing accumulates
 make stress     # the same objects under contention: every event, queue busy
+make power      # what all of it costs: CPU, processor wakeups, battery draw
 make leakcheck  # the soak loop under `leaks`
+make verify-all # every gate above, in order
 make dist       # produce Postview.zip for AirDrop
 ```
+
+Every one of those runs the same program, `Tests/pvsuite.m`, with a different
+subcommand — `pvsuite unit`, `ui`, `soak`, `stress`, `band`, `power` — and the
+Makefile target is the fixtures and the environment each needs. `pvsuite all
+<pdf> <outdir>` runs the four that gate without needing anything special of
+their environment.
 
 Between them `make test` and `make uitest` pin the awkward cases directly rather
 than by inference: that a page already rendered and waiting to be delivered is
@@ -825,10 +833,34 @@ make stress SAN="-fsanitize=address,undefined"
 Both are clean, as are the soak and the UI tests under the same flags. (A
 sanitizer build overrides the architecture to the host's own; the shipping
 binary is still built by plain `make` with the Mavericks flags.) The static
-analyser is clean too, over sources and tests, with the core, osx, deadcode and
-nullability checkers — helped by `CF_RETURNS_RETAINED` on the one method that
-hands out a `CGImageRef`, which turns a comment about ownership into something
-that gets checked across the three files that bitmap travels through.
+analyser is clean too, with the core, osx, deadcode and nullability checkers —
+helped by `CF_RETURNS_RETAINED` on the one method that hands out a `CGImageRef`,
+which turns a comment about ownership into something that gets checked across
+the three files that bitmap travels through. It runs over `Sources/` and not
+over the test suite, which is a narrower claim than this paragraph used to make:
+`make analyze` has only ever walked `Sources/*.m`, and the suite has a
+nullability report in it that comes from deliberately handing a controller
+arguments no caller would.
+
+`make power` is the newest gate and the one that closes the largest hole: until
+it existed, nothing in this tree measured what any of the rest of it COST. Every
+other check above asks whether Postview does the right thing. A build that had
+doubled its CPU per page, or that woke the processor a thousand times a second
+while displaying a page nobody was touching, passed all of them.
+
+It asserts on ratios and on zeroes and reports the seconds, because a ratio
+measured back to back on one machine is a property of the code while seconds are
+a property of the machine — and the machine that decides is a Mac Pro from 2013,
+which is not the one you are building on. So it gates that an idle document
+costs approximately no CPU and approximately no processor wakeups; that
+rasterisation is charged to the render helper and not to the viewer; that
+Postview's own cost census agrees with the kernel's account of the same
+renders; that the mains policy asks for full-resolution bitmaps during motion
+and the battery policy asks for none; that both policies nevertheless end up
+rasterising the same pixels, because the motion gate defers work rather than
+dropping it; and that no render helper is left running when it finishes. Where
+the machine has a battery it also reads instantaneous amperage and voltage
+straight out of the IO registry and reports the real draw in watts.
 
 `make leakcheck` runs the soak loop under `leaks`. **No object Postview
 allocates appears in it.** Postview does appear, but only as allocation *stack

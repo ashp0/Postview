@@ -31,8 +31,8 @@ There is no user-visible performance mode, and §5.4 is the argument for why not
 
 ## 2. The measurement everything else rests on
 
-`make band` (`Tests/pvband.m`), 2026-08-30. Two documents, identical page
-geometry, identical bitmap, identical code path, back to back.
+`make band` (`Tests/pvsuite.m`, subcommand `band`), 2026-08-30. Two documents,
+identical page geometry, identical bitmap, identical code path, back to back.
 
 | fixture | content | page bitmap | x86_64 (shipping) | arm64 (cross-check) |
 |---|---|---|---|---|
@@ -104,7 +104,7 @@ Two earlier attempts at this failed, and the file avoids both by construction:
 
 The absence of a prediction is *exactly* the old policy, not merely similar to
 it: `PVShouldRenderWhileMoving` is implemented as the cost-aware function with
-no cost, and `pvtest` re-asserts the equivalence across a 180-case sweep.
+no cost, and `pvsuite unit` re-asserts the equivalence across a 180-case sweep.
 
 The model may **raise** the dwell bar and never lower it.
 `PV_MIN_VISIBLE_SECONDS` is a claim about eyes — a quarter-second is where a
@@ -115,8 +115,8 @@ glimpse becomes a look — and the cost model has no standing to overrule it.
 ## 4. Machine and power: one policy, no modes
 
 `PVRenderPolicyFor(power, tier, pressureReports)` is a pure function returning
-every knob that would otherwise have been a mode switch. `pvtest` walks all 36
-combinations.
+every knob that would otherwise have been a mode switch. `pvsuite unit` walks
+all 36 combinations.
 
 ### 4.1 RAM tiers
 
@@ -128,7 +128,7 @@ combinations.
 | Huge | > 8 GB | 256 MB | 16.78 Mpx | 1.54× | 4 pages |
 
 The first three are unchanged from the original derivation `ceiling = budget/3/4`
-and are pinned to the byte by `pvtest`, so every Mac with 8 GB or less gets
+and are pinned to the byte by `pvsuite unit`, so every Mac with 8 GB or less gets
 exactly the budgets it always had.
 
 **The zoom cliff** is where `PVClampPixelSize` begins silently downscaling and
@@ -156,9 +156,9 @@ behaves exactly as battery.
 | dwell safety factor | 1.50 | 1.25 |
 | full renders while moving | no — the blanket motion gate | per-page cost question |
 
-**Battery is byte-for-byte today's behaviour**, asserted per tier by `pvtest`.
-Unknown is battery, never AC — asserted, so a later refactor cannot fold them
-together on the grounds that most Macs are plugged in.
+**Battery is byte-for-byte today's behaviour**, asserted per tier by
+`pvsuite unit`. Unknown is battery, never AC — asserted, so a later refactor
+cannot fold them together on the grounds that most Macs are plugged in.
 
 Memory pressure outranks power in both directions and is applied last, so it can
 undo the AC branch: a machine that is swapping is not made better by being
@@ -244,20 +244,80 @@ memory on a photograph is a preference no measurement resolves. Not built.
 
 ## 6. Verification
 
-`make verify-all` runs every gate. Current state, this host:
+Every automated check lives in one program, `Tests/pvsuite.m`, with a subcommand
+per suite: `unit`, `ui`, `soak`, `stress`, `band` and `power`. It used to be
+five executables built from five files, which shared four copies of the same
+harness and no way at all to compare a number one of them measured against a
+number another one did. `power` is the suite that needed that and could not have
+existed without it: it reads the rasterisation counters the `ui` suite asserts
+on and the process accounting the `soak` suite uses, and reports them against
+the kernel's own.
+
+`make verify-all` runs every gate. Current state, this host, 2026-09-01:
 
 | gate | result |
 |---|---|
 | Clang static analyser | clean |
-| `pvtest` (unit) | 319 passed, 0 failed |
-| `pvuitest` (drives a real controller) | 140 passed, 0 failed |
-| `pvsoak` (175 document cycles) | 20 passed, 0 failed |
-| `pvstress` | 14 passed, 0 failed |
-| `pvstress` + AddressSanitizer + UBSan | 14 passed, 0 failed |
-| `pvstress` + ThreadSanitizer | 14 passed, 0 failed, no data races |
+| `pvsuite unit` | 345 passed, 0 failed |
+| `pvsuite ui` (drives a real controller) | 187 passed, 0 failed |
+| `pvsuite soak` (175 document cycles) | 26 passed, 0 failed |
+| `pvsuite stress` | 16 passed, 0 failed |
+| `pvsuite stress` + AddressSanitizer + UBSan | 16 passed, 0 failed |
+| `pvsuite stress` + ThreadSanitizer | 16 passed, 0 failed, no data races |
 | leak census | no Postview-owned object leaked |
+| `pvsuite power` (energy and CPU) | 23 passed, 0 failed |
 | showdown self-test | 26 instrument checks passed |
 | `make verify` (Mach-O 10.9 compatibility) | OK |
+
+### 6.1 The energy suite
+
+Until 2026-09-01 nothing in this tree measured what any of it COST. Every gate
+above checked that Postview did the right thing; a build that had doubled its
+CPU per page, or started waking the processor a thousand times a second while
+displaying a static page, passed all of them. The only energy measurement that
+existed was the showdown, which runs on one machine that is not the development
+host and whose instruments §9.4 found to be wrong in four separate ways.
+
+`make power` asserts on ratios and on zeroes and reports the seconds, because a
+ratio measured back to back on one machine is a property of the code while
+seconds are a property of the machine. What it gates:
+
+- **An idle document costs nothing.** Measured at 0.15% of one core and 0.0
+  package wakeups a second, against limits of 5% and 60. A reader spends most of
+  a session not touching anything, and this is the only check that looks at
+  that.
+- **Rasterisation is charged to the helper.** 99.7% of the CPU a render costs is
+  spent in the child process, which is the whole point of the process boundary
+  and was never verified from outside.
+- **Postview's own cost census agrees with the kernel's.** 821 ms of CPU per
+  megapixel against the census's 884, measured over the same six renders. This
+  is the check §9.4 did not have: the number `PVCostModel` predicts from had
+  never been compared with anything outside the program.
+- **The mains policy asks for full-resolution bitmaps during motion and the
+  battery policy asks for none** — 6 against 0 over three repetitions each.
+- **Both policies end up rasterising the same pixels.** 7.86 Mpx either way. The
+  motion gate defers work; it does not drop it, and a page the reader settles on
+  goes sharp under either policy.
+- **No render helper is left running when the measurement ends.**
+
+Two instrument faults were found by writing it, and both are the kind that
+report a plausible number rather than an error:
+
+- **Helper CPU was under-reported by 41.67x.** `proc_pid_rusage` returns times
+  in the kernel's absolute-time unit, and this binary is x86_64, so on an Apple
+  silicon host it runs under Rosetta — which reports the timebase it *emulates*,
+  1/1, while the kernel's numbers stay in the host's real units. The obvious fix
+  (ask `mach_timebase_info`) gives the answer 1 on precisely the machine where
+  the answer is 41.67. `RusageSeconds()` now measures the ratio against
+  `getrusage`, which is microseconds by definition, and `[E1]` asserts the
+  result. Before the fix, eight page renders reported 0.121 s of helper CPU
+  while `ps` showed that same helper had accumulated 7.5 s.
+- **The harness was keeping seven documents alive.** `-valueForKey:` returns an
+  autoreleased reference, and the pool it landed in did not drain until the
+  whole suite had finished — so every repetition left a render helper resident,
+  and every reading after the first included other people's rasterisers. The UI
+  suite's `[8]` documents the same trap; there it costs a failed assertion,
+  here it cost a quietly wrong number and 237 seconds of run time.
 
 **The AddressSanitizer row above was false until 2026-08-31, and `verify-all`
 was reporting it as passing.** §9.6. The row is true now, and the harness can no
@@ -265,8 +325,8 @@ longer make that particular mistake.
 
 Two gates were also flaky rather than wrong, in the same way and for the same
 reason — an asynchronous teardown asserted against a fixed wall-clock budget.
-`pvstress`'s deadlines are now scaled for sanitized builds (§9.6), and
-`pvuitest` `[8]` waits for the cache and the PDF source instead of sampling them
+The stress suite's deadlines are now scaled for sanitized builds (§9.6), and the
+UI suite's `[8]` waits for the cache and the PDF source instead of sampling them
 once the page view has gone. That one lost about one run in three on this host,
 and it is the reason the whole class matters: **a flaky gate is worse than a
 missing one, because it teaches you to re-run until green** — which is precisely
@@ -283,9 +343,10 @@ command run against the previous commit and against the current tree:
 Better on all three. Note that the 65.8 MB settled figure quoted in earlier
 documents does not reproduce on this host and should not be cited.
 
-`pvuitest` pins the power source to battery for the whole suite, because
+The UI suite pins the power source to battery for its whole length, because
 otherwise its verdict would depend on whether the machine was plugged in when it
-ran. `[5g6]` turns the AC branch on explicitly and asserts what it changes.
+ran. `[5g6]` turns the AC branch on explicitly and asserts what it changes, and
+`power` `[E4]` measures what that branch costs.
 
 ### Tests written to fail against the old behaviour
 
@@ -329,14 +390,14 @@ Checked by reverting the change and re-running:
   was the difference of two independently-timed maxima. The instrument is fixed;
   the question is untouched.
 - **A middle preview rung** at 1/2 linear (1/4 pixels) would land far sooner than
-  a full render. *Unverified* — `pvband` varies band count, not scale.
+  a full render. *Unverified* — the band probe varies band count, not scale.
 - **A speed-dependent preview divisor.** At 3000 pt/s nothing at 1/3 linear is
   resolvable; 1/6 linear is 1/36 the pixels. Risk is a visible transition when
   the scroll stops, which this host cannot judge.
 - **The keyboard's unannounced first event** costs one wanted-set rebuild per
   scroll episode. Closing it means treating `[event isARepeat]` as the
   keyboard's announcement, which moves CPU and belongs after a showdown run.
-- **Zoom past the tier's cliff renders soft.** Pinned by `pvtest`, not fixed.
+- **Zoom past the tier's cliff renders soft.** Pinned by `pvsuite unit`, not fixed.
 
 ---
 
@@ -440,7 +501,7 @@ Verified against the recorded TSV: the two failures become one, and `scroll`
 
 ### 9.3 Banded rendering does not pay on this document
 
-`pvband`, 528-page Russian-language text document, 8.66 Mpx per page:
+`pvsuite band`, 528-page Russian-language text document, 8.66 Mpx per page:
 
 | K | ms/render | page-equivalents |
 |---|---|---|
@@ -524,7 +585,7 @@ script's default. Now written into the verdict itself.
 - **Peak memory**, with a `non-bitmap` column that is now a real quantity. This
   is the only metric Postview loses on in all seven scenarios, by 22–43%.
 - **`cost.ms.per.mpx.full`**, alongside the window size and document, so it can
-  finally be compared with `pvband`'s 18.1 ms/Mpx on the same page.
+  finally be compared with the band probe's 18.1 ms/Mpx on the same page.
 - **The AC branch**, via `POWERSTATE=ac`. §9.1 makes it live code on this
   machine and it has never been measured there.
 
@@ -553,7 +614,7 @@ verify-all: every gate passed
 ```
 
 The failure printed, four more gates ran, and the run concluded that every gate
-passed. §6 has been carrying `pvstress + AddressSanitizer + UBSan | 14 passed,
+passed. §6 has been carrying `stress + AddressSanitizer + UBSan | 14 passed,
 0 failed` on the strength of that.
 
 Each gate now runs through a `gate` function that captures the log, echoes the

@@ -11,6 +11,12 @@
 #   make run        build and launch it locally
 #   make dist       build and produce Postview.zip for AirDrop
 #   make verify     check the built binary really is Mavericks-compatible
+#   make test       the unit suite      (Tests/pvsuite.m, subcommand `unit`)
+#   make uitest     a driven controller (               subcommand `ui`)
+#   make soak       long-uptime memory  (               subcommand `soak`)
+#   make stress     contention, sanitized (             subcommand `stress`)
+#   make power      CPU, wakeups, battery (             subcommand `power`)
+#   make verify-all every gate, in order
 #   make clean
 
 comma    := ,
@@ -143,7 +149,7 @@ LDFLAGS := -arch x86_64 -mmacosx-version-min=$(MIN) -isysroot $(SDK) \
 HELPER_LDFLAGS := -arch x86_64 -mmacosx-version-min=$(MIN) -isysroot $(SDK) \
                   -framework Foundation -framework CoreGraphics -Wl,-dead_strip
 
-.PHONY: all clean distclean run dist package verify icon analyze release test uitest soak stress leakcheck verify-all band bandtool sign helper
+.PHONY: all clean distclean run dist package verify icon analyze release test uitest soak stress leakcheck verify-all band power suite sign helper
 
 all: $(BUNDLE)
 
@@ -232,7 +238,7 @@ dist:
 	@$(MAKE) --no-print-directory package
 	@echo "  dist     $(APP).zip built from a fully verified tree"
 
-package: $(BUNDLE) bandtool $(BENCHMARK) $(PROFILE) $(SHOWDOWN)
+package: $(BUNDLE) $(SUITE) $(BENCHMARK) $(PROFILE) $(SHOWDOWN)
 	@rm -rf "$(DISTDIR)"
 	@mkdir -p "$(DISTDIR)"
 	@ditto "$(BUNDLE)" "$(DISTDIR)/$(BUNDLE)"
@@ -240,13 +246,19 @@ package: $(BUNDLE) bandtool $(BENCHMARK) $(PROFILE) $(SHOWDOWN)
 	@cp "$(BENCHMARK)" "$(DISTDIR)/$(BENCHMARK)"
 	@cp "$(PROFILE)" "$(DISTDIR)/$(PROFILE)"
 	@cp "$(SHOWDOWN)" "$(DISTDIR)/$(SHOWDOWN)"
-	@cp $(BUILD)/pvband "$(DISTDIR)/pvband"
-	@# pvband spawns the render helper from beside its own executable, which in
-	@# the archive is the top level and not the bundle. Shipping the probe
-	@# without it shipped a tool that could not run: the released pvband exited
-	@# 2 with "cannot open <file>" on every document, which reads as a bad PDF
-	@# rather than a missing renderer. 21 KB to make the diagnostic tool in a
-	@# diagnostic archive actually work.
+	@cp $(SUITE) "$(DISTDIR)/pvsuite"
+	@# The whole test suite, not just the band probe it replaces. It is one
+	@# x86_64/10.9 binary either way, and the Mavericks machine is the one place
+	@# `pvsuite power` can measure what this program costs on the hardware it was
+	@# written for -- so shipping only the probe was shipping the least
+	@# interesting subcommand.
+	@#
+	@# It spawns the render helper from beside its own executable, which in the
+	@# archive is the top level and not the bundle. Shipping the probe without it
+	@# shipped a tool that could not run: the released pvband exited 2 with
+	@# "cannot open <file>" on every document, which reads as a bad PDF rather
+	@# than a missing renderer. 21 KB to make the diagnostic tool in a diagnostic
+	@# archive actually work.
 	@cp "$(MACOS)/$(HELPER)" "$(DISTDIR)/$(HELPER)"
 	@xattr -cr "$(DISTDIR)" 2>/dev/null || true
 	@rm -f $(APP).zip
@@ -421,9 +433,17 @@ analyze: | $(BUILD)
 	  cat $$log; exit 1; }
 	@echo "OK"
 
-# Headless checks for the logic that has no visible surface. Self contained:
-# it generates its own fixtures. Point REALPDF at any document to additionally
-# run the scale-independence check against it.
+# The test suite. One program, Tests/pvsuite.m, with a subcommand per suite;
+# the targets below are the fixtures and the environment each of them needs.
+#
+# It used to be five programs (pvtest, pvuitest, pvsoak, pvstress, pvband) built
+# from five files with four copies of the same OK()/Pump() harness between them.
+# The merge is not tidiness: the suites could not compare notes. `power` reads
+# the rasterisation counters the UI suite asserts on and the process accounting
+# the soak uses, and none of that was reachable from one place before.
+#
+# Point REALPDF at any document to additionally run the unit suite's
+# scale-independence check against it.
 PDF ?= $(BUILD)/heavy.pdf
 REALPDF ?=
 
@@ -431,33 +451,56 @@ REALPDF ?=
 # the host has will do. Mavericks has only /usr/bin/python (2.7); current macOS
 # has only python3.
 PYTHON ?= $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null)
-TESTOBJ := $(filter-out $(BUILD)/main.o $(BUILD)/PVAppDelegate.o $(BUILD)/PVDocument.o $(BUILD)/PVWindowController.o,$(OBJECTS))
 
-test: $(OBJECTS) $(BUILD)/$(HELPER) | $(BUILD)
-	@$(CC) $(CFLAGS) -ISources -c Tests/pvtest.m -o $(BUILD)/pvtest.o
-	@$(CC) $(LDFLAGS) $(TESTOBJ) $(BUILD)/pvtest.o -o $(BUILD)/pvtest
+# Everything the suite links. main.m has its own main(), and PVAppDelegate and
+# PVDocument are the application shell -- the suite drives PVWindowController
+# directly, which is the point.
+#
+# This used to be two lists: the unit suite additionally excluded
+# PVWindowController.o, because pvtest.m did not reference it. One file
+# references all of it now, and -Wl,-dead_strip means an object nothing calls
+# costs the binary nothing.
+SUITEOBJ := $(filter-out $(BUILD)/main.o $(BUILD)/PVAppDelegate.o $(BUILD)/PVDocument.o,$(OBJECTS))
+SUITE    := $(BUILD)/pvsuite
+
+# The heavy fixture, generated once and reused by every suite below.
+define mkheavy
+	@test -f $(BUILD)/heavy.pdf || ( \
+	   $(CC) $(FIXTURE_CFLAGS) -framework Cocoa \
+	     -o $(BUILD)/mkheavy Tests/make_heavy_fixture.m && \
+	   $(BUILD)/mkheavy $(BUILD)/heavy.pdf 60 )
+endef
+
+# Built for the shipping target, x86_64 / 10.9, like everything else here --
+# which is also what lets `make package` ship this binary to the Mavericks
+# machine as the diagnostic tool. See `package` above.
+#
+# The toolbar artwork is copied beside it because a bare executable's own
+# +mainBundle looks for resources next to the binary. Without it the UI suite's
+# icon checks fail for want of a bundle rather than for want of the assets.
+$(SUITE): Tests/pvsuite.m $(OBJECTS) $(BUILD)/$(HELPER) | $(BUILD)
+	@echo "  compile  Tests/pvsuite.m"
+	@$(CC) $(CFLAGS) -ISources -c Tests/pvsuite.m -o $(BUILD)/pvsuite.o
+	@$(CC) $(LDFLAGS) $(SUITEOBJ) $(BUILD)/pvsuite.o -o $(SUITE)
+	@cp $(TOOLBAR_RESOURCES) $(BUILD)/
+
+suite: $(SUITE)
+	@echo "  built    $(SUITE)"
+
+# Headless checks for the logic that has no visible surface. Self contained: it
+# generates its own fixtures.
+test: $(SUITE)
 	@test -n "$(PYTHON)" || { echo "FAIL: no python interpreter found"; exit 1; }
 	@$(PYTHON) Tests/make_rotation_fixture.py $(BUILD)/rotation.pdf >/dev/null
-	@test -f $(BUILD)/heavy.pdf || ( \
-	   $(CC) $(FIXTURE_CFLAGS) -framework Cocoa \
-	     -o $(BUILD)/mkheavy Tests/make_heavy_fixture.m && \
-	   $(BUILD)/mkheavy $(BUILD)/heavy.pdf 60 )
-	@$(BUILD)/pvtest $(PDF) $(BUILD)/rotation.pdf $(REALPDF)
+	$(mkheavy)
+	@$(SUITE) unit $(PDF) $(BUILD)/rotation.pdf $(REALPDF)
 
-UIOBJ := $(filter-out $(BUILD)/main.o $(BUILD)/PVAppDelegate.o $(BUILD)/PVDocument.o,$(OBJECTS))
-
-uitest: $(OBJECTS) $(BUILD)/$(HELPER) | $(BUILD)
-	@test -f $(BUILD)/heavy.pdf || ( \
-	   $(CC) $(FIXTURE_CFLAGS) -framework Cocoa \
-	     -o $(BUILD)/mkheavy Tests/make_heavy_fixture.m && \
-	   $(BUILD)/mkheavy $(BUILD)/heavy.pdf 60 )
-	@$(CC) $(CFLAGS) -ISources -c Tests/pvuitest.m -o $(BUILD)/pvuitest.o
-	@$(CC) $(LDFLAGS) $(UIOBJ) $(BUILD)/pvuitest.o -o $(BUILD)/pvuitest
-	@# The toolbar artwork, where a bare executable's own +mainBundle looks for
-	@# resources: beside the binary. Without this the icon checks fail for want
-	@# of a bundle rather than for want of the assets.
-	@cp $(TOOLBAR_RESOURCES) $(BUILD)/
-	@$(BUILD)/pvuitest $(PDF) $(BUILD)/shots
+# Drives a real PVWindowController and snapshots it, so the sidebar, page
+# jumping and position saving are verified without needing Accessibility
+# permission to click things.
+uitest: $(SUITE)
+	$(mkheavy)
+	@$(SUITE) ui $(PDF) $(BUILD)/shots
 
 # Long-uptime check: repeats the whole document lifecycle and asserts that
 # every one of Postview's long-lived objects is deallocated afterwards. 150 is
@@ -465,74 +508,66 @@ uitest: $(OBJECTS) $(BUILD)/$(HELPER) | $(BUILD)
 # to assert on; below that it is reported but not enforced.
 SOAKCYCLES ?= 150
 
-soak: $(OBJECTS) $(BUILD)/$(HELPER) | $(BUILD)
-	@test -f $(BUILD)/heavy.pdf || ( \
-	   $(CC) $(FIXTURE_CFLAGS) -framework Cocoa \
-	     -o $(BUILD)/mkheavy Tests/make_heavy_fixture.m && \
-	   $(BUILD)/mkheavy $(BUILD)/heavy.pdf 60 )
-	@$(CC) $(CFLAGS) -ISources -c Tests/pvsoak.m -o $(BUILD)/pvsoak.o
-	@$(CC) $(LDFLAGS) $(UIOBJ) $(BUILD)/pvsoak.o -o $(BUILD)/pvsoak
-	@$(BUILD)/pvsoak $(PDF) $(SOAKCYCLES)
+soak: $(SUITE)
+	$(mkheavy)
+	@$(SUITE) soak $(PDF) $(SOAKCYCLES)
+
+# What any of it COSTS. Every other gate here checks that Postview does the
+# right thing and none of them checked the price, which for a program whose
+# entire design argument is energy (ENGINEERING.md section 1) is the one
+# omission that matters.
+#
+# Asserts on ratios and on zeroes -- an idle document costs no measurable CPU
+# and no wakeups, rasterisation is charged to the helper and not the viewer,
+# Postview's own cost census agrees with the kernel's, the mains policy asks for
+# sharp bitmaps during motion and the battery policy asks for none -- and only
+# reports the seconds, because seconds are a property of the machine and the
+# machine that decides is not this one. So it is safe in verify-all on any host,
+# and it fails for a reason rather than for being slow.
+POWERSECONDS ?= 3
+
+power: $(SUITE)
+	$(mkheavy)
+	@$(SUITE) power $(PDF) $(POWERSECONDS)
 
 # Task 4 stage 1: does a band render cost a fraction of a page render, or does
 # per-render PDF parsing overhead dominate? An experiment, not a gate -- it is
-# not in verify-all and it ships nothing. Built for the host architecture as
+# not in verify-all and it asserts nothing. Built for the host architecture as
 # well as the Mavericks one, because the quantity it measures is a ratio and a
 # ratio that disagrees between the two is a ratio that cannot be trusted to
 # transfer to the machine that decides.
 BANDPAGES ?= 6
 BANDREPS  ?= 3
 
-# Builds the probe without running it, and targets 10.9 like the app does.
-#
-# Split out of `band` so `make dist` can ship the binary. The probe cannot be
-# COMPILED on the Mavericks machine -- $(CFLAGS) carries
+# The probe cannot be COMPILED on the Mavericks machine -- $(CFLAGS) carries
 # -Werror=unguarded-availability, which Xcode 6's clang does not have -- but the
-# binary it produces is x86_64/10.9 and RUNS there natively. That is the only
-# way the measurement ENGINEERING.md section 7 asks for can be taken on the
-# machine that decides, so the probe travels in the distributable.
-bandtool: | $(BUILD)
-	@$(CC) $(CFLAGS) -ISources -c Sources/PVCommon.m     -o $(BUILD)/band-PVCommon.o
-	@$(CC) $(CFLAGS) -ISources -c Sources/PVPDFSource.m  -o $(BUILD)/band-PVPDFSource.o
-	@$(CC) $(CFLAGS) -ISources -c Sources/PVRenderCore.m -o $(BUILD)/band-PVRenderCore.o
-	@$(CC) $(CFLAGS) -ISources -c Tests/pvband.m         -o $(BUILD)/pvband.o
-	@$(CC) $(LDFLAGS) $(BUILD)/band-PVCommon.o $(BUILD)/band-PVPDFSource.o $(BUILD)/band-PVRenderCore.o $(BUILD)/pvband.o -o $(BUILD)/pvband
-	@echo "  built    $(BUILD)/pvband (x86_64, 10.9 -- runs on the Mavericks machine)"
-
-band: bandtool | $(BUILD)
-	@test -f $(BUILD)/heavy.pdf || ( \
-	   $(CC) $(FIXTURE_CFLAGS) -framework Cocoa \
-	     -o $(BUILD)/mkheavy Tests/make_heavy_fixture.m && \
-	   $(BUILD)/mkheavy $(BUILD)/heavy.pdf 60 )
+# binary $(SUITE) produces is x86_64/10.9 and RUNS there natively. That is the
+# only way the measurement ENGINEERING.md section 7 asks for can be taken on the
+# machine that decides, which is why `package` puts the whole suite in the
+# distributable.
+band: $(SUITE)
+	$(mkheavy)
 	@test -f $(BUILD)/text.pdf || ( \
 	   $(CC) $(FIXTURE_CFLAGS) -framework Cocoa \
 	     -o $(BUILD)/mktext Tests/make_text_fixture.m && \
 	   $(BUILD)/mktext $(BUILD)/text.pdf 60 )
 	@echo "== x86_64 (the shipping architecture; under Rosetta on an Apple silicon host) =="
-	@$(BUILD)/pvband $(PDF) $(BANDPAGES) $(BANDREPS)
+	@$(SUITE) band $(PDF) $(BANDPAGES) $(BANDREPS)
 	@echo ""
 	@echo "== $(shell uname -m) (native, as a cross-check that the ratio is not a Rosetta artefact) =="
-	@$(CC) -arch $(shell uname -m) -mmacosx-version-min=11.0 -isysroot $(SDK) -fno-objc-arc \
-	   -fobjc-exceptions -Os -ISources -Wno-deprecated-declarations \
-	   -c Sources/PVCommon.m -o $(BUILD)/bandn-PVCommon.o
-	@$(CC) -arch $(shell uname -m) -mmacosx-version-min=11.0 -isysroot $(SDK) -fno-objc-arc \
-	   -fobjc-exceptions -Os -ISources -Wno-deprecated-declarations \
-	   -c Sources/PVPDFSource.m -o $(BUILD)/bandn-PVPDFSource.o
-	@$(CC) -arch $(shell uname -m) -mmacosx-version-min=11.0 -isysroot $(SDK) -fno-objc-arc \
-	   -fobjc-exceptions -Os -ISources -Wno-deprecated-declarations \
-	   -c Sources/PVRenderCore.m -o $(BUILD)/bandn-PVRenderCore.o
-	@$(CC) -arch $(shell uname -m) -mmacosx-version-min=11.0 -isysroot $(SDK) -fno-objc-arc \
-	   -fobjc-exceptions -Os -ISources -Wno-deprecated-declarations \
-	   -c Tests/pvband.m -o $(BUILD)/bandn-pvband.o
-	@$(CC) -arch $(shell uname -m) -mmacosx-version-min=11.0 -isysroot $(SDK) \
+	@mkdir -p $(BUILD)/native
+	@for f in $(filter-out Sources/main.m Sources/PVAppDelegate.m Sources/PVDocument.m,$(SOURCES)) Tests/pvsuite.m; do \
+	   $(CC) -arch $(shell uname -m) -mmacosx-version-min=11.0 -isysroot $(HOST_SDK) \
+	     -fno-objc-arc -fobjc-exceptions -Os -ISources -Wno-deprecated-declarations \
+	     -c $$f -o $(BUILD)/native/$$(basename $$f .m).o || exit 1; \
+	 done
+	@$(CC) -arch $(shell uname -m) -mmacosx-version-min=11.0 -isysroot $(HOST_SDK) \
 	   -framework Cocoa -framework CoreGraphics \
-	   $(BUILD)/bandn-PVCommon.o $(BUILD)/bandn-PVPDFSource.o \
-	   $(BUILD)/bandn-PVRenderCore.o $(BUILD)/bandn-pvband.o \
-	   -o $(BUILD)/pvband-native
-	@$(BUILD)/pvband-native $(PDF) $(BANDPAGES) $(BANDREPS)
+	   $(BUILD)/native/*.o -o $(BUILD)/pvsuite-native
+	@$(BUILD)/pvsuite-native band $(PDF) $(BANDPAGES) $(BANDREPS)
 
 # Contention check: the same objects, driven with every asynchronous event the
-# app can receive arriving while the render queue is busy. pvsoak proves a
+# app can receive arriving while the render queue is busy. The soak proves a
 # document cycle leaves nothing behind; this proves the cycle is safe while
 # something is actually happening. Worth running under ThreadSanitizer, which
 # is what it was written for:
@@ -564,7 +599,7 @@ STRESSHELPERLD := $(STRESSARCH) -isysroot $(STRESSSDK) $(SAN) -framework Foundat
 STRESSSRC := $(filter-out Sources/main.m Sources/PVAppDelegate.m Sources/PVDocument.m,$(SOURCES))
 STRESSSCALE ?= 1
 
-# Multiplier on pvstress's teardown deadlines, in a sanitized build only.
+# Multiplier on the stress suite's teardown deadlines, in a sanitized build only.
 #
 # The deadlines assert how long an unwind takes, which is a property of the
 # code; they were being checked against wall-clock time, which is a property of
@@ -576,20 +611,21 @@ STRESSSCALE ?= 1
 # on this host while the plain and thread builds passed them and `leakcheck`
 # found nothing leaked; at 8x it passes 14/14, so the objects were unwinding and
 # not inside a number chosen for a faster build. See DeadlineScale() in
-# Tests/pvstress.m -- it multiplies deadlines and never removes them, so a real
+# Tests/pvsuite.m -- it multiplies deadlines and never removes them, so a real
 # leak still fails, just later.
 DEADLINE_SCALE ?= $(if $(SAN),8,1)
 
-# pvstress and its render helper live in $(BUILD)/stress, not $(BUILD): a
-# sanitized build overrides the architecture to the host's, and a helper spawned
-# from beside the binary has to be the same architecture as the binary that
-# spawns it. Keeping them together also keeps the x86_64 pair in $(BUILD)
-# untouched.
+# The sanitized suite and its render helper live in $(BUILD)/stress rather than
+# $(BUILD): a sanitized build overrides the architecture to the host's, and a
+# helper spawned from beside the binary has to be the same architecture as the
+# binary that spawns it. Keeping them together also keeps the x86_64 pair in
+# $(BUILD) untouched.
 #
-# HOME is redirected at a scratch directory because pvstress asserts on the
-# state store, which lives under the real one. The test said it was given a
+# HOME is redirected at a scratch directory because the stress suite asserts on
+# the state store, which lives under the real one. The test said it was given a
 # scratch HOME and the Makefile never gave it one, so a developer's own resume
-# state was both read by the test and rewritten by it.
+# state was both read by the test and rewritten by it. The suite refuses to run
+# this subcommand without one, so the claim is now checked rather than commented.
 #
 # PV_HELPER_DIAGNOSTICS is set for the same class of reason. A render helper is
 # spawned with /dev/null for stderr and an empty environment, which is right for
@@ -603,8 +639,8 @@ DEADLINE_SCALE ?= $(if $(SAN),8,1)
 stress: | $(BUILD)
 	@mkdir -p $(BUILD)/stress $(BUILD)/stress/helper
 	@test -f $(BUILD)/heavy.pdf || ( 	   $(CC) $(FIXTURE_CFLAGS) -framework Cocoa 	     -o $(BUILD)/mkheavy Tests/make_heavy_fixture.m && 	   $(BUILD)/mkheavy $(BUILD)/heavy.pdf 60 )
-	@for f in $(STRESSSRC) Tests/pvstress.m; do 	   o=$(BUILD)/stress/$$(basename $$f .m).o; 	   $(CC) $(STRESSCFLAGS) -c $$f -o $$o || exit 1; 	 done
-	@$(CC) $(STRESSLD) $(BUILD)/stress/*.o -o $(BUILD)/stress/pvstress
+	@for f in $(STRESSSRC) Tests/pvsuite.m; do 	   o=$(BUILD)/stress/$$(basename $$f .m).o; 	   $(CC) $(STRESSCFLAGS) -c $$f -o $$o || exit 1; 	 done
+	@$(CC) $(STRESSLD) $(BUILD)/stress/*.o -o $(BUILD)/stress/pvsuite
 	@for f in $(HELPER_SOURCES); do 	   o=$(BUILD)/stress/helper/$$(basename $$f .m).o; 	   $(CC) $(STRESSCFLAGS) -c $$f -o $$o || exit 1; 	 done
 	@$(CC) $(STRESSHELPERLD) $(BUILD)/stress/helper/*.o -o $(BUILD)/stress/$(HELPER)
 	@cp $(TOOLBAR_RESOURCES) $(BUILD)/stress/
@@ -613,7 +649,7 @@ stress: | $(BUILD)
 	  status=0; \
 	  HOME="$$PV_STRESS_HOME" PVSTRESS_DEADLINE_SCALE=$(DEADLINE_SCALE) \
 	  PV_HELPER_DIAGNOSTICS=1 \
-	    $(BUILD)/stress/pvstress $(PDF) $(STRESSSCALE) 2>"$$log" || status=$$?; \
+	    $(BUILD)/stress/pvsuite stress $(PDF) $(STRESSSCALE) 2>"$$log" || status=$$?; \
 	  /bin/cat "$$log" >&2; \
 	  if /usr/bin/grep -qE 'ERROR: (Address|Thread|UndefinedBehavior|Leak)Sanitizer|runtime error:|SUMMARY: .*Sanitizer' "$$log"; then \
 	    echo "FAIL: sanitizer diagnostics were reported during the stress run."; \
@@ -636,11 +672,10 @@ stress: | $(BUILD)
 # it, which put 120 root leaks in the report for a 25-cycle run and failed the
 # build on an object that does not exist on the 10.9 target. Those are listed,
 # by class, and not counted against us; anything of ours fails the build.
-leakcheck: $(OBJECTS) $(BUILD)/$(HELPER) | $(BUILD)
-	@$(CC) $(CFLAGS) -ISources -c Tests/pvsoak.m -o $(BUILD)/pvsoak.o
-	@$(CC) $(LDFLAGS) $(UIOBJ) $(BUILD)/pvsoak.o -o $(BUILD)/pvsoak
+leakcheck: $(SUITE)
+	$(mkheavy)
 	@report="$(BUILD)/leaks-report.txt"; status=0; \
-	  MallocStackLogging=1 leaks --atExit -- $(BUILD)/pvsoak $(PDF) 25 > "$$report" 2>&1 || status=$$?; \
+	  MallocStackLogging=1 leaks --atExit -- $(SUITE) soak $(PDF) 25 > "$$report" 2>&1 || status=$$?; \
 	  sed -n '/leaks Report/,/^Binary Images/p' "$$report" | grep -v '^Binary Images' | head -n 40; \
 	  summary=$$(grep -E '[0-9]+ leaks? for [0-9]+ total leaked bytes' "$$report" | tail -n 1); \
 	  if [ -z "$$summary" ] || [ "$$status" -gt 1 ]; then \
@@ -664,7 +699,8 @@ release: dist
 
 # Everything, in one command. This is the gate before a release: the unit and
 # UI suites, the soak (memory growth over 175 document cycles), the stress
-# suite under three sanitizers, the leak census and the static analyser.
+# suite under three sanitizers, the leak census, the energy and CPU suite and
+# the static analyser.
 #
 # Runs the stress suite three times because each sanitizer excludes the others:
 # ASan and TSan cannot be linked together, so a single pass can only ever cover
@@ -707,6 +743,7 @@ verify-all: $(BUNDLE) $(SHOWDOWN) | $(BUILD)
 	$(call gate,stress + address$(comma)undefined,$(MAKE) --no-print-directory stress SAN="-fsanitize=address$(comma)undefined")
 	$(call gate,stress + thread,$(MAKE) --no-print-directory stress SAN="-fsanitize=thread")
 	$(call gate,leaks,$(MAKE) --no-print-directory leakcheck)
+	$(call gate,energy and CPU,$(MAKE) --no-print-directory power)
 	$(call gate,showdown self-test,./$(SHOWDOWN) --selftest $(PDF))
 	@echo "" && echo "verify-all: every gate passed"
 
