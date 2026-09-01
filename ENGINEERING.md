@@ -364,9 +364,19 @@ Checked by reverting the change and re-running:
 
 ## 9. The Mavericks run, 2026-08-31
 
-The first time any of this executed on a 2013 Mac. Raw files are in
-`Tests/Mavericks Testing/`. Machine: the Mac Pro, 64 GB, mains power, SIMBL
-present as always.
+The first time any of this executed on a 2013 Mac. Machine: the Mac Pro,
+64 GB, mains power, SIMBL present as always.
+
+The raw TSV and console output used to be committed under
+`Tests/Mavericks Testing/`. They are no longer in the tree, and that is a
+consequence of §9.4 and §9.7 rather than tidying: four of the instruments that
+produced those files were reporting quantities that were not what their column
+headings said, so the files invited exactly the quoting this section spends most
+of its length warning against. What survives is below, each figure stated with
+what it does and does not support. The figures that are still safe to use are
+reproducible by re-running the harness that produced them; the ones that are not
+are marked unrecoverable, and no file in the tree now makes them look
+otherwise.
 
 Four things were settled and three instruments were found to be wrong. The
 instrument faults matter as much as the results, because two of them had been
@@ -470,7 +480,7 @@ full renders and previews. `PVCostModel.h` calls mixing them "the real defect"
 and keeps two independent estimates for exactly this reason; the census then
 averaged them back together on the way out. The recorded 432.55 ms/Mpx came
 from 96 samples of which **72 were previews**, so the headline figure — the one
-`INSTRUCTIONS.md` told the tester to check — largely described previews and was
+the tester was told to read off the screen — largely described previews and was
 read as the cost of a page. Now reported as `cost.ms.per.mpx.full` and
 `cost.ms.per.mpx.preview`, each dividing its own population's seconds by its own
 population's pixels.
@@ -478,8 +488,9 @@ population's pixels.
 That run's figure cannot be recovered by arithmetic and **should not be quoted**.
 Nor is it comparable with §9.3's 18.1 ms/Mpx: the Step 1 session averaged
 2.03 Mpx per full render against the probe's 8.66, so it was a different window
-or a different document, and neither was recorded. `INSTRUCTIONS.md` now asks
-for both.
+or a different document, and neither was recorded. Any future run has to record
+the window size and the document alongside the rate, or the rate is not
+comparable with anything.
 
 **The "non-bitmap" column was the difference of two clocks.** It was computed as
 `max(peak RSS) − max(resident bitmaps)`, two high-water marks taken by different

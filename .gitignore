@@ -31,13 +31,14 @@ dist/
 *.tsv
 Benchmarks/
 
-# ...with the exception of the ones that ARE history. Runs taken on the
-# Mavericks machine are the evidence ENGINEERING.md argues from -- §9 quotes
-# this file by name -- and a document that cites data the repository excludes
-# is a document nobody can check. Same reasoning as Postview.zip above: a clone
-# has to be sufficient on its own.
-!Tests/Mavericks Testing/
-!Tests/Mavericks Testing/*.tsv
+# There used to be an exception here un-ignoring `Tests/Mavericks Testing/`,
+# which held the raw TSV and console output of the 2026-08-31 run on the Mac
+# Pro. That run's instruments were found to be wrong in four separate ways
+# (ENGINEERING.md §9.4 and §9.7), so the files were reporting numbers that
+# should not be quoted, and they have been removed. §9 keeps the findings and
+# now states plainly which figures survived the instrument faults and which did
+# not. A future run that IS trustworthy should be committed the same way this
+# one was, and this exception restored with it.
 
 # macOS
 .DS_Store
