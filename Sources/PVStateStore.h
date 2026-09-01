@@ -12,6 +12,21 @@
     NSMutableDictionary *_docs;    // path -> state dictionary
     NSString            *_path;    // resolved once; nil means memory only
     BOOL                 _dirty;
+    // The document paths THIS process has changed since its last successful
+    // write.
+    //
+    // Every process loads the file once and, until now, wrote the whole
+    // dictionary back. Two copies of Postview reading different documents --
+    // which is the ordinary way a document-based app is used -- therefore each
+    // held a snapshot taken at their own launch, and whichever quit last
+    // overwrote everything the other had recorded. The user loses the reading
+    // position in every document they had open in the other window.
+    //
+    // Writing only the keys this process actually touched, merged onto whatever
+    // is on disk at write time, makes the two independent: they collide only
+    // when they genuinely disagree about the same document, and then the later
+    // write wins, which is the right answer.
+    NSMutableSet        *_dirtyKeys;
 }
 + (PVStateStore *)sharedStore;
 

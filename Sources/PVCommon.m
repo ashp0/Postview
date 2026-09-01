@@ -1,4 +1,5 @@
 #import "PVCommon.h"
+#import <mach/mach_time.h>
 #import <pthread.h>
 #import <string.h>
 #import <dlfcn.h>
@@ -237,10 +238,14 @@ BOOL PVStatsEnabled(void)
     // only one of them carries a shell environment. Running the executable
     // directly inherits POSTVIEW_STATS; going through LaunchServices -- which
     // is what `open` does, and what a benchmark has to use if it wants to
-    // measure the same launch path a user gets -- does not, so the argument
-    // domain is honoured too and `open --args -PVStats YES` works. The
-    // argument domain is volatile, so nothing is written to the user's
-    // preferences either way.
+    // measure the same launch path a user gets -- does not, so
+    // NSUserDefaults is consulted as well.
+    //
+    // The harnesses reach that through `defaults write com.postview.Postview
+    // PVStats -bool YES`, NOT through `open --args`: Mavericks' `open` has no
+    // --args flag and silently treats what follows it as more filenames, so the
+    // census was never switched on there and the profile's internal-render
+    // columns were blank on the one machine they were for.
     static BOOL enabled;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -271,15 +276,6 @@ void PVStatMax(PVStatKey key, double value)
     pthread_mutex_unlock(&sPVStatsLock);
 }
 
-void PVStatSet(PVStatKey key, double value)
-{
-    if (!PVStatsEnabled()) return;
-    if (key < 0 || key >= PVStatCount) return;
-    if (!isfinite(value)) return;
-    pthread_mutex_lock(&sPVStatsLock);
-    sPVStats[key] = value;
-    pthread_mutex_unlock(&sPVStatsLock);
-}
 
 double PVStatValue(PVStatKey key)
 {
@@ -289,6 +285,19 @@ double PVStatValue(PVStatKey key)
     double v = sPVStats[key];
     pthread_mutex_unlock(&sPVStatsLock);
     return v;
+}
+
+double PVMonotonicSeconds(void)
+{
+    static mach_timebase_info_data_t tb;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        if (mach_timebase_info(&tb) != KERN_SUCCESS || tb.denom == 0) {
+            tb.numer = 0; tb.denom = 1;   // unusable: every interval reads zero
+        }
+    });
+    if (tb.numer == 0) return 0;
+    return (double)mach_absolute_time() * (double)tb.numer / (double)tb.denom / 1.0e9;
 }
 
 #pragma mark - Resident rendered-pixel census
@@ -302,6 +311,9 @@ static size_t          sPVResident[PVResidentBucketCount];
 static size_t          sPVResidentPeak[PVResidentBucketCount];
 static size_t          sPVResidentTotal;
 static size_t          sPVResidentTotalPeak;
+// The process RSS read at the instant sPVResidentTotalPeak was last raised.
+// Held under sPVResidentLock with the peak it belongs to; see PVResidentAdd.
+static size_t          sPVRSSAtResidentPeak;
 static pthread_mutex_t sPVResidentLock = PTHREAD_MUTEX_INITIALIZER;
 
 // Resident set size of this process, or 0 if the kernel declines to say.
@@ -339,10 +351,27 @@ void PVResidentAdd(PVResidentBucket bucket, size_t bytes)
 
     if (sPVResident[bucket] > sPVResidentPeak[bucket])
         sPVResidentPeak[bucket] = sPVResident[bucket];
-    BOOL newTotalPeak = NO;
     if (sPVResidentTotal > sPVResidentTotalPeak) {
         sPVResidentTotalPeak = sPVResidentTotal;
-        newTotalPeak = YES;
+        // Read and stored under the same lock as the peak it pairs with.
+        //
+        // This used to be taken after the unlock, on the grounds that task_info
+        // should not be called with a global mutex held. But the two numbers are
+        // only meaningful together -- the report subtracts one from the other --
+        // and page and thumbnail renders on the Mac Pro establish peaks within
+        // microseconds of each other. Both threads would leave the lock holding
+        // their own reading, and whichever was descheduled longer wrote last:
+        // the RSS recorded against the final peak was routinely the RSS measured
+        // at an earlier, smaller one, which makes the difference between them
+        // arbitrary and occasionally negative.
+        //
+        // Only on a new high-water mark, and only when the census is on. A peak
+        // advances a few dozen times in a session, so the trap is paid for where
+        // it buys something.
+        if (PVStatsEnabled()) {
+            size_t rss = PVProcessResidentBytes();
+            if (rss > 0) sPVRSSAtResidentPeak = rss;
+        }
     }
 
     double total       = (double)sPVResidentTotal;
@@ -356,18 +385,6 @@ void PVResidentAdd(PVResidentBucket bucket, size_t bytes)
     PVStatMax(PVStatPeakResidentBytes,    total);
     PVStatMax(PVStatPeakUndeliveredBytes, undelivered);
     PVStatMax(PVStatPeakCacheBytes,       cached);
-
-    // Only on a new high-water mark, and only when the census is switched on.
-    // task_info is a mach trap rather than a syscall, but this function runs on
-    // every bitmap allocation and free, and a peak advances a few dozen times
-    // in a session -- so the cost is paid where it buys something and nowhere
-    // else. PVStatSet, not PVStatMax: this is a reading taken AT that instant,
-    // and a maximum over readings would put it back out of step with the number
-    // it exists to be subtracted from.
-    if (newTotalPeak && PVStatsEnabled()) {
-        size_t rss = PVProcessResidentBytes();
-        if (rss > 0) PVStatSet(PVStatRSSAtPeakResident, (double)rss);
-    }
 }
 
 void PVResidentSub(PVResidentBucket bucket, size_t bytes)
@@ -400,6 +417,27 @@ size_t PVResidentTotal(void)
     return v;
 }
 
+void PVResidentPeakSnapshot(size_t *totalPeak, size_t *cachePeak,
+                            size_t *undeliveredPeak, size_t *renderPeak,
+                            size_t *rssAtPeak)
+{
+    pthread_mutex_lock(&sPVResidentLock);
+    if (totalPeak)       *totalPeak       = sPVResidentTotalPeak;
+    if (cachePeak)       *cachePeak       = sPVResidentPeak[PVResidentCache];
+    if (undeliveredPeak) *undeliveredPeak = sPVResidentPeak[PVResidentUndelivered];
+    if (renderPeak)      *renderPeak      = sPVResidentPeak[PVResidentRender];
+    if (rssAtPeak)       *rssAtPeak       = sPVRSSAtResidentPeak;
+    pthread_mutex_unlock(&sPVResidentLock);
+}
+
+size_t PVResidentRSSAtHighWater(void)
+{
+    pthread_mutex_lock(&sPVResidentLock);
+    size_t v = sPVRSSAtResidentPeak;
+    pthread_mutex_unlock(&sPVResidentLock);
+    return v;
+}
+
 size_t PVResidentHighWater(void)
 {
     pthread_mutex_lock(&sPVResidentLock);
@@ -425,8 +463,9 @@ void PVResidentReset(void)
         sPVResident[i]     = 0;
         sPVResidentPeak[i] = 0;
     }
-    sPVResidentTotal     = 0;
-    sPVResidentTotalPeak = 0;
+    sPVResidentTotal      = 0;
+    sPVResidentTotalPeak  = 0;
+    sPVRSSAtResidentPeak  = 0;
     pthread_mutex_unlock(&sPVResidentLock);
 }
 
@@ -447,11 +486,19 @@ NSString *PVStatsReport(void)
     // because that census is on in every build and this one is not: a run with
     // stats disabled still maintains the high-water marks, and reading them
     // here means the two can never disagree about the same run.
+    //
+    // All five under one lock. Read one at a time they came from five different
+    // instants, and a render finishing between two of them could produce a
+    // report whose totals do not add up -- for numbers whose entire purpose is
+    // to be subtracted from one another.
     const double kMB = 1024.0 * 1024.0;
-    double peakResident    = (double)PVResidentHighWater() / kMB;
-    double peakCache       = (double)PVResidentHighWaterForBucket(PVResidentCache) / kMB;
-    double peakUndelivered = (double)PVResidentHighWaterForBucket(PVResidentUndelivered) / kMB;
-    double peakRender      = (double)PVResidentHighWaterForBucket(PVResidentRender) / kMB;
+    size_t rTotal = 0, rCache = 0, rUndelivered = 0, rRender = 0, rRSS = 0;
+    PVResidentPeakSnapshot(&rTotal, &rCache, &rUndelivered, &rRender, &rRSS);
+    double peakResident    = (double)rTotal / kMB;
+    double peakCache       = (double)rCache / kMB;
+    double peakUndelivered = (double)rUndelivered / kMB;
+    double peakRender      = (double)rRender / kMB;
+    double peakRSS         = (double)rRSS / kMB;
 
     // Machine-readable on purpose: the benchmark greps these lines out of the
     // app's stderr and puts them in the TSV beside the CPU numbers.
@@ -504,7 +551,7 @@ NSString *PVStatsReport(void)
         suppressed,
         (total > 0) ? (suppressed / total) : 0.0,
         peakResident, peakCache, peakUndelivered, peakRender,
-        v[PVStatRSSAtPeakResident] / (1024.0 * 1024.0),
+        peakRSS,
         v[PVStatCostSuppressed], v[PVStatCostAdmitted],
         // Measured over the whole run rather than taken from any one document's
         // EWMA: these lines are for reading a recorded run back afterwards, and
@@ -712,10 +759,76 @@ PVPowerSource PVCurrentPowerSource(void)
         }
     }
     // A desktop with no battery at all reports AC, which is the answer we want
-    // and the reason this is not phrased as "is there a battery".
+    // and the reason this is not phrased as "is there a battery". The machine
+    // that IS phrased that way is PVMachineHasInternalBattery, below.
     sCached   = result;
     sCachedAt = now;
     return result;
+}
+
+// The two further IOKit entry points the battery question needs, resolved the
+// same way and for the same reason: reading a boolean is not worth an
+// LC_LOAD_DYLIB that `make verify` would then have to allow.
+typedef CFArrayRef      (*PVIOPSCopyList)(CFTypeRef);
+typedef CFDictionaryRef (*PVIOPSDescribe)(CFTypeRef, CFTypeRef);
+
+static BOOL sPVBatteryOverride;
+static BOOL sPVBatteryOverrideOn;
+
+void PVSetInternalBatteryOverride(BOOL hasBattery, BOOL enabled)
+{
+    sPVBatteryOverride   = hasBattery;
+    sPVBatteryOverrideOn = enabled;
+}
+
+BOOL PVMachineHasInternalBattery(void)
+{
+    if (sPVBatteryOverrideOn) return sPVBatteryOverride;
+
+    // Cached for the process. Unlike the charger, the presence of a battery is
+    // not something a reader changes mid-document, so there is no TTL to get
+    // wrong -- and this is consulted from the render queue's constructor, which
+    // must not be the place that learns IOKit is slow.
+    static BOOL            sHasBattery;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        // Conservative default, applied before anything is asked: a machine
+        // that will not say gets the portable's policy. Being wrong this way
+        // costs a desktop one render lane; being wrong the other way costs a
+        // laptop its battery, which is the failure this exists to prevent.
+        sHasBattery = YES;
+
+        void *h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY);
+        if (!h) return;
+        PVIOPSCopyInfo copyInfo = (PVIOPSCopyInfo)dlsym(h, "IOPSCopyPowerSourcesInfo");
+        PVIOPSCopyList copyList = (PVIOPSCopyList)dlsym(h, "IOPSCopyPowerSourcesList");
+        PVIOPSDescribe describe = (PVIOPSDescribe)dlsym(h, "IOPSGetPowerSourceDescription");
+        if (!copyInfo || !copyList || !describe) return;
+
+        CFTypeRef blob = copyInfo();
+        if (!blob) return;
+        CFArrayRef list = copyList(blob);
+        if (list) {
+            // Absence of an internal battery is the answer being looked for, so
+            // it is only concluded from a list that was actually obtained. An
+            // empty list from a working IOKit is a desktop.
+            BOOL found = NO;
+            CFIndex i, n = CFArrayGetCount(list);
+            for (i = 0; i < n && !found; i++) {
+                CFDictionaryRef d = describe(blob, CFArrayGetValueAtIndex(list, i));
+                if (!d) continue;
+                CFTypeRef type = CFDictionaryGetValue(d, CFSTR("Type"));
+                if (type && CFGetTypeID(type) == CFStringGetTypeID() &&
+                    CFStringCompare((CFStringRef)type, CFSTR("InternalBattery"),
+                                    0) == kCFCompareEqualTo)
+                    found = YES;
+            }
+            sHasBattery = found;
+            CFRelease(list);
+        }
+        CFRelease(blob);
+    });
+    return sHasBattery;
 }
 
 #pragma mark - The render policy
@@ -894,21 +1007,34 @@ PVVolumeKind PVVolumeKindFromFlags(BOOL removable, BOOL ejectable, BOOL local)
     return PVVolumeFixed;
 }
 
+// Unreadable volume metadata is treated as removable, not as fixed.
+//
+// This used to answer PVVolumeFixed whenever the volume declined to describe
+// itself, on the grounds that a warning shown to someone who has done nothing
+// wrong is a cost. But the caller is -checkRunningLocation, and what it does
+// with PVVolumeFixed is stay silent -- so the old behaviour suppressed the
+// warning in exactly the case where safety could not be established. "I could
+// not tell" and "I checked and it is safe" were the same answer.
+//
+// The consequence of being wrong in each direction is not symmetric. A false
+// PVVolumeRemovable is one dialog offering to install into /Applications, which
+// the user can decline. A false PVVolumeFixed is Postview killed mid-session
+// with no warning ever shown, which is the outcome the whole check exists to
+// prevent. So the unknown case fails towards the recoverable answer.
 PVVolumeKind PVVolumeKindForURL(NSURL *url)
 {
-    if (!url || ![url isFileURL]) return PVVolumeFixed;
+    if (!url || ![url isFileURL]) return PVVolumeRemovable;
 
     NSNumber *removable = nil, *ejectable = nil, *local = nil;
+    // A key can also be fetched successfully and still come back nil when the
+    // file system does not implement it, which is the same amount of knowledge
+    // as a failed fetch and gets the same answer.
     if (![url getResourceValue:&removable forKey:NSURLVolumeIsRemovableKey error:NULL] ||
         ![url getResourceValue:&ejectable forKey:NSURLVolumeIsEjectableKey error:NULL] ||
-        ![url getResourceValue:&local     forKey:NSURLVolumeIsLocalKey     error:NULL]) {
-        return PVVolumeFixed;
+        ![url getResourceValue:&local     forKey:NSURLVolumeIsLocalKey     error:NULL] ||
+        !removable || !ejectable || !local) {
+        return PVVolumeRemovable;
     }
-    // A key can be fetched successfully and still come back nil when the file
-    // system does not implement it. Warning on a volume that declined to
-    // describe itself would put a dialog in front of someone who has done
-    // nothing wrong, so silence is the answer to a question with no answer.
-    if (!removable || !ejectable || !local) return PVVolumeFixed;
 
     return PVVolumeKindFromFlags([removable boolValue],
                                  [ejectable boolValue],
@@ -925,8 +1051,14 @@ PVVolumeKind PVVolumeKindForURL(NSURL *url)
 + (PVRenderRequest *)page:(NSUInteger)p pixels:(CGSize)s priority:(int)pri preview:(BOOL)pv
                   express:(BOOL)ex
 {
-    PVRenderRequest *r = [[[PVRenderRequest alloc] init] autorelease];
+    // The ivar writes are direct, and a direct ivar write through nil is not
+    // the harmless no-op that a message to nil is -- it is a store through a
+    // null pointer. +alloc returning nil is the one situation that reaches it,
+    // so it is checked here rather than assumed away. Callers that collect
+    // these into an array must test the result: -addObject: raises on nil.
+    PVRenderRequest *r = [[PVRenderRequest alloc] init];
+    if (!r) return nil;
     r->page = p; r->px = s; r->priority = pri; r->preview = pv; r->express = ex;
-    return r;
+    return [r autorelease];
 }
 @end

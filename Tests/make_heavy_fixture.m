@@ -22,9 +22,9 @@ int main(int argc, const char **argv) {
       NSString *label = [NSString stringWithFormat:@"Page %d", p+1];
       NSMutableString *body = [NSMutableString string];
       for (int l = 0; l < 40; l++) [body appendFormat:@"Line %d of page %d — the quick brown fox jumps over the lazy dog. 0123456789\n", l+1, p+1];
-      NSGraphicsContext *gc = [NSGraphicsContext graphicsContextWithCGContext:c flipped:NO];
+      NSGraphicsContext *gc = [NSGraphicsContext graphicsContextWithGraphicsPort:(void *)c flipped:NO];
       [NSGraphicsContext saveGraphicsState]; [NSGraphicsContext setCurrentContext:gc];
-      [[NSColor colorWithWhite:1 alpha:0.85] setFill]; NSRectFillUsingOperation(NSMakeRect(40,40,532,712), NSCompositingOperationSourceOver);
+      [[NSColor colorWithWhite:1 alpha:0.85] setFill]; NSRectFillUsingOperation(NSMakeRect(40,40,532,712), NSCompositeSourceOver);
       [label drawAtPoint:NSMakePoint(60,730) withAttributes:@{NSFontAttributeName:[NSFont boldSystemFontOfSize:28]}];
       [body drawInRect:NSMakeRect(60,60,500,650) withAttributes:@{NSFontAttributeName:[NSFont systemFontOfSize:11]}];
       [NSGraphicsContext restoreGraphicsState];

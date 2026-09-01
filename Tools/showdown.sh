@@ -693,7 +693,18 @@ sample_power() {
 pvstat() { /usr/bin/awk -v k="$1" '$1 == "PVSTAT" && $2 == k { print $3; exit }' "$2"; }
 
 # Which power branch Postview is pinned to for the run. See open_app_with().
+#
+# Validated rather than trusted. PVApplyPowerDefaultOnce treats an unrecognised
+# value as "no override" and falls back to asking the machine -- which on the
+# Mac Pro arbiter is always AC. So `POWERSTATE=bettery` silently measured the AC
+# policy while every header, filename and verdict line said battery, and nothing
+# in the recorded output would ever say otherwise. An unrecognised value is a
+# typo, and a typo here invalidates the run.
 POWERSTATE="${POWERSTATE:-battery}"
+case "$POWERSTATE" in
+    battery|ac|auto) ;;
+    *) die "POWERSTATE must be battery, ac, or auto (got '$POWERSTATE')" ;;
+esac
 
 POSTVIEW_DOMAIN="com.postview.Postview"
 
@@ -718,17 +729,60 @@ POSTVIEW_DOMAIN="com.postview.Postview"
 # Written immediately before the launch and removed immediately after, with the
 # EXIT trap removing them again in case a trial dies in between. Nothing is
 # left in the user's preferences by a completed run.
-postview_settings_set() {
-    # $1 statfile
-    /usr/bin/defaults write "$POSTVIEW_DOMAIN" PVStats -bool YES        >/dev/null 2>&1
-    /usr/bin/defaults write "$POSTVIEW_DOMAIN" PVStatsPath "$1"         >/dev/null 2>&1
-    /usr/bin/defaults write "$POSTVIEW_DOMAIN" PVPowerState "$POWERSTATE" >/dev/null 2>&1
+# Whatever the operator already had, captured before the first write so the
+# restore below puts it back instead of deleting it. A profiling harness that
+# clears settings it did not set is a harness that quietly edits the machine it
+# is measuring.
+POSTVIEW_SAVED_STATS=
+POSTVIEW_SAVED_STATSPATH=
+POSTVIEW_SAVED_POWER=
+POSTVIEW_SETTINGS_SAVED=0
+
+postview_settings_save() {
+    [ "$POSTVIEW_SETTINGS_SAVED" = "1" ] && return 0
+    POSTVIEW_SAVED_STATS=$(/usr/bin/defaults read "$POSTVIEW_DOMAIN" PVStats 2>/dev/null || true)
+    POSTVIEW_SAVED_STATSPATH=$(/usr/bin/defaults read "$POSTVIEW_DOMAIN" PVStatsPath 2>/dev/null || true)
+    POSTVIEW_SAVED_POWER=$(/usr/bin/defaults read "$POSTVIEW_DOMAIN" PVPowerState 2>/dev/null || true)
+    POSTVIEW_SETTINGS_SAVED=1
+    return 0
 }
 
+# Returns non-zero if any write failed.
+#
+# These used to be three unchecked commands. A failed write is not a cosmetic
+# problem here: PVStats not being set means the census never runs and every
+# internal-render column is a dash, and PVPowerState not being set means the app
+# asks the machine -- which on the arbiter is a Mac Pro, so the run measures the
+# AC policy under a header that says battery. Both produce a complete-looking
+# TSV that describes a different program from the one named in it.
+postview_settings_set() {
+    # $1 statfile
+    postview_settings_save
+    /usr/bin/defaults write "$POSTVIEW_DOMAIN" PVStats -bool YES &&
+    /usr/bin/defaults write "$POSTVIEW_DOMAIN" PVStatsPath "$1" &&
+    /usr/bin/defaults write "$POSTVIEW_DOMAIN" PVPowerState "$POWERSTATE"
+}
+
+# Restore, not delete. Deleting is only the right answer when the operator had
+# nothing set, and postview_settings_save is what knows whether that was true.
 postview_settings_clear() {
-    /usr/bin/defaults delete "$POSTVIEW_DOMAIN" PVStats      >/dev/null 2>&1
-    /usr/bin/defaults delete "$POSTVIEW_DOMAIN" PVStatsPath  >/dev/null 2>&1
-    /usr/bin/defaults delete "$POSTVIEW_DOMAIN" PVPowerState >/dev/null 2>&1
+    [ "$POSTVIEW_SETTINGS_SAVED" = "1" ] || return 0
+    if [ -n "$POSTVIEW_SAVED_STATS" ]; then
+        /usr/bin/defaults write "$POSTVIEW_DOMAIN" PVStats "$POSTVIEW_SAVED_STATS" >/dev/null 2>&1 || true
+    else
+        /usr/bin/defaults delete "$POSTVIEW_DOMAIN" PVStats >/dev/null 2>&1 || true
+    fi
+    if [ -n "$POSTVIEW_SAVED_STATSPATH" ]; then
+        /usr/bin/defaults write "$POSTVIEW_DOMAIN" PVStatsPath "$POSTVIEW_SAVED_STATSPATH" >/dev/null 2>&1 || true
+    else
+        /usr/bin/defaults delete "$POSTVIEW_DOMAIN" PVStatsPath >/dev/null 2>&1 || true
+    fi
+    if [ -n "$POSTVIEW_SAVED_POWER" ]; then
+        /usr/bin/defaults write "$POSTVIEW_DOMAIN" PVPowerState "$POSTVIEW_SAVED_POWER" >/dev/null 2>&1 || true
+    else
+        /usr/bin/defaults delete "$POSTVIEW_DOMAIN" PVPowerState >/dev/null 2>&1 || true
+    fi
+    return 0
 }
 
 open_app_with() {
@@ -745,7 +799,8 @@ open_app_with() {
     # branch deliberately; the value is printed in the run header and recorded
     # in the TSV so no run is ambiguous about which policy it measured.
     if [ -n "${3:-}" ]; then
-        postview_settings_set "$3"
+        postview_settings_set "$3" ||
+            die "could not configure Postview statistics and power policy"
     fi
     /usr/bin/open -n -a "$1" "$2" >/dev/null 2>&1
 }
@@ -1167,12 +1222,22 @@ AWKEOF
     ok "$([ "$st_power" = "$POWERSTATE" ] && echo 1 || echo 0)" \
        "the power branch is pinned to '$POWERSTATE' and not left to the machine"
     postview_settings_clear
+    # "As found", which is not the same as "deleted": the harness now snapshots
+    # whatever the operator had and puts that back, so a machine with a standing
+    # PVPowerState keeps it. Asserted against the snapshot rather than against
+    # absence, because deleting a setting the harness did not create is itself
+    # the bug this replaced.
     st_after=$(/usr/bin/defaults read "$POSTVIEW_DOMAIN" PVStats 2>/dev/null || echo "gone")
+    st_power_after=$(/usr/bin/defaults read "$POSTVIEW_DOMAIN" PVPowerState 2>/dev/null || echo "gone")
     ok "$([ "$st_after" = "gone" ] && echo 1 || echo 0)" \
-       "and all of it is removed again, leaving the user's preferences as found"
-    # A real setting the user may have had before the self-test ran is put back.
-    [ -n "$st_prev_state" ] && \
-        /usr/bin/defaults write "$POSTVIEW_DOMAIN" PVPowerState "$st_prev_state" >/dev/null 2>&1
+       "the census switch is removed again"
+    if [ -n "$st_prev_state" ]; then
+        ok "$([ "$st_power_after" = "$st_prev_state" ] && echo 1 || echo 0)" \
+           "a pre-existing power setting is restored, not deleted"
+    else
+        ok "$([ "$st_power_after" = "gone" ] && echo 1 || echo 0)" \
+           "no power setting is left behind where there was none"
+    fi
 
     printf '\n'
     if [ "$fails" -eq 0 ]; then
@@ -1599,7 +1664,8 @@ case "$probe_iw" in ''|-) ;; *) WAKEUPS_OK=yes ;; esac
 # index the analysis below already uses keeps its meaning and TSVs recorded
 # before them still parse. The analysis reads fields by number and never NF,
 # which is what makes appending safe.
-printf 'app\tscenario\trun\tlaunch_seconds\twall_seconds\tcpu_seconds\tcpu_per_second\tenergy_mean\tenergy_peak\tidle_wakeups\tmean_rss_kb\tpeak_rss_kb\trenders_full\trenders_preview\tmegapixels\trequests_suppressed\trequests_suppressed_motion\tresident_peak_mb\tresident_peak_undelivered_mb\tresident_peak_cache_mb\tstart_idle\tstart_page\tend_page\tresident_peak_rss_mb\n' > "$OUTPUT"
+printf 'app\tscenario\trun\tlaunch_seconds\twall_seconds\tcpu_seconds\tcpu_per_second\tenergy_mean\tenergy_peak\tidle_wakeups\tmean_rss_kb\tpeak_rss_kb\trenders_full\trenders_preview\tmegapixels\trequests_suppressed\trequests_suppressed_motion\tresident_peak_mb\tresident_peak_undelivered_mb\tresident_peak_cache_mb\tstart_idle\tstart_page\tend_page\tresident_peak_rss_mb\n' > "$OUTPUT" ||
+    die "cannot create $OUTPUT"
 
 # Trials whose app restored a saved reading position instead of starting at
 # page 1. Any at all and the run compared two different workloads, which is not
@@ -1673,6 +1739,12 @@ VERDICT_WINDOW="${WIN_W}x${WIN_H}"
 VERDICT_HOST="$(/usr/bin/uname -s) $(/usr/bin/uname -r) $(/usr/bin/uname -m)"
 VERDICT_WHEN="$(/bin/date '+%Y-%m-%d %H:%M:%S %Z')"
 export VERDICT_WINDOW VERDICT_HOST VERDICT_WHEN
-render_verdict "$OUTPUT" "$TIE_BAND" "$RUNS" | /usr/bin/tee "$VERDICT"
+# Not `render_verdict ... | tee`. A pipeline exits with the status of its LAST
+# command, so `tee` succeeding hid a verdict generator that had failed -- and
+# what it printed in that case was a truncated verdict, or none, under a run
+# that reported success. The same mistake `verify-all` made with its gates.
+render_verdict "$OUTPUT" "$TIE_BAND" "$RUNS" > "$VERDICT" ||
+    die "verdict generation failed"
+/bin/cat "$VERDICT" || die "cannot read $VERDICT"
 
 printf '\nRaw data: %s\nVerdict:  %s\n' "$OUTPUT" "$VERDICT"

@@ -147,7 +147,11 @@ int main(int argc, const char *argv[])
         PVPDFSource *src = [[PVPDFSource alloc] initWithURL:url error:&err];
         if (!src) { fprintf(stderr, "cannot open %s\n", argv[1]); return 2; }
         CGPDFDocumentRef doc = CGPDFDocumentCreateWithURL((CFURLRef)url);
-        if (!doc) { fprintf(stderr, "cannot re-open %s for banding\n", argv[1]); return 2; }
+        if (!doc) {
+            fprintf(stderr, "cannot re-open %s for banding\n", argv[1]);
+            [src release];
+            return 2;
+        }
 
         size_t pages = (argc > 2) ? (size_t)atoi(argv[2]) : 6;
         int    reps  = (argc > 3) ? atoi(argv[3]) : 3;

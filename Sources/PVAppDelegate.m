@@ -172,8 +172,8 @@ static NSString *PVFnKey(unichar c)
     if (canOffer) {
         [why appendString:@"\n\nRunning it from your Applications folder removes the possibility."];
         if (replacing) {
-            [why appendString:@" The copy already in Applications will be moved "
-                              @"to the Trash and replaced with this one."];
+            [why appendString:@" This copy will replace the one already in "
+                              @"Applications, which is then moved to the Trash."];
         }
     }
 
@@ -194,26 +194,63 @@ static NSString *PVFnKey(unichar c)
     NSInteger choice = [alert runModal];
     if (!canOffer || choice != NSAlertFirstButtonReturn) return;
 
+    // Stage first, replace second. This used to move the installed copy to the
+    // Trash and only then start copying -- from a removable or network volume,
+    // across a link that by construction might be about to disappear. Between
+    // those two steps there is no working Postview in /Applications, and if the
+    // copy failed halfway there was a half-written bundle sitting where the
+    // working one had been. Both of those are worse than not installing.
+    //
+    // So: copy the whole thing to a hidden name on the DESTINATION filesystem,
+    // where a failure costs nothing and can be cleaned up, and only once it is
+    // complete swap it in. -replaceItemAtURL:... does the swap through
+    // exchangedata/renamex where it can, so there is no instant at which the
+    // destination is missing or partial. All of this is present on Mavericks.
     NSError *error = nil;
-    BOOL trashedTheOldCopy = NO;
+    NSURL *sourceURL = [NSURL fileURLWithPath:sourcePath];
+    NSURL *destURL = [NSURL fileURLWithPath:destPath];
+    NSURL *applicationsURL = [destURL URLByDeletingLastPathComponent];
+    NSString *token = [[NSProcessInfo processInfo] globallyUniqueString];
+
+    NSURL *stageURL = [applicationsURL URLByAppendingPathComponent:
+        [NSString stringWithFormat:@".%@.install-%@", name, token]];
+
+    if (![fm copyItemAtURL:sourceURL toURL:stageURL error:&error]) {
+        [fm removeItemAtURL:stageURL error:NULL];
+        [self reportCopyFailure:error
+                           verb:@"stage a complete copy in your Applications folder"];
+        return;
+    }
+
     if (replacing) {
-        // The Trash rather than -removeItemAtPath:. Replacing an installed
-        // application is the user's decision to make once and possibly regret;
-        // a delete they cannot undo is not something to do on their behalf.
-        if (![fm trashItemAtURL:[NSURL fileURLWithPath:destPath]
-               resultingItemURL:NULL
-                          error:&error]) {
+        NSString *backupName =
+            [NSString stringWithFormat:@".%@.backup-%@", name, token];
+        NSURL *resultURL = nil;
+
+        // WithoutDeletingBackupItem: the previous copy is kept until the swap
+        // has definitely succeeded, and only then moved to the Trash. The Trash
+        // rather than a delete, for the same reason as before -- replacing an
+        // installed application is a decision the user may want to undo.
+        if (![fm replaceItemAtURL:destURL
+                    withItemAtURL:stageURL
+                   backupItemName:backupName
+                          options:NSFileManagerItemReplacementWithoutDeletingBackupItem
+                 resultingItemURL:&resultURL
+                            error:&error]) {
+            [fm removeItemAtURL:stageURL error:NULL];
             [self reportCopyFailure:error
-                               verb:@"replace the copy in your Applications folder"
-                            trashed:NO];
+                               verb:@"replace the copy in your Applications folder"];
             return;
         }
-        trashedTheOldCopy = YES;
-    }
-    if (![fm copyItemAtPath:sourcePath toPath:destPath error:&error]) {
+
+        NSURL *backupURL =
+            [applicationsURL URLByAppendingPathComponent:backupName];
+        if ([fm fileExistsAtPath:[backupURL path]])
+            [fm trashItemAtURL:backupURL resultingItemURL:NULL error:NULL];
+    } else if (![fm moveItemAtURL:stageURL toURL:destURL error:&error]) {
+        [fm removeItemAtURL:stageURL error:NULL];
         [self reportCopyFailure:error
-                           verb:@"copy itself to your Applications folder"
-                        trashed:trashedTheOldCopy];
+                           verb:@"copy itself to your Applications folder"];
         return;
     }
 
@@ -225,25 +262,22 @@ static NSString *PVFnKey(unichar c)
                                                  configuration:[NSDictionary dictionary]
                                                          error:&error]) {
         [self reportCopyFailure:error
-                           verb:@"open the copy in your Applications folder"
-                        trashed:NO];
+                           verb:@"open the copy in your Applications folder"];
         return;
     }
     [NSApp terminate:nil];
 }
 
-// `trashed` says whether the older copy in Applications has already been moved
-// to the Trash by the time this failed. If it has, saying only "Postview will
-// keep running from where it is" would be true and still leave the user
-// looking for an application that is no longer where they left it.
-- (void)reportCopyFailure:(NSError *)error verb:(NSString *)verb trashed:(BOOL)trashed
+// There is no longer a `trashed` case to report. The install stages a complete
+// copy first and only trashes the previous one after the swap has succeeded, so
+// every failure this can be called for leaves the installed copy exactly where
+// the user left it -- which is the whole point of the staging.
+- (void)reportCopyFailure:(NSError *)error verb:(NSString *)verb
 {
     NSMutableString *detail = [NSMutableString stringWithString:
         error ? [error localizedDescription] : @"The reason was not reported."];
-    if (trashed) {
-        [detail appendString:@"\n\nThe copy that was in your Applications folder has "
-                             @"already been moved to the Trash, where you can put it back."];
-    }
+    [detail appendString:@"\n\nThe copy in your Applications folder, if there was one, "
+                         @"has not been touched."];
     [detail appendString:@"\n\nPostview will keep running from where it is. Moving it "
                          @"yourself in the Finder does the same job."];
 
@@ -273,13 +307,39 @@ static NSString *PVFnKey(unichar c)
     // One process-wide memory pressure source. It is a dispatch source, not a
     // timer: it costs nothing until the kernel actually reports pressure, which
     // matters on a machine with only a few GB of RAM.
-    _memoryPressureSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
-        DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
+    //
+    // The level the kernel reported has to travel with the notification. The
+    // handler used to post a bare notification and drop
+    // dispatch_source_get_data() on the floor, which loses the one piece of
+    // information in the event: whether this is WARN or CRITICAL. Events also
+    // coalesce, so a process that was idle when the machine went straight to
+    // critical receives exactly one undifferentiated callback -- and the
+    // controller, counting notifications rather than reading levels, treated
+    // that as a first warning and immediately re-rendered every visible page at
+    // full resolution. That is the worst possible response to a critical event.
+    //
+    // NORMAL is subscribed to as well, because it is the only authority that
+    // says the pressure is over.
+    _memoryPressureSource = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
+        DISPATCH_MEMORYPRESSURE_NORMAL |
+        DISPATCH_MEMORYPRESSURE_WARN |
+        DISPATCH_MEMORYPRESSURE_CRITICAL,
         dispatch_get_main_queue());
     if (_memoryPressureSource) {
-        dispatch_source_set_event_handler(_memoryPressureSource, ^{
+        // Captured in a local: the block must read the source it belongs to,
+        // and reading the ivar would be a second dereference of self at a
+        // moment when self may be going away.
+        dispatch_source_t source = _memoryPressureSource;
+        dispatch_source_set_event_handler(source, ^{
+            unsigned long flags = dispatch_source_get_data(source);
+            NSDictionary *info = [NSDictionary dictionaryWithObject:
+                [NSNumber numberWithUnsignedLong:flags]
+                                                             forKey:@"PVMemoryPressureFlags"];
             [[NSNotificationCenter defaultCenter]
-                postNotificationName:PVMemoryPressureNotification object:nil];
+                postNotificationName:PVMemoryPressureNotification
+                              object:nil
+                            userInfo:info];
         });
         dispatch_resume(_memoryPressureSource);
     }

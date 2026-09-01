@@ -27,9 +27,12 @@
 #    paged through a later part of the document -- different pages, different
 #    content, different cost. Once a run resumed at the end of the document the
 #    Page Downs moved nothing at all and the app was measured doing nothing.
-#    Each trial now opens its own hardlink to the PDF at a path neither app has
-#    seen, so every run starts at page 1 in the default view. Nothing in the
-#    user's preferences is read or written to achieve that.
+#    Each trial now opens its own COPY of the PDF at a path neither app has
+#    seen, so every run starts at page 1 in the default view, and the page each
+#    app actually opened on is read back and checked. A hard link is not enough:
+#    it is the same inode, so Preview -- which keys on document identity rather
+#    than path -- restores the position it saved last time. Nothing in the
+#    user's preferences is read or written to achieve any of this.
 #
 # 2. Nothing checked whether the machine was busy. The noisiest session had
 #    BOTH apps pinned near 105% because something else on the system was
@@ -149,14 +152,93 @@ WORKDIR=$(/usr/bin/mktemp -d /tmp/postview-bench.XXXXXX) || die "could not creat
 PDF_BASE=$(basename "$PDF")
 PDF_STEM=${PDF_BASE%.*}
 
+# A document neither app has seen before, so every trial starts at page 1 in
+# the default view.
+#
+# This used to be a hard link, and a hard link does not do that. It is the same
+# inode: one file with a second name. Postview keys its saved reading position
+# on the path, so a new name did fool Postview -- which is exactly what let the
+# bug survive, because the app being developed visibly started at page 1.
+# Preview does not key on the path. It keys on the document's identity, and a
+# hard link has the identity it is a link to, so Preview restored the position
+# it had saved the last time anyone opened that PDF.
+#
+# The recorded evidence is in Postview-Profile-20260828-215944.tsv, whose
+# `launch` row -- a scenario that sends no input at all -- has Preview sitting
+# on "page 1,174 of 1,263" of a freshly staged path while Postview is on page 1.
+# The two apps were rasterising different parts of a 1,263-page book, and a page
+# costs up to 59x another at identical pixel counts. Every CPU figure produced
+# that way compares two different workloads.
+#
+# A copy has its own inode and its own document identity, which is the property
+# actually wanted. -X drops extended attributes and any resource fork, so
+# quarantine flags and Finder metadata do not travel either. It costs one file
+# copy per trial; correctness of the measurement is worth more than the seconds.
+#
+# Verified, not assumed: assert_fresh_start below reads the page out of the
+# app's own window title, and a trial that did not start on page 1 is
+# disqualified rather than averaged in.
 fresh_document() {
     # $1: a label unique to this trial. Echoes a path to an unseen copy.
-    # Spaces are squeezed out of the label so the staged name stays one word;
-    # the document's own name may still contain them and is quoted throughout.
-    label=$(printf '%s' "$1" | /usr/bin/tr ' ' '-')
+    # Spaces and slashes are squeezed out of the label so the staged name stays
+    # one word; the document's own name may still contain them and is quoted
+    # throughout.
+    label=$(printf '%s' "$1" | /usr/bin/tr ' /' '--')
     path="$WORKDIR/$PDF_STEM-$label.pdf"
-    /bin/ln "$PDF" "$path" 2>/dev/null || /bin/cp "$PDF" "$path" 2>/dev/null || return 1
+    /bin/rm -f "$path" 2>/dev/null
+    /bin/cp -X "$PDF" "$path" 2>/dev/null ||
+        /bin/cp "$PDF" "$path" 2>/dev/null ||
+        return 1
+    /usr/bin/xattr -c "$path" 2>/dev/null || true
     printf '%s\n' "$path"
+}
+
+# The page an app is showing, read from its own window title.
+#
+# Both apps put it there in the same shape -- "... (page 6 of 1263)" -- and
+# Preview writes the thousands separator its locale asks for, so the digits are
+# taken and the separators dropped. Empty when the title says nothing about a
+# page, which is not an error: it means this instrument cannot see the position
+# for this app, and that is treated differently from seeing the wrong page.
+page_from_title() {
+    printf '%s' "$1" | /usr/bin/sed -n 's/.*[Pp]age \([0-9][0-9.,]*\) of .*/\1/p' | \
+        /usr/bin/tr -d '.,' | /usr/bin/head -n 1
+}
+
+window_title() {
+    /usr/bin/osascript - "$1" <<'AS' 2>/dev/null
+on run argv
+    tell application "System Events"
+        tell process (item 1 of argv)
+            try
+                if (count of windows) is 0 then return ""
+                return name of window 1
+            on error
+                return ""
+            end try
+        end tell
+    end tell
+end run
+AS
+}
+
+# Did this trial actually start where it claims to? Sets START_PAGE, and
+# returns non-zero when the app resumed a saved position instead.
+#
+# A trial that began on a different page than its opposite number is not a
+# slightly noisy trial, it is a measurement of a different document, so it is
+# not something a median over runs can absorb. It is refused outright.
+assert_fresh_start() {
+    START_PAGE=$(page_from_title "$(window_title "$1")")
+    # No page in the title means this instrument cannot see the position for
+    # this app, not that the position is wrong.
+    [ -n "$START_PAGE" ] || { START_PAGE="-"; return 0; }
+    [ "$START_PAGE" = "1" ] && return 0
+    printf '  !! %s opened a freshly copied file on page %s, not page 1.\n' \
+        "$2" "$START_PAGE" >&2
+    printf '     It restored a saved reading position, so this trial is not\n' >&2
+    printf '     comparable with its opposite number.\n' >&2
+    return 1
 }
 
 now() { /usr/bin/perl -MTime::HiRes=time -e 'printf "%.6f\n", time'; }
@@ -318,6 +400,11 @@ run_trial() {
     launch=$(elapsed "$started" "$opened")
     pid=$(pid_for "$process")
     [ -n "$pid" ] || die "$app showed a window but could not be sampled"
+
+    # Checked before the clock starts, so a contaminated trial is refused rather
+    # than measured and then folded into a median that hides it.
+    assert_fresh_start "$process" "$app" ||
+        die "$app did not start on page 1; the comparison would be between two different workloads"
 
     /bin/sleep 1
     reset_samples

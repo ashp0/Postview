@@ -149,8 +149,8 @@ static PVWelcomeWindowController *sShared = nil;
 - (id)init
 {
     NSRect frame = NSMakeRect(0, 0, 460, 420);
-    NSUInteger style = (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
-                        NSWindowStyleMaskMiniaturizable);
+    NSUInteger style = (NSTitledWindowMask | NSClosableWindowMask |
+                        NSMiniaturizableWindowMask);
     NSWindow *w = [[[NSWindow alloc] initWithContentRect:frame
                                               styleMask:style
                                                 backing:NSBackingStoreBuffered

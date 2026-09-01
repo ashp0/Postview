@@ -23,7 +23,7 @@ int main(int argc, const char **argv) {
     for (int p = 0; p < pages; p++) {
       CGContextBeginPage(c, &media);
       CGContextSetRGBFillColor(c, 1,1,1,1); CGContextFillRect(c, media);
-      NSGraphicsContext *gc = [NSGraphicsContext graphicsContextWithCGContext:c flipped:NO];
+      NSGraphicsContext *gc = [NSGraphicsContext graphicsContextWithGraphicsPort:(void *)c flipped:NO];
       [NSGraphicsContext saveGraphicsState]; [NSGraphicsContext setCurrentContext:gc];
       NSMutableString *body = [NSMutableString string];
       // ~62 lines of 9pt text: a dense trade-paperback page, and roughly the

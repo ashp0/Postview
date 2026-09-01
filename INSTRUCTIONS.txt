@@ -24,10 +24,13 @@ STEP 1 — FIRST LAUNCH
 ---------------------
 RIGHT-CLICK /Applications/Postview.app and choose "Open", then confirm.
 
-Do not just double-click it the first time. The app is not signed with an Apple
-Developer ID, so double-clicking gives "can't be opened because it is from an
-unidentified developer" with no way past it. Right-click → Open gives you an
-"Open anyway" button. You only need to do this once, ever.
+Do not just double-click it the first time IF THIS BUILD IS UNSIGNED. An
+unsigned app gives "can't be opened because it is from an unidentified
+developer" with no way past it; right-click -> Open gives you an "Open anyway"
+button, and you only need to do it once, ever. A build signed with a Developer
+ID (see `make dist SIGN_IDENTITY=...`) opens on a double click -- Mavericks
+does understand Developer ID; what 10.9.5 will not accept is a SHA-256-only
+signature, which is why the Makefile signs with both SHA-1 and SHA-256.
 
 Open a PDF, scroll around, zoom in and out, open the sidebar. If anything
 crashes or looks wrong, note what you did and move on to Step 2 anyway.
@@ -185,9 +188,12 @@ KNOWN LIMITS — NOT BUGS, DO NOT REPORT THESE
     This is a known, deliberate memory limit, recorded and pinned by tests.
   - Peak memory use is higher than Preview's. It is the one measurement it
     loses on across the board. Known, measured, still open.
-  - Right-click → Open being needed on first launch is normal for an unsigned
-    app. There is no way around it without a paid Apple Developer ID, and
-    Mavericks predates notarization entirely.
+  - Right-click -> Open being needed on first launch is normal for an UNSIGNED
+    build. Mavericks predates notarization, but it does understand Developer
+    ID: a release built with `make dist SIGN_IDENTITY=...` carries a dual
+    SHA-1/SHA-256 signature, which 10.9.5 accepts, and opens with a double
+    click. Signing needs a paid Apple Developer ID; without one the build is
+    unsigned and right-click -> Open is the way in.
 
 
 IF SOMETHING GOES BADLY WRONG
@@ -199,4 +205,10 @@ completely:
     rm -rf ~/Library/Application\ Support/Postview
 
 Deleting /Applications/Postview.app removes the app. It installs nothing
-elsewhere, no background processes, no login items, no kernel extensions.
+elsewhere, no login items, no kernel extensions.
+
+While a document is open you will see one or more PostviewRenderHelper
+processes in Activity Monitor. Those are Postview's own, they live inside the
+bundle, and they exist so that a malformed PDF that hangs or crashes
+CoreGraphics takes down a helper instead of the viewer. They start when a
+document opens and are gone the moment it closes.

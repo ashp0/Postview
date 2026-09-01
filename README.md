@@ -64,10 +64,28 @@ back when *you* open that file.
 
 The recent list is macOS's own document history, the same one behind Open
 Recent, filtered to the files that are still where they were. (On a current
-macOS the system will only keep that history for a code-signed app, and this one
-deliberately is not signed — a modern signature is one of the things Mavericks'
-dyld cannot read. On Mavericks itself there is no such condition and the list
-fills up normally.)
+macOS the system will only keep that history for a code-signed app, so an
+unsigned build loses its recent list there; on Mavericks there is no such
+condition and the list fills up normally either way.)
+
+A release **should** be signed, and Mavericks is not the obstacle. Mavericks
+understands Developer ID perfectly well — Gatekeeper has required it since 10.8
+— and dyld does not read code signatures at all. What 10.9.5 introduced is the
+*version 2* signature format, which means a SHA-256-only signature (the default
+from a modern `codesign`) is what it cannot validate. The compatible form is a
+dual SHA-1/SHA-256 signature, which is exactly what `make sign` produces:
+
+```
+make dist SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"
+```
+
+Do **not** enable the hardened runtime for this target: that is a 10.14 feature
+and Mavericks' Gatekeeper rejects what it cannot parse. `make dist` will not
+package without an identity, because an unsigned release should be a decision
+someone typed out rather than one reached by omission.
+
+See [Apple TN2206](https://developer.apple.com/library/archive/technotes/tn2206/_index.html)
+and [Apple Developer ID](https://developer.apple.com/developer-id/).
 
 Close a document and reopen it later and it returns to the same page, the same
 position on that page, the same zoom, and the same window size. That is stored
@@ -299,8 +317,9 @@ constraint rather than an afterthought.
   every style mask, with tabbing disallowed, after forty seconds of run loop:
   shown windows are simply never deallocated.) A window that cannot be got rid of
   goes on owning its content view, and through it the page view, the bitmap cache
-  and the parsed `CGPDFDocument` behind them — so every file ever opened would
-  stay resident until you quit, tens of megabytes each. Closing a document
+  and the `PVPDFSource` behind them — which now means the document's private
+  snapshot of the file and its render helper process as well — so every file ever
+  opened would stay resident until you quit, tens of megabytes each. Closing a document
   therefore detaches its whole view tree from the window and drops the toolbar,
   leaving the controller holding the only references, and its `-dealloc` hands
   everything back. Where AppKit does hold the window — which it does on every
@@ -650,9 +669,12 @@ controlled for:
   keyed by file path, so run 2 resumed where run 1 stopped and paged through a
   later part of the document. Once a run resumed at the *end* of the document,
   Page Down moved nothing and the app was measured doing nothing at all. Each
-  trial now opens its own hardlink to the PDF, at a path neither app has seen,
-  so every run starts at page 1 in the default view — without the benchmark
-  reading or writing either app's preferences.
+  trial now opens its own *copy* of the PDF, at a path neither app has seen, and
+  reads back the page each app actually opened on — a trial that did not start
+  at page 1 is refused rather than averaged in. (A hard link is not enough: it
+  is the same inode, so Preview, which keys on document identity rather than
+  path, restores the position it saved last time. See §"the comparison needs
+  re-running" above.) None of this reads or writes either app's preferences.
 - **Nothing checked whether the machine was busy.** The worst session had *both*
   apps near 105% because something else was running. Each trial now waits for
   the machine to go quiet and records the idle figure it started with, so a
@@ -698,8 +720,19 @@ how many bitmaps it produced, how many megapixels that was, and how many
 requests the throttle declined:
 
 ```
-POSTVIEW_STATS=1 open -n -a Postview.app doc.pdf --args -PVStatsPath /tmp/s.txt
+defaults write com.postview.Postview PVStats -bool YES
+defaults write com.postview.Postview PVStatsPath /tmp/s.txt
+open -n -a Postview.app doc.pdf
+# ...and afterwards:
+defaults delete com.postview.Postview PVStats
+defaults delete com.postview.Postview PVStatsPath
 ```
+
+Not `open --args`: Mavericks' `open` has no such flag and reads what follows it
+as further filenames, so the census silently never switches on and every
+internal-render column comes out blank. `defaults write` reaches the same
+`NSUserDefaults` on every version. Running the executable directly instead
+picks up `POSTVIEW_STATS=1` from the environment.
 
 Off in every normal run — the counters cost one guarded add per rendered page
 and exist so a profile can attribute work, not so the app carries a profiler.
@@ -757,8 +790,9 @@ window exists, whenever AppKit chooses to build the toolbar; and that a state
 file full of the wrong types loads without taking the app down. Each of those was
 written by first reverting the fix and watching the test fail. `make uitest` also
 pins the window invariant directly: after a document is closed and its controller
-released, the page view, its cache and its `CGPDFDocument` must all be gone
-*while AppKit is still holding the window*.
+released, the page view, its cache and its `PVPDFSource` must all be gone
+*while AppKit is still holding the window*, and with the source its render
+helper process: `make soak` counts the surviving children directly.
 
 `make soak` is the long-uptime check. It runs the full open / lay out / scroll /
 zoom / thumbnails / jump / close cycle over and over, then asserts that every

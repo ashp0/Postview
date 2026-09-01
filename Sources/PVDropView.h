@@ -15,6 +15,12 @@
 @interface PVDropView : NSView {
     BOOL _highlighted;
     BOOL _drawsBackground;
+    // Paths from the current drop that have not been opened yet.
+    //
+    // A drop opens one document per turn of the run loop rather than all of
+    // them in one loop: see -openNextDroppedDocument. Nil whenever no sequence
+    // is outstanding.
+    NSMutableArray *_pendingDrops;
 }
 // Whether to paint anything at all. The welcome window's own content view draws
 // the empty state; the document window's sits behind an opaque view tree and
@@ -30,5 +36,15 @@
 
 // The PDF paths in a drag, or nil if it holds none. Exposed so the highlight
 // and the drop agree exactly about what counts.
+//
+// At most PV_MAX_DROPPED_DOCUMENTS are returned; `outTotal` receives how many
+// were actually there, which is what the "too many" message needs and the only
+// reason the two numbers are separate.
++ (NSArray *)pdfPathsInDrag:(id <NSDraggingInfo>)info
+                 totalFound:(NSUInteger *)outTotal;
 + (NSArray *)pdfPathsInDrag:(id <NSDraggingInfo>)info;
+
+// Abandon any drop still being opened. Called from -dealloc; exposed because a
+// window closing mid-sequence has to be able to stop it too.
+- (void)cancelPendingOpens;
 @end

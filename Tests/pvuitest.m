@@ -69,9 +69,16 @@ static void PVInstallRequestCounter(void)
     if (a && b) method_exchangeImplementations(a, b);
 }
 
+// Mirrors PV_MAX_RENDER_ATTEMPTS, which is private to PVWindowController.m.
+// Deliberately larger, so a loop that means "exhaust the attempts" keeps
+// meaning that if the real limit is ever raised.
+#define PV_UITEST_MAX_ATTEMPTS 8
+
 @interface PVWindowController (PVTestHooks)
 - (BOOL)pageIsUnrenderable:(NSUInteger)page;
-- (void)notePageFailed:(NSUInteger)page;
+- (BOOL)pageIsUnrenderable:(NSUInteger)page preview:(BOOL)preview;
+- (BOOL)thumbIsUnrenderable:(NSUInteger)page;
+- (void)notePageFailed:(NSUInteger)page preview:(BOOL)preview;
 - (void)resetRenderFailures;
 - (void)updateVisibleContent;
 - (void)memoryPressure:(NSNotification *)note;
@@ -124,6 +131,18 @@ static void PVInstallRequestCounter(void)
 @end
 
 static int gPass = 0, gFail = 0;
+
+// A memory-pressure notification carrying a level, exactly as PVAppDelegate
+// posts one. The level matters: the controller's response to CRITICAL is not
+// its response to WARN, and a notification with no level at all is read as WARN.
+static NSNotification *PressureNote(unsigned long flags)
+{
+    NSDictionary *info = [NSDictionary dictionaryWithObject:
+        [NSNumber numberWithUnsignedLong:flags] forKey:@"PVMemoryPressureFlags"];
+    return [NSNotification notificationWithName:PVMemoryPressureNotification
+                                         object:nil
+                                       userInfo:info];
+}
 static void OK(int cond, const char *what)
 {
     if (cond) { gPass++; printf("  ok    %s\n", what); }
@@ -535,22 +554,48 @@ int main(int argc, const char *argv[])
         // -hideSidebar had emptied, where it then sat until the sidebar was
         // next opened. Re-opening and immediately closing reproduces that
         // ordering: renders are certainly in flight at the moment of the hide.
-        printf("\n[5b] a thumbnail in flight when the sidebar closes is discarded\n");
+        printf("\n[5b] closing the sidebar releases everything behind it\n");
         {
-            PVImageCache *tc = [wc valueForKey:@"_thumbCache"];
             [wc showSidebar];
             Pump(0.25);                       // long enough to start, not to finish
+
+            // Retained across the hide on purpose. -hideSidebar releases the
+            // controller's references, and the point of the next few lines is
+            // that they are gone -- so the only way to keep asking questions
+            // about them is to hold them here.
+            PVImageCache  *tc = [[wc valueForKey:@"_thumbCache"]  retain];
+            PVRenderQueue *tq = [[wc valueForKey:@"_thumbQueue"]  retain];
+            PVPDFSource   *ts = [[wc valueForKey:@"_thumbSource"] retain];
+            OK(tc && tq && ts,
+               "the sidebar builds its own source, queue and cache");
+
             [wc hideSidebar];
-            OK([tc entryCount] == 0, "hiding the sidebar empties the thumbnail cache");
-            // Everything that was in flight at the moment of the hide has now
-            // been delivered -- the queue only reports idle once its results
-            // have reached the main thread.
-            PVRenderQueue *tq = [wc valueForKey:@"_thumbQueue"];
+
+            // The promise the on-demand sidebar makes is that it costs nothing
+            // once it is put away -- not "nothing except a second PVPDFSource
+            // with its own snapshot and helper process, a render queue with its
+            // own worker, a cache, a strip view and a bounds observer", which is
+            // what it used to keep until the document closed.
+            OK([wc valueForKey:@"_thumbCache"]  == nil, "hiding it releases the cache");
+            OK([wc valueForKey:@"_thumbQueue"]  == nil, "...and the render queue");
+            OK([wc valueForKey:@"_thumbSource"] == nil, "...and the second PDF source");
+            OK([wc valueForKey:@"_thumbView"]   == nil, "...and the strip view");
+
+            OK([tc entryCount] == 0, "the thumbnail cache is emptied on the way out");
+            // Everything in flight at the moment of the hide has now been
+            // delivered -- the queue only reports idle once its results have
+            // reached the main thread. The queue outlives the controller's
+            // reference because its worker block retains it, which is what makes
+            // releasing it mid-render safe.
             OK(PumpUntil(^{ return [tq isIdle]; }, 20.0),
                "the thumbnail queue drains after the sidebar is hidden");
             OK([tc entryCount] == 0,
                "a thumbnail delivered after the sidebar closed is not stored");
             OK([tc byteCount] == 0, "no thumbnail bytes are held once the sidebar is away");
+
+            [tc release];
+            [tq release];
+            [ts release];
         }
 
         // The strip rebuilds its wanted set only when the visible range changes
@@ -569,16 +614,23 @@ int main(int argc, const char *argv[])
         // back is.
         printf("\n[5c] the thumbnail early-out is reset when the cache is emptied\n");
         {
-            PVImageCache *tc = [wc valueForKey:@"_thumbCache"];
+            // Re-read after each -showSidebar: the cache is built by the show
+            // and released by the hide, so it is a different object each time
+            // rather than one long-lived cache being emptied and refilled.
             [wc showSidebar];
+            PVImageCache *tc = [[wc valueForKey:@"_thumbCache"] retain];
             OK(PumpUntil(^{ return (BOOL)([tc entryCount] > 0); }, 20.0),
                "reopening the sidebar renders thumbnails");
             NSUInteger firstFill = [tc entryCount];
             [wc hideSidebar];
             OK([tc entryCount] == 0, "hiding it empties the cache again");
+            [tc release];
+
             [wc showSidebar];
-            OK(PumpUntil(^{ return (BOOL)([tc entryCount] >= firstFill); }, 20.0),
+            PVImageCache *tc2 = [[wc valueForKey:@"_thumbCache"] retain];
+            OK(PumpUntil(^{ return (BOOL)([tc2 entryCount] >= firstFill); }, 20.0),
                "reopening at the same page refills it: the early-out is not sticky");
+            [tc2 release];
             [wc hideSidebar];
         }
 
@@ -590,14 +642,34 @@ int main(int argc, const char *argv[])
         {
             PVRenderQueue *pq = [wc valueForKey:@"_pageQueue"];
             [wc resetRenderFailures];
-            OK(![wc pageIsUnrenderable:5], "a page starts out renderable");
+            OK(![wc pageIsUnrenderable:5 preview:NO], "a page starts out renderable");
             [wc renderQueue:pq didFailPage:5 pixelSize:CGSizeMake(10, 10) preview:NO];
-            OK(![wc pageIsUnrenderable:5], "one failure is not enough to give up");
+            OK(![wc pageIsUnrenderable:5 preview:NO], "one failure is not enough to give up");
             [wc renderQueue:pq didFailPage:5 pixelSize:CGSizeMake(10, 10) preview:NO];
-            OK(![wc pageIsUnrenderable:5], "two failures are not enough either");
+            OK(![wc pageIsUnrenderable:5 preview:NO], "two failures are not enough either");
             [wc renderQueue:pq didFailPage:5 pixelSize:CGSizeMake(10, 10) preview:NO];
-            OK([wc pageIsUnrenderable:5], "the third failure retires the page");
-            OK(![wc pageIsUnrenderable:6], "retiring one page does not retire its neighbour");
+            OK([wc pageIsUnrenderable:5 preview:NO], "the third failure retires the full bitmap");
+            OK(![wc pageIsUnrenderable:6 preview:NO],
+               "retiring one page does not retire its neighbour");
+
+            // The counters are per bitmap, not per page. A 28 MB full render
+            // can fail for want of contiguous memory while the 3 MB preview of
+            // the same page succeeds every time -- and when one counter served
+            // both, the expensive failure retired the cheap bitmap with it, so
+            // a page that could have shown something showed nothing at all.
+            OK(![wc pageIsUnrenderable:5 preview:YES],
+               "a retired full bitmap does not retire the page's preview");
+            OK(![wc pageIsUnrenderable:5],
+               "...so the page as a whole is still worth asking about");
+            OK(![wc thumbIsUnrenderable:5],
+               "...and its thumbnail is a third, separate question");
+
+            NSUInteger attempt;
+            for (attempt = 0; attempt < PV_UITEST_MAX_ATTEMPTS; attempt++)
+                [wc renderQueue:pq didFailPage:5
+                      pixelSize:CGSizeMake(10, 10) preview:YES];
+            OK([wc pageIsUnrenderable:5],
+               "only once both bitmaps are retired is the page itself given up on");
 
             // Asking again after nothing has changed must not restart the
             // cycle; asking again after the pixel size changes must.
@@ -608,6 +680,115 @@ int main(int argc, const char *argv[])
             OK(![wc pageIsUnrenderable:5],
                "a zoom asks CoreGraphics a different question, so the page is retried");
             [wc zoomOut:nil];
+            Pump(0.5);
+        }
+
+        // The same question asked of the failures that are NOT about the page.
+        //
+        // Every failure used to arrive as a bare NULL, so a page starved of
+        // shared memory for one instant was counted exactly like a page
+        // CoreGraphics will never draw: three of them and the page was blank for
+        // the session. Now the renderer says which kind it was, and only the
+        // deterministic kind spends an attempt.
+        printf("\n[5c2] transient failures are retried; a missing renderer is not\n");
+        {
+            PVRenderQueue *pq = [wc valueForKey:@"_pageQueue"];
+            CGSize px = CGSizeMake(10, 10);
+            [wc resetRenderFailures];
+
+            // Three transient failures -- the number that permanently retires a
+            // page when the reason is not carried -- must not retire this one.
+            //
+            // "Not retired" is not the same as "ask again immediately", and the
+            // two assertions below are that distinction. Straight after a
+            // transient failure the page reports unrenderable, because a backoff
+            // is outstanding and re-requesting inside it would be the spin this
+            // is replacing. What matters is that the backoff EXPIRES.
+            int i;
+            for (i = 0; i < 3; i++)
+                [wc renderQueue:pq didFailPage:7 pixelSize:px preview:NO
+                        failure:PVRenderFailureTransientResource];
+            OK([wc pageIsUnrenderable:7 preview:NO],
+               "a transient failure holds the page off rather than re-asking at once");
+            OK(PumpUntil(^BOOL{
+                   return (BOOL)![wc pageIsUnrenderable:7 preview:NO]; }, 5.0),
+               "...and three of them still leave it renderable once the backoff expires");
+
+            // The bound. A machine that never recovers must not be asked
+            // forever, so the transient budget runs out too -- but into a state
+            // a reset can lift, unlike the permanent one.
+            [wc resetRenderFailures];
+            for (i = 0; i < 40; i++)
+                [wc renderQueue:pq didFailPage:8 pixelSize:px preview:NO
+                        failure:PVRenderFailureTimeout];
+            OK([wc pageIsUnrenderable:8 preview:NO],
+               "transient retries are bounded, so a broken machine is not asked forever");
+            [wc resetRenderFailures];
+            OK(![wc pageIsUnrenderable:8 preview:NO],
+               "...and a reset lifts it, which it must not do for a real refusal");
+
+            // Deterministic failures still retire, and still take three.
+            for (i = 0; i < 3; i++)
+                [wc renderQueue:pq didFailPage:9 pixelSize:px preview:NO
+                        failure:PVRenderFailureInvalidPage];
+            OK([wc pageIsUnrenderable:9 preview:NO],
+               "a page CoreGraphics refuses is still retired after three tries");
+
+            // A failure recorded at one bitmap size must not retire another.
+            [wc resetRenderFailures];
+            for (i = 0; i < 2; i++)
+                [wc renderQueue:pq didFailPage:10 pixelSize:CGSizeMake(100, 130)
+                        preview:NO failure:PVRenderFailureInvalidPage];
+            [wc renderQueue:pq didFailPage:10 pixelSize:CGSizeMake(900, 1170)
+                    preview:NO failure:PVRenderFailureInvalidPage];
+            OK(![wc pageIsUnrenderable:10 preview:NO],
+               "a failure at a new pixel size starts the count over, not finishes it");
+
+            // And the one that is not about any page at all. A missing renderer
+            // has no per-page counter to run out, so without a document-level
+            // answer the failure handler rebuilt the wanted set, the wanted set
+            // named the same pages, and nothing converged.
+            [wc resetRenderFailures];
+            OK(![wc pageIsUnrenderable:11 preview:NO], "page 11 starts renderable");
+            [wc renderQueue:pq didFailPage:11 pixelSize:px preview:NO
+                    failure:PVRenderFailureHelperUnavailable];
+            OK([wc pageIsUnrenderable:11 preview:NO],
+               "one helper-unavailable failure stops that page being asked for");
+            OK([wc pageIsUnrenderable:12 preview:NO],
+               "...and every other page too: it is one fact about the installation");
+            OK([wc thumbIsUnrenderable:3],
+               "...thumbnails included");
+            [wc resetRenderFailures];
+            OK([wc pageIsUnrenderable:12 preview:NO],
+               "a reset does not put a renderer back in the bundle");
+
+            // The alert this raised is a real sheet on a real window, and a
+            // window with a sheet attached does not close: leaving it up made
+            // -performClose: at the end of the run a no-op, so [6] read a
+            // reading position that had never been written. Dismissed here.
+            OK([[wc window] attachedSheet] != nil,
+               "the missing renderer is reported to the user, once, as a sheet");
+            if ([[wc window] attachedSheet]) {
+                [NSApp endSheet:[[wc window] attachedSheet]];
+                [[[wc window] attachedSheet] orderOut:nil];
+            }
+            // Waited for, not slept through. AppKit tears a sheet down over an
+            // indeterminate number of run-loop turns, so a fixed Pump is a bet
+            // on how loaded the machine is -- and this suite runs straight after
+            // the static analyser, which is exactly when it is loaded. Observed
+            // failing once in four runs at 0.2 s and never since as a wait.
+            OK(PumpUntil(^BOOL{
+                   return (BOOL)([[wc window] attachedSheet] == nil); }, 10.0),
+               "the sheet is dismissed");
+
+            // Undone for the rest of the run: every later section expects a
+            // working renderer.
+            [wc setValue:[NSNumber numberWithBool:NO]
+                  forKey:@"_reportedRendererMissing"];
+            [wc resetRenderFailures];
+            OK(![wc pageIsUnrenderable:12 preview:NO],
+               "the document recovers once the renderer is accounted for again");
+            [wc updateVisibleContent];
             Pump(0.5);
         }
 
@@ -630,37 +811,158 @@ int main(int argc, const char *argv[])
             printf("  full bitmaps after a settled pass: %lu\n", (unsigned long)normal);
             OK(normal >= 2, "a settled pass renders the visible pages and prefetches ahead");
 
-            [wc memoryPressure:nil];
-            OK([pc fullImageCount] == 0, "pressure drops every full bitmap immediately");
+            [wc memoryPressure:PressureNote(DISPATCH_MEMORYPRESSURE_WARN)];
+            OK([pc fullImageCount] == 0, "a warning drops every full bitmap immediately");
             OK(PumpUntil(^{ return [pq isIdle]; }, 60.0), "the pass after pressure settles");
             NSUInteger after = [pc fullImageCount];
-            printf("  full bitmaps after pressure settled: %lu\n", (unsigned long)after);
+            printf("  full bitmaps after a warning settled: %lu\n", (unsigned long)after);
             OK(after > 0, "the pages actually on screen still go sharp again");
             OK(after < normal,
                "prefetch does not put back the full bitmaps pressure just dropped");
 
-            // The second report, with no user action in between, is the one
-            // that used to close a loop. Answering it the same way as the
-            // first means: drop the bitmaps, render them again, be told to
-            // drop them again -- for as long as the machine stays tight, with
-            // a background thread busy throughout and the visible pages
-            // flickering between sharp and soft. From the second report on,
-            // nothing full-resolution is asked for at all until the user does
-            // something.
-            [wc memoryPressure:nil];
-            OK([pc fullImageCount] == 0, "the second report drops the bitmaps too");
+            // CRITICAL is the kernel saying it is nearly out, and it is answered
+            // directly rather than by counting how many times it has spoken.
+            // The old code derived its response from the NUMBER of reports, so a
+            // machine that went straight to critical -- one coalesced event --
+            // read as a first warning, and the first-warning response is to
+            // re-render every visible page at full resolution. That is the
+            // largest allocation this app can make, made in reply to being told
+            // memory is nearly gone.
+            [wc memoryPressure:PressureNote(DISPATCH_MEMORYPRESSURE_CRITICAL)];
+            OK([pc fullImageCount] == 0, "a critical report drops the bitmaps too");
             OK(PumpUntil(^{ return [pq isIdle]; }, 60.0), "the pass after it settles");
             OK([pc fullImageCount] == 0,
-               "a machine still under pressure is not asked to render again");
+               "a machine at critical pressure is not asked to render again");
             OK([pc entryCount] > 0,
                "the previews are kept, so the document stays readable");
 
-            // ...and the moment the user does anything, sharp pages come back.
+            // A single CRITICAL is enough on its own: it does not have to be
+            // seen twice, and it must not be reachable by counting warnings.
+            [wc memoryPressure:PressureNote(DISPATCH_MEMORYPRESSURE_NORMAL)];
+            [wc memoryPressure:PressureNote(DISPATCH_MEMORYPRESSURE_CRITICAL)];
+            OK([[wc valueForKey:@"_pressureReports"] unsignedIntegerValue] == 2,
+               "one critical event reaches the strict tier by itself");
+
+            // User activity must NOT end the backoff. Scrolling says nothing
+            // about whether the kernel still has memory, and scrolling is
+            // exactly what someone does while waiting for a stalled machine --
+            // so clearing it here re-armed full-resolution rendering at the
+            // worst possible moment.
             [wc goToPageNumber:2];
+            Pump(0.6);
+            OK([[wc valueForKey:@"_pressureReports"] unsignedIntegerValue] == 2,
+               "a user action does not overrule the kernel");
+            OK([pc fullImageCount] == 0,
+               "...and no full bitmap is rendered while it still says critical");
+
+            // Only the kernel's own all-clear does.
+            [wc memoryPressure:PressureNote(DISPATCH_MEMORYPRESSURE_NORMAL)];
+            OK([[wc valueForKey:@"_pressureReports"] unsignedIntegerValue] == 0,
+               "a NORMAL event from the kernel ends the backoff");
             OK(PumpUntil(^BOOL{ return (BOOL)([pc fullImageCount] > 0); }, 60.0),
-               "a user action ends the backoff and the pages go sharp again");
+               "...and the pages go sharp again");
             // Put the document back where the rest of the run expects to find
             // it: [6] reads the position this leaves behind off the disk.
+            [wc goToPageNumber:37];
+            PumpUntil(^{ return [pq isIdle]; }, 60.0);
+        }
+
+        // The half of pressure handling that the block above cannot reach: a
+        // render that was ALREADY RUNNING when the kernel said critical.
+        //
+        // Dropping the cache is only half a response. Rasterisation happens in
+        // a helper process and cannot be recalled; the bitmap is coming whether
+        // or not the machine is still short of memory, and delivery used to put
+        // it straight into the cache that had just been emptied. On two lanes
+        // that is ~56 MB restored within milliseconds of the release, on a
+        // machine the kernel had just called critical, and nothing would take
+        // it out again until the next pressure event.
+        //
+        // The pressure is therefore posted DURING the renders rather than
+        // between them, which is the only arrangement that exercises the
+        // delivery path at all.
+        printf("\n[5d2] a render in flight when pressure arrives is not stored\n");
+        {
+            PVImageCache *pc = [wc valueForKey:@"_pageCache"];
+            PVRenderQueue *pq = [wc valueForKey:@"_pageQueue"];
+
+            [wc memoryPressure:PressureNote(DISPATCH_MEMORYPRESSURE_NORMAL)];
+            [pc removeAll];
+            [wc updateVisibleContent];
+
+            // Caught mid-pass, deliberately not settled. -inFlightCount holds a
+            // request from the moment a lane picks it up until its result has
+            // been handed over, so a non-zero count here is exactly the
+            // "bitmap already on its way" the assertion is about.
+            BOOL caught = PumpUntil(^BOOL{
+                return (BOOL)([pq inFlightCount] > 0); }, 30.0);
+            OK(caught, "a render was in flight to post the pressure event into");
+            printf("  in flight when critical was posted: %lu\n",
+                   (unsigned long)[pq inFlightCount]);
+
+            [wc memoryPressure:PressureNote(DISPATCH_MEMORYPRESSURE_CRITICAL)];
+            OK([pc fullImageCount] == 0,
+               "the drop empties the cache of full bitmaps as before");
+
+            // Now let everything that was outstanding arrive.
+            OK(PumpUntil(^{ return [pq isIdle]; }, 90.0),
+               "every outstanding render drains");
+            OK([pc fullImageCount] == 0,
+               "...and not one of them was put back into the cache");
+            OK([pc entryCount] > 0,
+               "the previews still arrive, so the document stays readable");
+
+            // And the same thing again, deterministically.
+            //
+            // The drain above is a real race and racing is all it can do: which
+            // bitmaps happen to be outstanding when the event lands depends on
+            // the machine, and on one lane it is usually a preview, which is
+            // kept by design. A test that only sometimes exercises the path it
+            // is named after passes just as loudly when the guard is gone --
+            // observed, on this machine, with the guard deleted.
+            //
+            // So the late arrival is performed rather than waited for. This is
+            // exactly what the delivery block does when a rasterisation that
+            // began before the pressure event finishes after it, minus the
+            // timing. The page is the one on screen, so the viewport-window
+            // check further down cannot be what drops the bitmap and let this
+            // pass for the wrong reason.
+            {
+                NSUInteger page =
+                    [[wc valueForKey:@"_displayedPage"] unsignedIntegerValue];
+                CGSize px = CGSizeMake(240, 320);
+                CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+                CGContextRef ctx = CGBitmapContextCreate(NULL, (size_t)px.width,
+                    (size_t)px.height, 8, 0, cs,
+                    (CGBitmapInfo)kCGImageAlphaNoneSkipFirst |
+                        kCGBitmapByteOrder32Host);
+                CGColorSpaceRelease(cs);
+                CGImageRef late = ctx ? CGBitmapContextCreateImage(ctx) : NULL;
+                if (ctx) CGContextRelease(ctx);
+                OK(late != NULL, "a stand-in bitmap for the late arrival");
+
+                NSUInteger before = [pc fullImageCount];
+                [wc renderQueue:pq didRenderPage:page image:late pixelSize:px
+                        preview:NO renderSeconds:0.1];
+                OK([pc fullImageCount] == before,
+                   "a full bitmap delivered during critical pressure is dropped, "
+                   "not cached");
+
+                // The counterpart: with the kernel's all-clear given, the very
+                // same delivery is accepted. Without this the assertion above
+                // would also pass if delivery had simply stopped working.
+                [wc memoryPressure:PressureNote(DISPATCH_MEMORYPRESSURE_NORMAL)];
+                [wc renderQueue:pq didRenderPage:page image:late pixelSize:px
+                        preview:NO renderSeconds:0.1];
+                OK([pc fullImageCount] > before,
+                   "...and is accepted once the kernel says the pressure is over");
+                if (late) CGImageRelease(late);
+            }
+
+            // The state the rest of the run expects.
+            [wc memoryPressure:PressureNote(DISPATCH_MEMORYPRESSURE_NORMAL)];
+            OK(PumpUntil(^BOOL{ return (BOOL)([pc fullImageCount] > 0); }, 60.0),
+               "the all-clear brings the sharp pages back");
             [wc goToPageNumber:37];
             PumpUntil(^{ return [pq isIdle]; }, 60.0);
         }
@@ -678,13 +980,28 @@ int main(int argc, const char *argv[])
             // of several notifications arriving during the wait triggers the
             // same pass. The handler is reached through NSWindow's delegate
             // registration, so this also pins the window delegate being set.
-            [wc memoryPressure:nil];
-            OK([[wc valueForKey:@"_pressureReports"] unsignedIntegerValue] > 0,
-               "memory pressure arms prefetch suppression (test premise holds)");
+            // Observed through the render-failure table rather than through
+            // the pressure state. The end of a live resize means "the geometry
+            // is final, ask again": it resets retired pages, because a page
+            // that would not rasterise at the old size is a different question
+            // at the new one. It does NOT clear memory pressure -- only the
+            // kernel does that -- so the pressure flag can no longer serve as
+            // the observable here.
+            PVRenderQueue *rq = [wc valueForKey:@"_pageQueue"];
+            [wc resetRenderFailures];
+            NSUInteger attempt;
+            for (attempt = 0; attempt < PV_UITEST_MAX_ATTEMPTS; attempt++) {
+                [wc renderQueue:rq didFailPage:5
+                      pixelSize:CGSizeMake(10, 10) preview:NO];
+                [wc renderQueue:rq didFailPage:5
+                      pixelSize:CGSizeMake(10, 10) preview:YES];
+            }
+            OK([wc pageIsUnrenderable:5],
+               "a retired page is retired (test premise holds)");
             [[NSNotificationCenter defaultCenter]
                 postNotificationName:NSWindowDidEndLiveResizeNotification
                               object:[wc window]];
-            OK([[wc valueForKey:@"_pressureReports"] unsignedIntegerValue] == 0,
+            OK(![wc pageIsUnrenderable:5],
                "the end of a live resize is observed and starts a fresh exact pass");
             PumpUntil(^{ return [(PVRenderQueue *)[wc valueForKey:@"_pageQueue"] isIdle]; }, 60.0);
         }
@@ -731,7 +1048,11 @@ int main(int argc, const char *argv[])
             // restated here to stand for the first bounds change of the
             // scroll. Without it these assertions test the staleness rule
             // rather than the speed rule they are written for.
-            [wc setValue:[NSNumber numberWithDouble:[NSDate timeIntervalSinceReferenceDate]]
+            // PVMonotonicSeconds, because that is the clock -clipBoundsChanged:
+            // stamps this ivar with. Written in wall-clock seconds it is not a
+            // stale timestamp, it is a timestamp from a different time base --
+            // roughly 8x10^8 seconds ahead of the clock it is compared against.
+            [wc setValue:[NSNumber numberWithDouble:PVMonotonicSeconds()]
                   forKey:@"_lastScrollTime"];
 
             // The threshold is a constant, so these hold on every machine: a
@@ -852,7 +1173,11 @@ int main(int argc, const char *argv[])
             [pcache removeAll];
             PVFullRequestCount = 0; PVPreviewRequestCount = 0;
             [wc setValue:[NSNumber numberWithDouble:20000.0] forKey:@"_scrollSpeed"];
-            [wc setValue:[NSNumber numberWithDouble:[NSDate timeIntervalSinceReferenceDate]]
+            // PVMonotonicSeconds, because that is the clock -clipBoundsChanged:
+            // stamps this ivar with. Written in wall-clock seconds it is not a
+            // stale timestamp, it is a timestamp from a different time base --
+            // roughly 8x10^8 seconds ahead of the clock it is compared against.
+            [wc setValue:[NSNumber numberWithDouble:PVMonotonicSeconds()]
                   forKey:@"_lastScrollTime"];
             [wc updateVisibleContent];
             NSUInteger fullsMoving = PVFullRequestCount;
@@ -1155,7 +1480,7 @@ int main(int argc, const char *argv[])
             // the part that would break if the pairing did: RSS at the moment
             // the bitmaps peaked cannot be smaller than the bitmaps, since they
             // are resident memory and are counted in it.
-            double rssAtPeak = PVStatValue(PVStatRSSAtPeakResident);
+            double rssAtPeak = (double)PVResidentRSSAtHighWater();
             double residentPeak = (double)PVResidentHighWater();
             printf("  rss at the bitmap peak: %.1f MB, bitmaps %.1f MB\n",
                    rssAtPeak / (1024.0 * 1024.0), residentPeak / (1024.0 * 1024.0));
@@ -1357,7 +1682,7 @@ int main(int argc, const char *argv[])
             NSString *up   = [NSString stringWithFormat:@"%C",
                                   (unichar)NSUpArrowFunctionKey];
             NSEvent *downEvent =
-                [NSEvent keyEventWithType:NSEventTypeKeyDown
+                [NSEvent keyEventWithType:NSKeyDown
                                  location:NSZeroPoint
                             modifierFlags:0
                                 timestamp:0
@@ -1368,7 +1693,7 @@ int main(int argc, const char *argv[])
                                 isARepeat:NO
                                   keyCode:125];
             NSEvent *upEvent =
-                [NSEvent keyEventWithType:NSEventTypeKeyDown
+                [NSEvent keyEventWithType:NSKeyDown
                                  location:NSZeroPoint
                             modifierFlags:0
                                 timestamp:0
@@ -1465,7 +1790,7 @@ int main(int argc, const char *argv[])
             // programmatic scroll causes must measure no travel at all.
             [wc setValue:[NSNumber numberWithDouble:0.0] forKey:@"_scrollSpeed"];
             [wc setValue:[NSNumber numberWithDouble:
-                             [NSDate timeIntervalSinceReferenceDate] - 0.003]
+                             PVMonotonicSeconds() - 0.003]
                   forKey:@"_lastScrollTime"];
             [wc scrollToPage:20 fraction:0.61f];
             [wc clipBoundsChanged:nil];
@@ -1778,6 +2103,20 @@ int main(int argc, const char *argv[])
         // the CGPDFDocument behind them. Closing a document has to hand that
         // back regardless, or a day of opening files leaves every one of them
         // resident until the app quits.
+        // The primary controller and its source, handed back before the
+        // lifecycle baseline is taken.
+        //
+        // [8] below counts live PVPageView, PVImageCache and PVPDFSource
+        // objects before and after one document cycle. This controller and its
+        // source were still owned by this frame at that point -- alloc'd at the
+        // top of main and never released -- so they sat inside every one of
+        // those counts. The deltas the section asserts on still worked, which
+        // is exactly why it went unnoticed: the baseline was inflated by two
+        // objects the test itself was leaking, and a suite that leaks cannot
+        // then be the evidence that nothing leaks.
+        [wc release];  wc = nil;
+        [src release]; src = nil;
+
         printf("\n[8] closing a document releases its content even though AppKit\n"
                "    keeps the window alive forever\n");
         {

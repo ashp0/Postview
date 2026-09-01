@@ -23,6 +23,14 @@
     // to clear, so age catches up with cost eventually and without a second
     // parameter to tune.
     double               _gdsL;
+    // How many entries currently hold a full bitmap.
+    //
+    // Maintained rather than counted. -evictExcept: needs this on the way out
+    // of every insertion, and computing it by walking the dictionary made
+    // insertion O(n) and a run of insertions O(n^2): measured at 0.06 CPU-s for
+    // 2,000 inserts, 0.25 for 4,000 and 0.98 for 8,000 -- on the main thread,
+    // in the middle of scrolling.
+    NSUInteger           _fullCount;
 }
 - (id)initWithBudget:(size_t)budget;
 

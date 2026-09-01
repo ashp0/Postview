@@ -5,15 +5,24 @@
 - (id)init
 {
     self = [super init];
-    if (self) {
-        if (pthread_mutex_init(&_lock, NULL) != 0) { [self release]; return nil; }
+    if (!self) return nil;
+    // -release runs -dealloc, and -dealloc used to destroy the mutex
+    // unconditionally. On the one path that reaches it with the mutex never
+    // initialised -- this failure -- that is pthread_mutex_destroy on
+    // uninitialised stack garbage, which is undefined rather than a clean
+    // "could not allocate". The flag is the smallest thing that makes -dealloc
+    // able to tell the two states apart.
+    if (pthread_mutex_init(&_lock, NULL) != 0) {
+        [self release];
+        return nil;
     }
+    _lockInitialized = YES;
     return self;
 }
 
 - (void)dealloc
 {
-    pthread_mutex_destroy(&_lock);
+    if (_lockInitialized) pthread_mutex_destroy(&_lock);
     [super dealloc];
 }
 

@@ -131,12 +131,20 @@
 // them in flight together is how peak RSS reached 334 MB while the cache
 // itself was never allowed past 96 MB.
 //
-// Enforced in -[PVRenderQueue drainExpressOnly:]: a full request is left in the
-// pending set and skipped, rather than the worker being blocked, because the
-// queue is serial and previews drain through the same loop -- blocking there
-// would stall the responsiveness path to save memory on the quality path. The
-// main-queue delivery block re-pumps when the count drops, which is what makes
-// the skipped request start again rather than wait for the next scroll event.
+// Enforced in -[PVRenderQueue bestPendingIndexLocked:forLane:]: a full request
+// is left in the pending set and skipped, rather than the worker being blocked,
+// because each lane is serial and previews drain through the same loop --
+// blocking there would stall the responsiveness path to save memory on the
+// quality path. The main-queue delivery block re-pumps when the count drops,
+// which is what makes the skipped request start again rather than wait for the
+// next scroll event.
+//
+// One bound for the QUEUE, not one per lane. A queue on mains power may run two
+// render lanes, and if each enforced its own limit the ceiling this number
+// represents would simply double -- the ~56 MiB of undelivered bitmaps becomes
+// ~112 MiB, on the machine with least to spare, for a change that was only
+// meant to use idle cores. The count lives on the queue and both lanes consult
+// it under the same lock.
 //
 // Counts bitmaps, not bytes, and deliberately so. Byte accounting is
 // instrumentation and can be compiled or configured away; this bound is a
@@ -361,6 +369,32 @@ PVPowerSource PVCurrentPowerSource(void);
 // battery case the project exists to optimise. This is the same seam for
 // pvtest, which has to walk both branches on whatever machine it runs on.
 void PVSetPowerSourceOverride(PVPowerSource source, BOOL enabled);
+
+// Does this machine have a battery in it at all?
+//
+// A different question from PVCurrentPowerSource(), and the render queue needs
+// both. "On AC" is a state that changes while a document is open; "has a
+// battery" is a property of the machine that does not. A quad-core MacBook Pro
+// opened with the charger in reports AC, and a lane count decided from that
+// alone survived the charger being pulled -- two cores awake on battery for the
+// rest of the session, on the exact hardware the whole power policy exists to
+// protect, with nothing to say so.
+//
+// Deciding the second lane from this instead means the answer cannot go stale,
+// because the premise cannot change. A portable gets one lane whether or not it
+// is plugged in; the Mac Pro, which has no battery and eleven idle cores, gets
+// two. That is the shipping policy stated directly rather than approximated by
+// a core count and a charger.
+//
+// Resolved through the same dlopen'd IOKit handle as the power source, and
+// cached for the life of the process. A machine that declines to answer is
+// treated as having a battery, which is the conservative branch.
+BOOL PVMachineHasInternalBattery(void);
+
+// Test seam for the above, matching PVSetPowerSourceOverride. Without it no
+// test on a laptop could exercise the two-lane scheduler at all, and the
+// in-flight cap is a two-lane property.
+void PVSetInternalBatteryOverride(BOOL hasBattery, BOOL enabled);
 
 // ---------------------------------------------------------------------------
 // The render policy: every mode-shaped decision, in one pure function.
@@ -602,19 +636,21 @@ typedef enum {
     // Process RSS, sampled at the instant the line above set a new high-water
     // mark -- not a maximum of its own.
     //
-    // The showdown wants to say how much of the peak is rendered pixels and how
-    // much is everything else, and it was doing that by subtracting one
-    // independently-timed maximum from another. max(bitmaps + rest) - max(rest)
-    // is not "bitmaps"; it is only equal to it when the two maxima happen to
-    // coincide, and it collapses towards zero when they do not. That is why the
-    // 2026-08-31 run's derived "non-bitmap" column swings from 68.8 MB to
-    // 177.6 MB across scenarios while the note beside it says the quantity
-    // should be roughly constant -- the column was measuring how well two
-    // clocks lined up. Sampled here, the pair is simultaneous by construction
-    // and the subtraction means what it claims.
-    PVStatRSSAtPeakResident,
     PVStatCount
 } PVStatKey;
+
+// A monotonic clock, in seconds, or 0 throughout if the machine will not
+// describe its timebase.
+//
+// Deliberately not -[NSDate timeIntervalSinceReferenceDate]. That one is wall
+// clock: NTP steps it, and it moves when the user changes the time zone or the
+// machine wakes from sleep. Everything here that measures an INTERVAL --
+// how long a render took, how fast the document is scrolling -- is measuring a
+// property of the code or of the user's hand, and a clock correction landing in
+// the middle of one of those puts a number into a decaying average that stays
+// wrong for the rest of the session. mach_absolute_time does not step and does
+// not go backwards.
+double PVMonotonicSeconds(void);
 
 BOOL PVStatsEnabled(void);
 void PVStatAdd(PVStatKey key, double delta);
@@ -622,12 +658,6 @@ void PVStatAdd(PVStatKey key, double delta);
 // that use it; adding a high-water mark with PVStatAdd would report the sum of
 // every peak ever reached, which is a number about nothing.
 void PVStatMax(PVStatKey key, double value);
-// Overwrite rather than accumulate or maximise. For a reading whose value is
-// only meaningful together with the moment it was taken: PVStatRSSAtPeakResident
-// has to be the RSS at the LAST bitmap peak, because that is the one the
-// resident figure beside it also describes. Maximising it independently would
-// reintroduce exactly the two-different-clocks error it exists to remove.
-void PVStatSet(PVStatKey key, double value);
 // One counter's current value, or 0 when the census is disabled or the key is
 // out of range. For tests: a counter nothing can read is a counter nothing can
 // prove counts, and the suppression keys exist precisely to be read.
@@ -685,6 +715,30 @@ size_t PVResidentTotal(void);
 // report and by the soak's footprint section.
 size_t PVResidentHighWater(void);
 size_t PVResidentHighWaterForBucket(PVResidentBucket bucket);
+
+// The process RSS as it stood at the instant the total high-water mark was last
+// raised, or 0 if the census never saw a peak or the kernel refused the reading.
+//
+// The showdown wants to say how much of the peak is rendered pixels and how much
+// is everything else. It was doing that by subtracting one independently-timed
+// maximum from another, and max(bitmaps + rest) - max(rest) is not "bitmaps" --
+// it equals it only when the two maxima coincide, and collapses towards zero
+// when they do not. That is why the 2026-08-31 run's derived "non-bitmap"
+// column swings from 68.8 MB to 177.6 MB across scenarios while the note beside
+// it says the quantity should be roughly constant: the column was measuring how
+// well two clocks lined up.
+//
+// Taken here under the same lock as the peak it belongs to, so the pair is
+// simultaneous by construction and the subtraction means what it claims.
+size_t PVResidentRSSAtHighWater(void);
+
+// Every resident peak and the paired RSS, read under one lock, so a report
+// cannot mix numbers from five different instants.  Any out-parameter may be
+// NULL.
+void   PVResidentPeakSnapshot(size_t *totalPeak, size_t *cachePeak,
+                              size_t *undeliveredPeak, size_t *renderPeak,
+                              size_t *rssAtPeak);
+
 // Zero the totals and the high-water marks. For tests that need a clean
 // measurement window; nothing in the application calls it.
 void   PVResidentReset(void);

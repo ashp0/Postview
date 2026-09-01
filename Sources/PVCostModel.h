@@ -116,6 +116,10 @@
     // PV_COST_MIN_SAMPLES while the rate was still the seed would predict from
     // a number that was never a measurement.
     pthread_mutex_t _lock;
+    // Whether _lock was successfully initialised. -dealloc must not destroy a
+    // mutex that pthread_mutex_init never touched, and -init's failure path
+    // reaches -dealloc through -release.
+    BOOL            _lockInitialized;
     // Index 0 is full-resolution, index 1 is preview. Two populations, never
     // mixed: see the header note above.
     double          _msPerMpx[2];

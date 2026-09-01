@@ -316,7 +316,7 @@
     if ([chars length] == 0) { [super keyDown:event]; return; }
 
     unichar c = [chars characterAtIndex:0];
-    BOOL shift = ([event modifierFlags] & NSEventModifierFlagShift) != 0;
+    BOOL shift = ([event modifierFlags] & NSShiftKeyMask) != 0;
     NSRect vis = [[[self enclosingScrollView] contentView] documentVisibleRect];
     CGFloat page = NSHeight(vis) - 40.0;
     if (page < 40) page = NSHeight(vis);

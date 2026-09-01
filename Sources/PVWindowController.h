@@ -122,6 +122,23 @@
     // when a live scroll takes over, and before any reschedule -- so it can
     // never outlive the controller or run twice for one movement.
     NSTimer          *_settleTimer;
+    // The pending transient-failure retry, and the monotonic instant it is set
+    // for. Separate from _settleTimer because a settle is cancelled and re-armed
+    // by every scroll event: a retry pinned to it would be pushed forward
+    // indefinitely by the one reader who most needs it, the one still scrolling
+    // through the pages that are missing. Invalidated in -teardownReferences
+    // alongside the settle timer.
+    NSTimer          *_retryTimer;
+    double            _retryTimerAt;
+    // The renderer has been reported missing. One document, one alert: it is a
+    // fact about the installation, and every page would otherwise report it.
+    //
+    // It also stops every page being asked for again. Without that the failure
+    // handler rebuilt the wanted set, the wanted set named the same pages, they
+    // failed the same way, and nothing anywhere converged -- a missing helper
+    // has no per-page counter to run out, because it is not a fact about any
+    // page. See -pageIsUnrenderable:preview:.
+    BOOL              _reportedRendererMissing;
     NSUInteger        _displayedPage;
 
     NSUInteger        _restorePage;
@@ -140,33 +157,81 @@
     NSRange           _lastRequestRange;
     BOOL              _haveRequestState;
 
-    // Pages CoreGraphics has refused to rasterise, and how many times. A page
-    // that fails never reaches the cache, so the wanted-set names it again on
-    // the next scroll event and the queue tries it again -- one bad page in a
-    // document left open overnight is a background thread rasterising nothing,
-    // forever. After a few attempts the page is left alone until something
-    // happens that could plausibly change the answer. Bounded, and empty in
-    // every normal session.
-    NSMutableDictionary *_renderFailures;   // NSNumber(page) -> NSNumber(count)
+    // Bitmaps CoreGraphics has refused to rasterise, and how many times. A
+    // render that fails never reaches the cache, so the wanted-set names it
+    // again on the next scroll event and the queue tries it again -- one bad
+    // page in a document left open overnight is a background thread rasterising
+    // nothing, forever. After a few attempts that bitmap is left alone until
+    // something happens that could plausibly change the answer.
+    //
+    // One counter per BITMAP, not per page. The three bitmaps a page can have
+    // are three different questions for CoreGraphics: a 28 MB full-resolution
+    // render can fail for want of contiguous memory while the 3 MB preview of
+    // the same page succeeds every time, and a thumbnail is smaller again.
+    // Keyed by page alone, the failure of the expensive one retired the cheap
+    // ones with it -- so a page that could have shown something showed nothing.
+    //
+    // Flat byte arrays sized from the page count, which -[PVPDFSource init]
+    // has already bounded at 100,000: 200 KB and 100 KB at the very top of
+    // that range, and no per-failure allocation. The dictionary this replaces
+    // was capped at 512 entries and then stopped recording, which meant every
+    // page after the 512th was retried without limit -- the exact behaviour
+    // the table exists to prevent, reached by the mechanism meant to bound it.
+    //
+    // NULL if the allocation failed; every read treats that as "renderable",
+    // so the worst case is the old unbounded retry rather than a crash.
+    uint8_t          *_pageFailures;    // 2 per page: [p*2] full, [p*2+1] preview
+    uint8_t          *_thumbFailures;   // 1 per page
+    NSUInteger        _failureSlots;    // page count the arrays were sized for
+    // Transient failures per page bitmap, counted apart from the permanent
+    // ones above, and the monotonic time each slot may next be attempted.
+    //
+    // A page starved of shared memory for one instant and a page CoreGraphics
+    // will never draw are different events with the same remedy applied to
+    // them: three strikes and the page was blank for the session. These two
+    // arrays are what let the second be retried with a backoff while only the
+    // first spends an attempt.
+    uint8_t          *_pageTransient;   // 2 per page, same slot layout
+    uint8_t          *_thumbTransient;  // 1 per page
+    double           *_pageRetryAt;     // 2 per page; 0 = no wait outstanding
+    double           *_thumbRetryAt;    // 1 per page
+    // The clamped pixel size each slot's counters were recorded at.
+    //
+    // Failures were keyed by page and preview alone, so a bitmap that could not
+    // be allocated at one zoom retired the page at every other -- the counter
+    // survived the very change of question that made it worth asking again. A
+    // slot whose size has moved starts over.
+    CGSize           *_pageFailureSize; // 2 per page
+    CGSize           *_thumbFailureSize;// 1 per page
 
-    // How many times the kernel has reported memory pressure since the user
-    // last did anything. Zero in every normal session.
+    // The memory pressure level the kernel last reported, as a tier. Zero in
+    // every normal session.
     //
-    // One report is another application spiking: drop the full-resolution
-    // bitmaps, stop prefetching them, and let the pages actually on screen go
-    // sharp again -- the user is still reading them.
+    // 0 -- DISPATCH_MEMORYPRESSURE_NORMAL. Nothing is wrong; render normally.
     //
-    // A second report with no user action in between means that re-rendering
-    // is itself what put the machine back under pressure. Continuing to answer
-    // it the same way is a loop: drop, re-render, drop, re-render, for as long
-    // as the machine stays tight, which on a 2 GB Mavericks machine can be
-    // hours. From the second report on, only the cheap previews are kept and
-    // no full-resolution page is asked for at all. The pages on screen stay
-    // legible, slightly soft, and the machine is left alone.
+    // 1 -- DISPATCH_MEMORYPRESSURE_WARN. Another application is spiking: drop
+    // the full-resolution bitmaps and stop PREFETCHING them, but keep rendering
+    // the pages actually on screen sharply, because the user is reading those.
     //
-    // Any real action -- a scroll, a zoom, a page jump, the window coming back
-    // into view -- resets this to zero through -noteUserActivity, so the
-    // moment the user is actually reading again they get sharp pages back.
+    // 2 -- DISPATCH_MEMORYPRESSURE_CRITICAL. Re-rendering is now itself part
+    // of the problem:
+    // continuing to answer it the same way is a loop -- drop, re-render, drop,
+    // re-render -- which on a 2 GB Mavericks machine can run for hours. Only
+    // the cheap previews are kept and no full-resolution page is asked for at
+    // all. Pages stay legible, slightly soft, and the machine is left alone.
+    //
+    // This is a level, not a count. A count could not tell a critical event
+    // from a mild one, and coalescing meant a machine that went straight to
+    // critical delivered a single callback that read as tier 1 -- the tier
+    // whose response is to allocate the largest bitmaps the app can make. One
+    // CRITICAL therefore reaches tier 2 by itself, and repeated WARNs never do:
+    // escalation follows what the kernel says, not how often it says it.
+    //
+    // Only a NORMAL event from the kernel clears it. User activity does NOT:
+    // scrolling says nothing about whether the machine still has memory, and
+    // scrolling is precisely what a user does while waiting for a stalled
+    // machine, so clearing it there re-armed full-resolution rendering at the
+    // worst possible moment.
     NSUInteger        _pressureReports;
 }
 - (id)initWithSource:(PVPDFSource *)source url:(NSURL *)url;

@@ -28,6 +28,7 @@
 #import "PVWindowController.h"
 #import "PVStateStore.h"
 #include <stdlib.h>          // getenv, atof -- see DeadlineScale()
+#include <string.h>          // strstr -- the scratch HOME check in main()
 #include <math.h>
 
 @interface PVWindowController (PVStressHooks)
@@ -104,6 +105,32 @@ static BOOL SettlesToZero(const char *cls, double deadline)
     return PVLiveCount(cls) == 0;
 }
 
+// Wait for a queue to go quiet, with a deadline, instead of guessing at a
+// duration.
+//
+// Shutdown is asynchronous: the worker sees the flag on its next iteration and
+// the delivery it may already have queued runs on the main thread after that.
+// The old form was a flat Pump(0.40) followed immediately by the assertion,
+// which makes the test a claim about how long a page render takes on the host
+// that happens to be running it -- and a page render varies by an order of
+// magnitude between the plain, address and thread builds, and again between
+// this laptop and the Mac Pro. Two of the plain runs recorded on 2026-08-31
+// failed here for that reason and nothing else.
+//
+// The deadline is generous and the exit is a condition, so a queue that
+// genuinely never settles still fails -- it just takes longer to say so.
+static BOOL QueueSettles(PVRenderQueue *q, double deadline)
+{
+    double waited = 0;
+    deadline *= DeadlineScale();
+    while (waited < deadline) {
+        if ([q isIdle] && [q inFlightCount] == 0) return YES;
+        @autoreleasepool { Pump(0.05); }
+        waited += 0.05;
+    }
+    return ([q isIdle] && [q inFlightCount] == 0);
+}
+
 // Reports the count it actually saw, so a failure says how far off it was
 // rather than only that it was not zero.
 static void CensusIsZero(const char *cls, const char *what, double deadline)
@@ -167,8 +194,9 @@ static void StressQueueChurn(NSURL *url, int rounds)
     Pump(0.30);
 
     [q shutdown];
-    // The worker sees _shutdown on its next iteration; give it that iteration.
-    Pump(0.40);
+    // Waited for, not guessed at: see QueueSettles.
+    BOOL settled = QueueSettles(q, 30.0);
+    OK(settled, "queue settles after churn and shutdown");
     OK([q isIdle], "queue is idle after churn and shutdown");
     OK([q inFlightCount] == 0, "nothing is left marked in flight after churn");
     [q release];
@@ -188,8 +216,23 @@ static void StressAbandonMidRender(NSURL *url, int rounds)
     int i;
     for (i = 0; i < rounds; i++) {
         @autoreleasepool {
-            PVRenderQueue *q = [[PVRenderQueue alloc] initWithSource:src
+            // Its own source, not the shared one.
+            //
+            // These queues are abandoned mid-render and are therefore all alive
+            // and rasterising at the same time. Handing every one of them the
+            // same PVPDFSource had sixty render lanes driving one source
+            // concurrently -- which is exactly what PVPDFSource.h says must
+            // never happen, so the harness was violating the contract it exists
+            // to test rather than testing it. Geometry is copied from `src` and
+            // the snapshot underneath is shared, so this costs one
+            // CGPDFDocumentCreate per round and not one file copy.
+            PVPDFSource *own = [[PVPDFSource alloc] initWithURL:url
+                                                  geometryFrom:src
+                                                         error:NULL];
+            if (!own) { printf("  FAIL  could not open a per-queue source\n"); gFail++; break; }
+            PVRenderQueue *q = [[PVRenderQueue alloc] initWithSource:own
                                                                label:"com.postview.stress.abandon"];
+            [own release];
             NSMutableArray *reqs = [NSMutableArray array];
             int k;
             for (k = 0; k < 4; k++)
@@ -319,9 +362,25 @@ int main(int argc, const char *argv[])
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
 
-        // Reading positions are written through the shared store, so this is
-        // run with HOME pointed at a scratch directory (see the makefile
-        // target) rather than over the user's real DocumentState.plist.
+        // Reading positions are written through the shared store, so this has
+        // to run with HOME pointed at a scratch directory rather than over the
+        // user's real DocumentState.plist.
+        //
+        // Checked rather than asserted in a comment. The comment said the
+        // makefile provided one and the makefile did not, so every run of this
+        // harness read and rewrote the developer's own reading positions --
+        // hundreds of state writes per run, against the file the app treats as
+        // authoritative. A claim about the environment that nothing verifies is
+        // a claim that stops being true silently.
+        const char *home = getenv("HOME");
+        if (!home || !strstr(home, "postview-stress-home")) {
+            fprintf(stderr,
+                "pvstress: refusing to run without a scratch HOME.\n"
+                "  HOME is currently %s\n"
+                "  Run it through `make stress`, which creates one.\n",
+                home ? home : "(unset)");
+            return 2;
+        }
 
         StressQueueChurn(url, 400 * scale);
         StressAbandonMidRender(url, 60 * scale);

@@ -36,20 +36,48 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
 - (void)scrollClipTo:(NSPoint)p;
 @end
 
+// +[PVRenderRequest page:...] can return nil -- +alloc can fail -- and
+// -[NSMutableArray addObject:] raises on nil rather than ignoring it. Five call
+// sites build these; saying it once is what keeps the fifth from being the one
+// that forgets.
+static void PVAddRequest(NSMutableArray *reqs, PVRenderRequest *request)
+{
+    if (request) [reqs addObject:request];
+}
+
 @implementation PVWindowController
 
 #pragma mark - Setup
 
 - (id)initWithSource:(PVPDFSource *)source url:(NSURL *)url
 {
-    if (!source) return nil;
+    // The superclass initialiser runs FIRST, before anything that can fail.
+    //
+    // It used to run last, after the window was built, which forced every
+    // earlier failure to be a bare `return nil` -- there was no initialised
+    // object to release, because -dealloc on an NSWindowController that never
+    // ran its own initialiser is not something to attempt. The comment that
+    // used to be here argued the leak was the smaller of the two evils, and it
+    // was right about that; it was answering the wrong question. Neither is
+    // necessary: -initWithWindow: accepts nil, so the superclass can be
+    // initialised up front and -setWindow: can supply the window once it
+    // exists. Every failure below is then an ordinary [self release].
+    self = [super initWithWindow:nil];
+    if (!self) return nil;
+    PVLiveAdjust("PVWindowController", +1);
+
+    if (!source) { [self release]; return nil; }
     NSRect frame = NSMakeRect(0, 0, 900, 760);
-    NSUInteger style = (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
-                        NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable);
+    NSUInteger style = (NSTitledWindowMask | NSClosableWindowMask |
+                        NSMiniaturizableWindowMask | NSResizableWindowMask);
     NSWindow *window = [[[NSWindow alloc] initWithContentRect:frame
                                                     styleMask:style
                                                       backing:NSBackingStoreBuffered
                                                         defer:NO] autorelease];
+    // Everything below configures the window by message, which is nil-safe. A
+    // controller with no window can never present anything and would fail
+    // later and somewhere else, so it is refused here.
+    if (!window) { [self release]; return nil; }
     [window setContentMinSize:NSMakeSize(380, 320)];
     [window setReleasedWhenClosed:NO];
     // No window animation. This is the same rule the rest of the app follows --
@@ -74,16 +102,18 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
     // documents on a plain launch from the icon.
     [window setRestorable:NO];
 
-    self = [super initWithWindow:window];
-    if (!self) return nil;
+    [self setWindow:window];
 
-    PVLiveAdjust("PVWindowController", +1);
     _url       = [url copy];
     _source    = [source retain];
     _pageCache = [[PVImageCache alloc] initWithBudget:PVPageCacheBudget()];
     _pageQueue = [[PVRenderQueue alloc] initWithSource:_source label:"com.postview.render.pages"];
     if (!_pageCache || !_pageQueue) { [self release]; return nil; }
     [_pageQueue setDelegate:self];
+    // Sized once, from a page count PVPDFSource has already bounded. Not a
+    // hard failure: -allocateFailureTablesForPages: leaves the tables NULL if
+    // it cannot get them, and every read of a NULL table answers "renderable".
+    [self allocateFailureTablesForPages:[_source pageCount]];
 
     _zoomMode        = PVZoomModeFitWidth;
     _zoom            = 1.0;
@@ -95,7 +125,12 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
     _lastDirection   = 1;
 
     [self loadSavedStateIntoWindow:window];
-    [self buildInterface];
+    // A window with no interface in it is not a degraded viewer, it is an empty
+    // grey rectangle with a toolbar. -buildInterface allocates a split view, a
+    // scroll view and a page view, and it used to return void, so a failure in
+    // any of them produced exactly that -- silently, and only for the user
+    // whose machine was already out of memory.
+    if (![self buildInterface]) { [self release]; return nil; }
 
     NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
     [nc addObserver:self selector:@selector(clipBoundsChanged:)
@@ -146,7 +181,15 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
     }
 }
 
-- (void)buildInterface
+// Builds the view tree, or returns NO having built none of it.
+//
+// Each of these allocations can fail, and the ones that matter are the three
+// this controller keeps: without them there is nothing to draw a page into and
+// nothing that scrolls. They are checked together rather than one at a time
+// because the answer is the same for all three -- the caller releases the
+// controller and the document does not open -- and because a partially built
+// window is worse than no window.
+- (BOOL)buildInterface
 {
     NSWindow *window = [self window];
 
@@ -157,18 +200,21 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
     // everything that does not claim a drag of its own ends up here.
     PVDropView *drop = [[[PVDropView alloc] initWithFrame:
                             [[window contentView] frame]] autorelease];
+    if (!drop) return NO;
     [drop setAutoresizingMask:(NSViewWidthSizable | NSViewHeightSizable)];
     [window setContentView:drop];
 
     NSRect content = [[window contentView] bounds];
 
     _splitView = [[NSSplitView alloc] initWithFrame:content];
+    if (!_splitView) return NO;
     [_splitView setVertical:YES];
     [_splitView setDividerStyle:NSSplitViewDividerStyleThin];
     [_splitView setDelegate:self];
     [_splitView setAutoresizingMask:(NSViewWidthSizable | NSViewHeightSizable)];
 
     _scrollView = [[NSScrollView alloc] initWithFrame:content];
+    if (!_scrollView) return NO;
     [_scrollView setHasVerticalScroller:YES];
     [_scrollView setHasHorizontalScroller:YES];
     [_scrollView setAutohidesScrollers:YES];
@@ -179,6 +225,7 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
     [_scrollView setPostsFrameChangedNotifications:YES];
 
     _pageView = [[PVPageView alloc] initWithSource:_source cache:_pageCache];
+    if (!_pageView) return NO;
     [_pageView setDelegate:self];
     [_scrollView setDocumentView:_pageView];
 
@@ -209,6 +256,7 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
     [window setDelegate:self];
     [window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
     [window makeFirstResponder:_pageView];
+    return YES;
 }
 
 // Everything that holds an unretained pointer back to this controller is
@@ -220,10 +268,11 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
 {
     [[NSNotificationCenter defaultCenter] removeObserver:self];
 
-    // Before anything else it could still fire into. An NSTimer retains its
+    // Before anything else they could still fire into. An NSTimer retains its
     // target, so a live one here is both a use-after-teardown and a leak of
-    // the whole controller graph behind it.
+    // the whole controller graph behind it. Both timers, for one reason.
     [self cancelSettle];
+    [self cancelRetry];
 
     [_pageQueue  setDelegate:nil];
     [_thumbQueue setDelegate:nil];
@@ -273,7 +322,7 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
 {
     PVLiveAdjust("PVWindowController", -1);
     [self teardownReferences];
-    [_renderFailures release];
+    [self freeFailureTables];
     [_url release];
     [_thumbScrollView release];
     [_thumbView release];
@@ -428,58 +477,330 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
 
 #pragma mark - Unrenderable pages
 
-// Three attempts, then the page is left alone. One is too few -- a bitmap
+// Three attempts, then that bitmap is left alone. One is too few -- a bitmap
 // context that could not be allocated under a momentary spike deserves another
 // go -- and an unbounded number is the bug this exists to close.
 #define PV_MAX_RENDER_ATTEMPTS 3
-// A document broken enough to fill this table is broken enough that there is
-// nothing useful left to remember about it, and the table must not become the
-// unbounded thing it was added to prevent.
-#define PV_MAX_FAILED_PAGES    512
 
+// Attempts for a failure that was about the machine rather than the page, and
+// the first delay between them.
+//
+// Six, doubling from a quarter of a second, is a little over eight seconds of
+// patience spread across increasing gaps. That covers the whole span of what
+// transient means here -- another application's memory spike, a helper killed
+// for missing its deadline, shared memory momentarily exhausted -- without ever
+// becoming a spin. Past it the slot goes quiet until something resets it, which
+// is not the same as the page being declared unrenderable: see
+// -pageIsUnrenderable:preview:.
+#define PV_MAX_TRANSIENT_RETRIES   6
+#define PV_TRANSIENT_BACKOFF_BASE  0.25
+
+// Allocate the two failure tables for a document of `pages` pages. Called once,
+// from -initWithSource:url:. A failure to allocate is survivable: every read
+// below treats a NULL table as "nothing has failed".
+- (void)allocateFailureTablesForPages:(NSUInteger)pages
+{
+    _failureSlots = 0;
+    if (pages == 0 || pages > SIZE_MAX / 2) return;
+    if (pages > SIZE_MAX / (2 * sizeof(CGSize))) return;
+    _pageFailures     = (uint8_t *)calloc(pages * 2, sizeof(uint8_t));
+    _thumbFailures    = (uint8_t *)calloc(pages, sizeof(uint8_t));
+    _pageTransient    = (uint8_t *)calloc(pages * 2, sizeof(uint8_t));
+    _thumbTransient   = (uint8_t *)calloc(pages, sizeof(uint8_t));
+    _pageRetryAt      = (double  *)calloc(pages * 2, sizeof(double));
+    _thumbRetryAt     = (double  *)calloc(pages, sizeof(double));
+    _pageFailureSize  = (CGSize  *)calloc(pages * 2, sizeof(CGSize));
+    _thumbFailureSize = (CGSize  *)calloc(pages, sizeof(CGSize));
+    if (!_pageFailures || !_thumbFailures || !_pageTransient ||
+        !_thumbTransient || !_pageRetryAt || !_thumbRetryAt ||
+        !_pageFailureSize || !_thumbFailureSize) {
+        [self freeFailureTables];
+        return;
+    }
+    _failureSlots = pages;
+}
+
+// All or nothing. Every read below treats a NULL table as "nothing has failed",
+// which is only a safe reading if the tables cannot disagree with each other
+// about whether they exist.
+- (void)freeFailureTables
+{
+    free(_pageFailures);     _pageFailures     = NULL;
+    free(_thumbFailures);    _thumbFailures    = NULL;
+    free(_pageTransient);    _pageTransient    = NULL;
+    free(_thumbTransient);   _thumbTransient   = NULL;
+    free(_pageRetryAt);      _pageRetryAt      = NULL;
+    free(_thumbRetryAt);     _thumbRetryAt     = NULL;
+    free(_pageFailureSize);  _pageFailureSize  = NULL;
+    free(_thumbFailureSize); _thumbFailureSize = NULL;
+    _failureSlots = 0;
+}
+
+// The slot for one page bitmap: full and preview are counted apart.
+- (NSUInteger)failureSlotForPage:(NSUInteger)page preview:(BOOL)preview
+{
+    return page * 2 + (preview ? 1 : 0);
+}
+
+// A slot whose counters describe a different bitmap than the one now being
+// asked about is a slot with nothing to say. Clears it and records the new size.
+//
+// Called only when a failure is being RECORDED, which is the moment the size is
+// known for certain. The queries below cannot do this -- most of them have a
+// page number and nothing else -- and they do not need to: a size change that
+// arrives through zoom or a window resize already resets every slot, and this
+// catches whatever reaches a counter by another route.
+- (void)prepareFailureSlot:(NSUInteger)slot
+                     sizes:(CGSize *)sizes
+                counters:(uint8_t *)counters
+                 transient:(uint8_t *)transient
+                   retryAt:(double *)retryAt
+                 pixelSize:(CGSize)px
+{
+    CGSize use = PVClampPixelSize(px);
+    CGSize had = sizes[slot];
+    // Exact equality, deliberately. These are the clamped integral sizes the
+    // renderer was actually given, not the floating-point request, so two
+    // bitmaps of the same size compare equal and a tolerance would only let a
+    // genuinely different bitmap inherit another's history.
+    if (had.width == use.width && had.height == use.height) return;
+    sizes[slot]     = use;
+    counters[slot]  = 0;
+    transient[slot] = 0;
+    retryAt[slot]   = 0;
+}
+
+// How long to wait before trying this slot again, having failed `attempts`
+// times transiently. Doubling from a quarter of a second: the first retry is
+// fast enough to be invisible when the pressure was momentary, and the last is
+// long enough that a machine genuinely out of memory is not being asked sixty
+// times a second to prove it.
+static double PVTransientBackoff(unsigned attempts)
+{
+    double delay = PV_TRANSIENT_BACKOFF_BASE;
+    unsigned i;
+    for (i = 1; i < attempts && delay < 8.0; i++) delay *= 2.0;
+    return delay;
+}
+
+- (BOOL)pageIsUnrenderable:(NSUInteger)page preview:(BOOL)preview
+{
+    // Nothing in this document can be drawn, so there is no point naming any of
+    // it. Asked before the tables, because this is not a fact the tables record.
+    if (_reportedRendererMissing) return YES;
+    if (!_pageFailures || page >= _failureSlots) return NO;
+    NSUInteger slot = [self failureSlotForPage:page preview:preview];
+    if (_pageFailures[slot] >= PV_MAX_RENDER_ATTEMPTS) return YES;
+    // Out of transient retries counts as unrenderable FOR NOW. It is not
+    // written into the permanent counter, so -resetRenderFailures -- a zoom, an
+    // emptied cache, the machine calming down -- brings the page back, which is
+    // the whole difference between this and a page Quartz will not draw.
+    if (_pageTransient[slot] >= PV_MAX_TRANSIENT_RETRIES) return YES;
+    // A backoff still outstanding: there is no point naming this page yet, and
+    // -notePageFailed:... has armed a timer to ask again when there is.
+    if (_pageRetryAt[slot] > 0 && PVMonotonicSeconds() < _pageRetryAt[slot])
+        return YES;
+    return NO;
+}
+
+// Nothing can be drawn for this page at all: both the full bitmap and the cheap
+// preview have run out of attempts. This is the question the wanted-set and the
+// express lane ask -- "is there any point naming this page" -- and it is NOT
+// the same as either slot on its own.
 - (BOOL)pageIsUnrenderable:(NSUInteger)page
 {
-    if (!_renderFailures) return NO;
-    NSNumber *n = [_renderFailures objectForKey:
-                      [NSNumber numberWithUnsignedLongLong:(unsigned long long)page]];
-    return (n && [n intValue] >= PV_MAX_RENDER_ATTEMPTS);
+    return ([self pageIsUnrenderable:page preview:NO] &&
+            [self pageIsUnrenderable:page preview:YES]);
 }
 
-- (void)notePageFailed:(NSUInteger)page
+- (BOOL)thumbIsUnrenderable:(NSUInteger)page
 {
-    if (!_renderFailures) _renderFailures = [[NSMutableDictionary alloc] init];
-    NSNumber *key  = [NSNumber numberWithUnsignedLongLong:(unsigned long long)page];
-    NSNumber *seen = [_renderFailures objectForKey:key];
-    // The cap bounds the table without ever losing sight of a page already in
-    // it, so no page can slip its attempt limit by failing late.
-    if (!seen && [_renderFailures count] >= PV_MAX_FAILED_PAGES) return;
-    [_renderFailures setObject:[NSNumber numberWithInt:[seen intValue] + 1] forKey:key];
+    if (_reportedRendererMissing) return YES;
+    if (!_thumbFailures || page >= _failureSlots) return NO;
+    if (_thumbFailures[page] >= PV_MAX_RENDER_ATTEMPTS) return YES;
+    if (_thumbTransient[page] >= PV_MAX_TRANSIENT_RETRIES) return YES;
+    if (_thumbRetryAt[page] > 0 && PVMonotonicSeconds() < _thumbRetryAt[page])
+        return YES;
+    return NO;
 }
 
-// Called for anything that changes the question being asked of CoreGraphics --
+// Record one failure against one bitmap, and say whether it is worth asking
+// again -- which is the entire reason the renderer now reports a reason.
+//
+// Only a deterministic refusal spends a permanent attempt. A page CoreGraphics
+// will not draw is a fact about the document that three tries confirm; a page
+// that lost a race for shared memory, or whose helper was killed for missing a
+// deadline, is a fact about the machine at one instant, and treating the two
+// alike is what put valid pages permanently blank on a busy Mac.
+- (BOOL)noteFailureInSlot:(NSUInteger)slot
+                 counters:(uint8_t *)counters
+                transient:(uint8_t *)transient
+                  retryAt:(double *)retryAt
+                  failure:(PVRenderFailure)failure
+{
+    switch (failure) {
+        case PVRenderFailureInvalidPage:
+            if (counters[slot] < PV_MAX_RENDER_ATTEMPTS) counters[slot]++;
+            retryAt[slot] = 0;
+            return (counters[slot] < PV_MAX_RENDER_ATTEMPTS);
+
+        case PVRenderFailureHelperUnavailable:
+            // Not a property of this page and not worth counting against it:
+            // every page will fail the same way until the installation is
+            // repaired. Reported once, at the document level.
+            [self presentRendererUnavailable];
+            return NO;
+
+        case PVRenderFailureTransientResource:
+        case PVRenderFailureTimeout:
+        case PVRenderFailureProtocol:
+        default:
+            if (transient[slot] < PV_MAX_TRANSIENT_RETRIES) transient[slot]++;
+            if (transient[slot] >= PV_MAX_TRANSIENT_RETRIES) {
+                retryAt[slot] = 0;
+                return NO;
+            }
+            retryAt[slot] = PVMonotonicSeconds() +
+                            PVTransientBackoff(transient[slot]);
+            [self scheduleRetryAt:retryAt[slot]];
+            return YES;
+    }
+}
+
+- (BOOL)notePageFailed:(NSUInteger)page
+               preview:(BOOL)preview
+             pixelSize:(CGSize)px
+               failure:(PVRenderFailure)failure
+{
+    if (!_pageFailures || page >= _failureSlots) return NO;
+    NSUInteger slot = [self failureSlotForPage:page preview:preview];
+    [self prepareFailureSlot:slot sizes:_pageFailureSize counters:_pageFailures
+                   transient:_pageTransient retryAt:_pageRetryAt pixelSize:px];
+    return [self noteFailureInSlot:slot counters:_pageFailures
+                         transient:_pageTransient retryAt:_pageRetryAt
+                           failure:failure];
+}
+
+- (BOOL)noteThumbFailed:(NSUInteger)page
+              pixelSize:(CGSize)px
+                failure:(PVRenderFailure)failure
+{
+    if (!_thumbFailures || page >= _failureSlots) return NO;
+    [self prepareFailureSlot:page sizes:_thumbFailureSize counters:_thumbFailures
+                   transient:_thumbTransient retryAt:_thumbRetryAt pixelSize:px];
+    return [self noteFailureInSlot:page counters:_thumbFailures
+                         transient:_thumbTransient retryAt:_thumbRetryAt
+                           failure:failure];
+}
+
+// Ask again once the earliest outstanding backoff has expired.
+//
+// Its own timer rather than -scheduleSettle's. The settle timer is the end of a
+// movement and is cancelled and re-armed by every scroll event; a retry pinned
+// to it would be pushed forward indefinitely by a reader who keeps scrolling,
+// which is exactly the reader whose pages are missing.
+- (void)scheduleRetryAt:(double)deadline
+{
+    if (_closing) return;
+    double now = PVMonotonicSeconds();
+    double delay = deadline - now;
+    if (delay < 0.01) delay = 0.01;
+    // An earlier deadline supersedes a later one; a later one is already
+    // covered, because the fire re-examines every slot.
+    if (_retryTimer && _retryTimerAt > 0 && _retryTimerAt <= deadline) return;
+    [_retryTimer invalidate];
+    _retryTimerAt = deadline;
+    _retryTimer = [NSTimer timerWithTimeInterval:delay
+                                          target:self
+                                        selector:@selector(retryFired:)
+                                        userInfo:nil
+                                         repeats:NO];
+    [[NSRunLoop currentRunLoop] addTimer:_retryTimer forMode:NSRunLoopCommonModes];
+}
+
+- (void)cancelRetry
+{
+    [_retryTimer invalidate];
+    _retryTimer = nil;           // never retained by us; the run loop held it
+    _retryTimerAt = 0;
+}
+
+- (void)retryFired:(NSTimer *)timer
+{
+    _retryTimer = nil;
+    _retryTimerAt = 0;
+    if (_closing || !_pageView) return;
+    // The expired backoffs are not cleared here. -pageIsUnrenderable: compares
+    // the deadline against the clock, so a slot whose wait is over is simply
+    // eligible again; clearing them would be a second place that has to agree
+    // about which slots those are.
+    _haveRequestState = NO;
+    _haveThumbState = NO;
+    [self updateVisibleContent];
+}
+
+// The renderer is missing from the bundle. Said once per document, because it
+// is one fact about the installation and not one per page.
+- (void)presentRendererUnavailable
+{
+    if (_closing || _reportedRendererMissing) return;
+    _reportedRendererMissing = YES;
+    NSAlert *alert = [[[NSAlert alloc] init] autorelease];
+    [alert setMessageText:@"Postview cannot render this document."];
+    [alert setInformativeText:
+        @"Its renderer is missing from the application bundle. "
+        @"Reinstall Postview from the original archive."];
+    [alert addButtonWithTitle:@"OK"];
+    [alert beginSheetModalForWindow:[self window]
+                      modalDelegate:nil
+                     didEndSelector:NULL
+                        contextInfo:NULL];
+}
+
+// Called for anything that changes the question being asked of the renderer --
 // a different pixel size, an emptied cache, a window that has come back into
 // view after the machine calmed down. Retrying then is worth it; retrying on
 // every scroll event is what had to stop.
 - (void)resetRenderFailures
 {
-    if ([_renderFailures count] > 0) [_renderFailures removeAllObjects];
+    if (!_pageFailures) return;
+    memset(_pageFailures,     0, _failureSlots * 2);
+    memset(_thumbFailures,    0, _failureSlots);
+    memset(_pageTransient,    0, _failureSlots * 2);
+    memset(_thumbTransient,   0, _failureSlots);
+    memset(_pageRetryAt,      0, _failureSlots * 2 * sizeof(double));
+    memset(_thumbRetryAt,     0, _failureSlots * sizeof(double));
+    memset(_pageFailureSize,  0, _failureSlots * 2 * sizeof(CGSize));
+    memset(_thumbFailureSize, 0, _failureSlots * sizeof(CGSize));
+    // _reportedRendererMissing is deliberately NOT cleared. A zoom or an
+    // emptied cache changes the question being asked of the renderer; it does
+    // not put a renderer back in the bundle.
+    [self cancelRetry];
 }
 
-// The user has done something, so whatever the machine was complaining about
-// a moment ago is worth re-testing. Seven different events mean this and each
-// used to say so in its own words; stating it once is what keeps the pressure
-// backoff and the prefetch suppression from drifting apart.
+// The user has done something. That used to clear the pressure state, on the
+// theory that a fresh action deserves fresh full-resolution pages -- but the
+// user scrolling says nothing whatsoever about whether the kernel is still
+// short of memory, and clearing it here meant a single scroll re-enabled
+// full-resolution rendering and prefetching on a machine the kernel had just
+// called critical. Scrolling is exactly what a user does while waiting for a
+// machine under pressure to recover, so the reset fired constantly at the
+// worst possible time.
+//
+// Only DISPATCH_MEMORYPRESSURE_NORMAL clears it now: the kernel is the only
+// thing that knows, and it does say so. Kept as a named no-op because the call
+// sites read correctly -- they are the places that would have to change if
+// anything else ever becomes activity-scoped.
 - (void)noteUserActivity
 {
-    _pressureReports = 0;
 }
 
 // Prefetching full-resolution bitmaps is the first thing to give up under
 // memory pressure: those are the very bitmaps that were just dropped.
 - (BOOL)wantsFullPrefetch  { return (_pressureReports == 0); }
 
-// Full-resolution rendering of the pages actually on screen survives one
-// pressure report and stops at the second. See _pressureReports.
+// Full-resolution rendering of the pages actually on screen survives a warning
+// and stops at critical. See _pressureReports.
 - (BOOL)wantsFullRenders   { return (_pressureReports < 2); }
 
 #pragma mark - Deciding what to render
@@ -539,8 +860,10 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
 // measured, which every consumer treats as "no evidence" and therefore renders.
 - (double)scrollSpeedAge
 {
+    // Same clock the samples are taken on, or the age is a difference between
+    // two different clocks.
     return (_lastScrollTime > 0)
-         ? ([NSDate timeIntervalSinceReferenceDate] - _lastScrollTime)
+         ? (PVMonotonicSeconds() - _lastScrollTime)
          : HUGE_VAL;
 }
 
@@ -757,12 +1080,13 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
         CGSize prevPx = CGSizeMake(ceil(fullPx.width  / PV_PREVIEW_DIVISOR),
                                    ceil(fullPx.height / PV_PREVIEW_DIVISOR));
 
-        if (![_pageCache hasPreviewForPage:i]) {
+        if (![_pageCache hasPreviewForPage:i] &&
+            ![self pageIsUnrenderable:i preview:YES]) {
             if ([self bitmapSurvivesMotion:prevPx preview:YES
                                      dwell:dwell age:age policy:policy]) {
-                [reqs addObject:[PVRenderRequest page:i
+                PVAddRequest(reqs, [PVRenderRequest page:i
                     pixels:prevPx
-                    priority:PVPriorityVisiblePreview preview:YES express:cold]];
+                    priority:PVPriorityVisiblePreview preview:YES express:cold]);
             } else {
                 PVStatAdd(PVStatRequestsSuppressed, 1);
             }
@@ -780,7 +1104,7 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
         // beside it correctly suppressed 323 and 47 requests respectively. The
         // throttle was working and reporting a healthy suppression rate for
         // the cheap half of the work while the expensive half walked past it.
-        if (fullsAllowed) {
+        if (fullsAllowed && ![self pageIsUnrenderable:i preview:NO]) {
             if (![_pageCache fullImageForPage:i pixelSize:fullPx]) {
                 if ([self bitmapSurvivesMotion:fullPx preview:NO
                                          dwell:dwell age:age policy:policy]) {
@@ -788,10 +1112,10 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
                     // previews so it sorts immediately behind its own page's
                     // preview, rather than behind every other page's preview.
                     // Without this the page being read went sharp last.
-                    [reqs addObject:[PVRenderRequest page:i pixels:fullPx
+                    PVAddRequest(reqs, [PVRenderRequest page:i pixels:fullPx
                                                  priority:(cold ? PVPriorityVisiblePreview
                                                                 : PVPriorityVisibleFull)
-                                                  preview:NO express:cold]];
+                                                  preview:NO express:cold]);
                     // A sharp page asked for while the document is still moving
                     // is the cost model's other direction, and it only happens
                     // on mains power. Counted separately from the renders that
@@ -858,6 +1182,7 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
     for (k = 0; k < [near count]; k++) {
         NSUInteger p = (NSUInteger)[[near objectAtIndex:k] integerValue];
         if ([_pageCache hasPreviewForPage:p]) continue;
+        if ([self pageIsUnrenderable:p preview:YES]) continue;
         CGSize px     = [_pageView pixelSizeForPage:p];
         CGSize prevPx = CGSizeMake(ceil(px.width  / PV_PREVIEW_DIVISOR),
                                    ceil(px.height / PV_PREVIEW_DIVISOR));
@@ -869,9 +1194,9 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
         if ([self bitmapSurvivesMotion:prevPx preview:YES
                                  dwell:[self secondsPageStaysVisible:p]
                                    age:age policy:policy]) {
-            [reqs addObject:[PVRenderRequest page:p
+            PVAddRequest(reqs, [PVRenderRequest page:p
                 pixels:prevPx
-                priority:PVPriorityNearPreview preview:YES]];
+                priority:PVPriorityNearPreview preview:YES]);
         } else {
             PVStatAdd(PVStatRequestsSuppressed, 1);
         }
@@ -908,6 +1233,7 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
         [self wantsFullPrefetch]) {
         for (k = 0; k < fullPrefetchLimit; k++) {
             NSUInteger p = (NSUInteger)[[near objectAtIndex:k] integerValue];
+            if ([self pageIsUnrenderable:p preview:NO]) continue;
             CGSize px = [_pageView pixelSizeForPage:p];
             if (![_pageCache fullImageForPage:p pixelSize:px]) {
                 // The per-page test is not optional here the way it was while
@@ -924,8 +1250,8 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
                     PVStatAdd(PVStatCostSuppressed, 1);
                     continue;
                 }
-                [reqs addObject:[PVRenderRequest page:p pixels:px
-                                             priority:PVPriorityNearFull preview:NO]];
+                PVAddRequest(reqs, [PVRenderRequest page:p pixels:px
+                                             priority:PVPriorityNearFull preview:NO]);
                 if (moving) PVStatAdd(PVStatCostAdmitted, 1);
             }
         }
@@ -1032,6 +1358,26 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
 {
     if (_closing || !image) return;
     if (queue == _pageQueue) {
+        // A full bitmap that arrives after the kernel called the machine
+        // critical is exactly the bitmap the pressure handler just dropped.
+        //
+        // -memoryPressure: empties the full images out of the cache and stops
+        // the wanted-set asking for more, but it cannot stop a rasterisation
+        // that is already running: that work is inside a helper process and the
+        // result is on its way. Storing it undid the release completely -- two
+        // lanes could put ~56 MB straight back into a cache that had been
+        // emptied one instant earlier, on a machine the kernel had just said
+        // was out of memory, and nothing would remove it again until the next
+        // pressure event.
+        //
+        // Dropped before ANY cache mutation, so the eviction pass below never
+        // runs for a bitmap that is not going to be kept.
+        if (!preview && ![self wantsFullRenders]) {
+            // The promotion is spent either way; see the trailing-page case
+            // below for the same reasoning.
+            if (page == _expressPage) _expressPage = NSNotFound;
+            return;
+        }
         // A full bitmap for a page the viewport has already left is ~27 MB
         // that will never be drawn. Storing it is not free: it spends the
         // cache's byte budget, and paying it out evicts something that is
@@ -1128,13 +1474,55 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
           pixelSize:(CGSize)px
             preview:(BOOL)preview
 {
+    // The queue prefers the reason-carrying method below wherever the delegate
+    // implements it, so nothing in the running app arrives here. Forwarded as
+    // the most conservative reading -- a page that will not draw -- because a
+    // caller that could not say why is a caller with no evidence that trying
+    // again would help.
+    [self renderQueue:queue didFailPage:page pixelSize:px preview:preview
+              failure:PVRenderFailureInvalidPage];
+}
+
+- (void)renderQueue:(PVRenderQueue *)queue
+        didFailPage:(NSUInteger)page
+          pixelSize:(CGSize)px
+            preview:(BOOL)preview
+            failure:(PVRenderFailure)failure
+{
     if (_closing) return;
-    if (queue != _pageQueue) return;      // a missing thumbnail is not worth tracking
-    [self notePageFailed:page];
-    // Nothing is going to make this page sharp, so stop paying raised-QoS
-    // energy for it. Left armed, it re-promoted a doomed render every time the
-    // wanted-set was rebuilt.
-    if (page == _expressPage) _expressPage = NSNotFound;
+
+    // A retry has to be arranged here rather than left to the next scroll
+    // event. A page that fails once while the document is stationary was
+    // otherwise never asked for again -- the wanted-set is rebuilt from the
+    // viewport, and a viewport that is not moving produces the same set, which
+    // the early-out then declines to re-request. One transient allocation
+    // failure on a page nobody scrolled past retired it for the session.
+    //
+    // And thumbnail failures were dropped entirely, on the grounds that a
+    // missing thumbnail is cosmetic. It is, once; permanently blank because
+    // nothing ever asked again is not.
+    //
+    // What is arranged depends on WHY. A transient failure books its own timer
+    // inside -notePageFailed:..., because its backoff is longer than a settle
+    // and must not be pushed forward by scrolling; a deterministic one gets the
+    // settle it always got, up to the third attempt. Both end with the wanted
+    // set rebuilt, which is what actually re-asks.
+    if (queue == _pageQueue) {
+        BOOL again = [self notePageFailed:page preview:preview
+                                pixelSize:px failure:failure];
+        // Nothing is going to make this page sharp, so stop paying raised-QoS
+        // energy for it. Left armed, it re-promoted a doomed render every time
+        // the wanted-set was rebuilt.
+        if (page == _expressPage) _expressPage = NSNotFound;
+        _haveRequestState = NO;
+
+        if (again && failure == PVRenderFailureInvalidPage) [self scheduleSettle];
+        else if (!again)                                    [self updateVisibleContent];
+    } else if (queue == _thumbQueue) {
+        BOOL again = [self noteThumbFailed:page pixelSize:px failure:failure];
+        _haveThumbState = NO;
+        if (again && failure == PVRenderFailureInvalidPage) [self scheduleSettle];
+    }
 }
 
 #pragma mark - Notifications
@@ -1152,16 +1540,31 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
     // Speed, from the same two numbers that already gave direction. A gap
     // longer than half a second is not a scroll, it is two separate ones, and
     // averaging across it would report a speed that never happened.
-    double now = [NSDate timeIntervalSinceReferenceDate];
+    //
+    // Monotonic, not wall clock. This used to read
+    // -[NSDate timeIntervalSinceReferenceDate], which NTP steps, the user steps
+    // by changing the time zone, and the system steps on waking from sleep. A
+    // backward step made `dt` negative, which matched none of the branches
+    // below -- so the stale speed from before the step survived untouched and
+    // was then stamped with a fresh timestamp, making it look freshly measured.
+    // A reading session judged as a flick suppresses every sharp page, and
+    // nothing clears it until the next real scroll.
+    double now = PVMonotonicSeconds();
     double dt  = now - _lastScrollTime;
-    if (_lastScrollTime > 0 && dt >= 0.002 && dt < 0.5) {
+
+    // A negative or non-finite interval means the clock, not the user. Treat
+    // the previous sample as unusable rather than keeping it: no evidence is a
+    // state every consumer already handles, and it is the truthful one here.
+    if (_lastScrollTime > 0 && (!isfinite(dt) || dt < 0.0)) {
+        _scrollSpeed = 0;
+    } else if (_lastScrollTime > 0 && dt >= 0.002 && dt < 0.5) {
         double v = fabs((double)(y - _lastScrollY)) / dt;
         // A jump is not a speed; see PV_MAX_SCROLL_SPEED.
         // Seeded with the first sample rather than ramped up from zero: a
         // smoothed average starting at rest needs four or five samples to
         // reach the truth, and those are exactly the first four or five pages
         // of a flick -- the ones the throttle exists to skip.
-        if (v <= PV_MAX_SCROLL_SPEED)
+        if (isfinite(v) && v <= PV_MAX_SCROLL_SPEED)
             _scrollSpeed = (_scrollSpeed > 0) ? (_scrollSpeed * 0.7 + v * 0.3) : v;
     } else if (_lastScrollTime > 0 && dt >= 0.5) {
         // Half a second of stillness ends a scroll. Skipping the update here
@@ -1264,16 +1667,30 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
 // returns the unchanged zoom for custom and 1.0 for actual size, so nothing is
 // recomputed that should not be, and the page and fraction the user was
 // looking at are preserved either way.
+// Nothing at all happens per frame of a live resize.
+//
+// This used to skip only -updateVisibleContent mid-drag and still run
+// -currentPageWithFraction: and -relayoutKeepingPage: on every frame. Both are
+// O(page count): the relayout walks every page to recompute its frame, and the
+// intermediate geometry it computes is thrown away by the next frame a
+// sixtieth of a second later. On a 100,000-page document that is two full
+// passes over the page table per frame, on the main thread, for the entire
+// duration of the drag -- so the window itself stops tracking the mouse.
+//
+// The frames that matter are the last one, which -windowDidEndLiveResize:
+// handles, and every frame outside a drag, which still runs the pass in full.
+// Mid-drag the cached bitmaps are simply stretched, which is what they were
+// already doing.
 - (void)scrollViewFrameChanged:(NSNotification *)note
 {
     if (!_didInitialLayout || _closing) return;
     _haveRequestState = NO;
-    CGFloat f = 0;
-    NSUInteger p = [self currentPageWithFraction:&f];
-    [self relayoutKeepingPage:p fraction:f];
-    // Mid-drag the cached bitmaps are simply stretched; the sharp re-render is
-    // requested once the user lets go of the window edge.
-    if (![_pageView inLiveResize]) [self updateVisibleContent];
+    if ([_pageView inLiveResize]) return;
+
+    CGFloat fraction = 0;
+    NSUInteger page = [self currentPageWithFraction:&fraction];
+    [self relayoutKeepingPage:page fraction:fraction];
+    [self updateVisibleContent];
 }
 
 // The one pass that -scrollViewFrameChanged: skipped for every step of the
@@ -1289,8 +1706,18 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
 - (void)windowDidEndLiveResize:(NSNotification *)note
 {
     if (_closing || !_didInitialLayout) return;
+
+    // The relayout now happens HERE rather than per frame, because
+    // -scrollViewFrameChanged: no longer does it mid-drag. This is the geometry
+    // the user settled on, and the only one worth computing.
+    CGFloat fraction = 0;
+    NSUInteger page = [self currentPageWithFraction:&fraction];
+    // A page that would not rasterise at the old size is a different question
+    // at the new one, so retired pages get another chance -- exactly as they do
+    // after a zoom.
+    [self resetRenderFailures];
+    [self relayoutKeepingPage:page fraction:fraction];
     _haveRequestState = NO;
-    [self noteUserActivity];
     [self updateVisibleContent];
 }
 
@@ -1310,16 +1737,35 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
 {
     if (_closing) return;
     BOOL visible = ([[self window] occlusionState] & NSWindowOcclusionStateVisible) != 0;
+
     // Fully covered or minimised: stop rendering entirely until it comes back.
-    [_pageQueue  setSuspended:!visible];
-    [_thumbQueue setSuspended:!visible];
-    if (visible) {
-        // Coming back into view is a fresh start: whatever made a page fail, or
-        // made memory tight, was minutes ago and is worth testing again.
-        [self resetRenderFailures];
-        [self noteUserActivity];
-        [self updateVisibleContent];
+    if (!visible) {
+        [_pageQueue  setSuspended:YES];
+        [_thumbQueue setSuspended:YES];
+        return;
     }
+
+    // Coming back into view is a fresh start: whatever made a page fail was
+    // minutes ago and is worth testing again.
+    //
+    // Order matters here, and used to be the other way round. -setSuspended:NO
+    // pumps the queue, and the queue's pending set is still the one from before
+    // the window was covered -- so unsuspending first started an obsolete
+    // render, at whatever zoom and page the window had minutes ago, and
+    // CGContextDrawPDFPage cannot be cancelled once it is inside a page. The
+    // work the user actually wants then waits behind a full Haswell core spent
+    // on a bitmap that is thrown away on arrival.
+    //
+    // Rebuilding the desired sets while the queues are still suspended means
+    // the first thing either of them runs is already the right thing.
+    _haveRequestState = NO;
+    _haveThumbState   = NO;
+    [self resetRenderFailures];
+
+    [self updateVisibleContent];
+
+    [_pageQueue  setSuspended:NO];
+    [_thumbQueue setSuspended:NO];
 }
 
 - (void)backingPropertiesChanged:(NSNotification *)note
@@ -1344,34 +1790,57 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
     [self updateVisibleContent];
 }
 
+// The kernel's pressure level, not a count of how many times it has spoken.
+//
+// This used to increment a counter per notification and derive the response
+// from that. Two things break under it. Events coalesce, so a machine that
+// goes straight to critical while this process is idle delivers ONE callback:
+// the counter reads 1, which is the first-warning response, and the
+// first-warning response re-renders every visible page at full resolution --
+// the largest allocation the app can make, made in answer to the kernel saying
+// it is nearly out of memory. And the level was never read at all, so a
+// critical event and a mild warning were indistinguishable no matter how many
+// arrived.
+//
+// The state is now the level itself. CRITICAL goes directly to the strictest
+// response without having to be told twice; WARN raises the state to the first
+// tier but never lowers it, so a WARN arriving after a CRITICAL does not
+// promote the machine back to a state the kernel has not reported; and only a
+// NORMAL event -- the kernel saying it is over -- clears it.
 - (void)memoryPressure:(NSNotification *)note
 {
     if (_closing) return;
-    [_pageCache dropFullImages];
-    [_thumbCache dropFullImages];
-    // Thumbnails are stored as previews and so survive this, but the cache is
-    // free to change what it drops and the early-out must not be the thing that
-    // notices last. Pressure is rare; a rebuilt wanted set costs nothing here.
-    _haveThumbState = NO;
 
-    // The previews survive the drop, so there is something to draw immediately
-    // and the pages on screen do not blank.
-    //
-    // What must not happen is answering every report the same way. The first
-    // one suppresses prefetch -- those are exactly the bitmaps just released,
-    // and re-rendering them undoes the drop within milliseconds. But the pages
-    // on screen were still re-requested at full resolution, and on a machine
-    // that stays tight that is its own loop: drop, render, drop, render, with
-    // a background thread busy the whole time and the visible pages flickering
-    // between sharp and soft. The kernel reports pressure on every transition,
-    // and re-filling the cache is what causes the next transition.
-    //
-    // So the second report with no user action in between stops asking for
-    // full-resolution pages at all. Previews are a ninth the size and are kept,
-    // so the document stays readable; it just stops being re-sharpened at the
-    // machine's expense. -noteUserActivity puts it back the moment the user
-    // touches anything.
-    if (_pressureReports < NSUIntegerMax) _pressureReports++;
+    // A notification with no level is treated as a warning. That is the
+    // conservative reading: it never under-reacts, and the only way to get one
+    // is a poster that predates the userInfo.
+    NSNumber *encoded = [[note userInfo] objectForKey:@"PVMemoryPressureFlags"];
+    unsigned long flags = encoded ? [encoded unsignedLongValue]
+                                  : DISPATCH_MEMORYPRESSURE_WARN;
+
+    if (flags & DISPATCH_MEMORYPRESSURE_CRITICAL) {
+        _pressureReports = 2;
+    } else if (flags & DISPATCH_MEMORYPRESSURE_WARN) {
+        if (_pressureReports < 1) _pressureReports = 1;
+    } else if (flags & DISPATCH_MEMORYPRESSURE_NORMAL) {
+        _pressureReports = 0;
+    }
+
+    // Previews survive this, so there is something to draw immediately and the
+    // pages on screen do not blank. Only drop on an actual pressure event: a
+    // NORMAL event is the all-clear and there is nothing to release for it.
+    if (flags & (DISPATCH_MEMORYPRESSURE_WARN |
+                 DISPATCH_MEMORYPRESSURE_CRITICAL)) {
+        [_pageCache dropFullImages];
+        [_thumbCache dropFullImages];
+    }
+
+    // Thumbnails are stored as previews and so survive the drop, but the cache
+    // is free to change what it drops and the early-out must not be the thing
+    // that notices last. Pressure is rare; a rebuilt wanted set costs nothing
+    // here.
+    _haveRequestState = NO;
+    _haveThumbState = NO;
 
     [_pageView  setNeedsDisplay:YES];
     [_thumbView setNeedsDisplay:YES];
@@ -1389,8 +1858,13 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
         _thumbSource = [[PVPDFSource alloc] initWithURL:_url geometryFrom:_source error:&err];
         if (!_thumbSource) return;
         _thumbCache = [[PVImageCache alloc] initWithBudget:PVThumbCacheBudget()];
+        // One lane, explicitly. A thumbnail is ~1/100 the pixels of a page, so
+        // the strip has never been what a reader waits on; a second lane here
+        // would spend a second PVPDFSource and a second helper process
+        // parallelising the cheap half of the work.
         _thumbQueue = [[PVRenderQueue alloc] initWithSource:_thumbSource
-                                                      label:"com.postview.render.thumbs"];
+                                                      label:"com.postview.render.thumbs"
+                                                   maxLanes:1];
         if (!_thumbCache || !_thumbQueue) {
             [_thumbQueue release]; _thumbQueue = nil;
             [_thumbCache release]; _thumbCache = nil;
@@ -1443,24 +1917,62 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
     [self updateThumbnailContent];
 }
 
+// Putting the sidebar away tears it down completely.
+//
+// It used to release the thumbnail BITMAPS and keep everything that made them:
+// a second PVPDFSource -- its own snapshot handle, its own helper process, its
+// own geometry table, one CGSize per page -- plus a render queue with a
+// dispatch queue and a worker, a cache, the strip view with a label per page,
+// the scroll view, and a bounds observer. All of it stayed until the document
+// closed, for a sidebar the user has explicitly dismissed. On a large document
+// the geometry table alone is megabytes, and the helper process is a whole
+// second process sitting idle.
+//
+// -showSidebar already rebuilds every one of those from nothing when
+// _thumbSource is nil, which is the state this leaves behind, so reopening
+// costs one construction rather than being free -- and that is the right trade
+// for something that is closed far more often than it is reopened.
+//
+// Safe with a render in flight: -shutdown makes the queue drop its results, and
+// the worker block retains the queue, so the object outlives whatever it
+// started. The delegate is cleared first so nothing is delivered to a
+// controller that has already let go of the cache the result would go into.
 - (void)hideSidebar
 {
     if (!_sidebarVisible) return;
     _sidebarVisible = NO;
+
+    // Before the scroll view goes: the observer is registered against its clip
+    // view, and an observer left registered against a released object is the
+    // one thing here that would not merely waste memory.
+    NSClipView *clip = [_thumbScrollView contentView];
+    if (clip) {
+        [[NSNotificationCenter defaultCenter]
+            removeObserver:self
+                      name:NSViewBoundsDidChangeNotification
+                    object:clip];
+    }
+
     [_thumbScrollView removeFromSuperview];
     [_splitView adjustSubviews];
 
-    // Nothing about thumbnails should cost anything once they are put away:
-    // stop the queue and release every rendered thumbnail bitmap.
-    [_thumbQueue setDesiredRequests:[NSArray array]];
+    [_thumbQueue setDelegate:nil];
+    [_thumbQueue shutdown];
+    [_thumbView setDelegate:nil];
     [_thumbCache removeAll];
-    // Every thumbnail just went. Reopening the strip at the page it was closed
-    // on gives the identical visible range, and without this the early-out in
-    // -updateThumbnailContent would recognise it and decline to ask for the
-    // bitmaps that no longer exist -- a sidebar of empty boxes until something
-    // else moved it.
+    [_thumbScrollView setDocumentView:nil];
+
+    [_thumbScrollView release]; _thumbScrollView = nil;
+    [_thumbView release];       _thumbView = nil;
+    [_thumbQueue release];      _thumbQueue = nil;
+    [_thumbCache release];      _thumbCache = nil;
+    [_thumbSource release];     _thumbSource = nil;
+
+    // Reopening at the page it was closed on gives the identical visible range,
+    // and without this the early-out in -updateThumbnailContent would recognise
+    // it and decline to ask for bitmaps that no longer exist -- a sidebar of
+    // empty boxes until something else moved it.
     _haveThumbState = NO;
-    [_thumbView setNeedsDisplay:YES];
 }
 
 - (void)thumbBoundsChanged:(NSNotification *)note
@@ -1502,9 +2014,10 @@ static const int kZoomStepCount = (int)(sizeof(kZoomSteps) / sizeof(kZoomSteps[0
     NSUInteger i;
     for (i = range.location; i < NSMaxRange(range) && i < [_source pageCount]; i++) {
         if ([_thumbCache hasPreviewForPage:i]) continue;
-        [reqs addObject:[PVRenderRequest page:i
+        if ([self thumbIsUnrenderable:i]) continue;
+        PVAddRequest(reqs, [PVRenderRequest page:i
                                        pixels:[_thumbView pixelSizeForPage:i]
-                                     priority:PVPriorityVisiblePreview preview:YES]];
+                                     priority:PVPriorityVisiblePreview preview:YES]);
     }
     [_thumbQueue setDesiredRequests:reqs];
 }

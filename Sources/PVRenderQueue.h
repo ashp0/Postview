@@ -69,11 +69,44 @@
         didFailPage:(NSUInteger)page
           pixelSize:(CGSize)px
             preview:(BOOL)preview;
+// The same failure, carrying WHY.
+//
+// Preferred over the method above when the delegate implements it; exactly one
+// of the two is called per failure. Added rather than folded in for the same
+// reason -renderSeconds: was: the collectors in the test suites do not have a
+// retry policy to inform, and would have grown a parameter they ignore.
+//
+// The distinction is not cosmetic. Every failure used to arrive as NULL, so a
+// page briefly starved of shared memory was indistinguishable from a page
+// CoreGraphics will never draw, and three of the former retired a perfectly
+// good page for the rest of the session.
+- (void)renderQueue:(PVRenderQueue *)queue
+        didFailPage:(NSUInteger)page
+          pixelSize:(CGSize)px
+            preview:(BOOL)preview
+            failure:(PVRenderFailure)failure;
 @end
 
+// At most two render lanes, and only on mains power. See -initWithSource:label:.
+#define PV_MAX_RENDER_LANES 2
+
 @interface PVRenderQueue : NSObject {
-    PVPDFSource      *_source;
-    dispatch_queue_t  _queue;
+    // One serial lane per entry, each with its own PVPDFSource over the same
+    // immutable snapshot. Lane 0 always exists; lane 1 exists only when
+    // -initWithSource:label: decided this machine should have it, and
+    // _laneCount is the authority on that everywhere else.
+    //
+    // Sharded by page number, so a given page is always rendered by the same
+    // lane. That is what keeps two lanes from being two answers to the same
+    // question, and it is why the sharding is arithmetic rather than
+    // whichever-lane-is-free.
+    PVPDFSource      *_laneSource[PV_MAX_RENDER_LANES];
+    dispatch_queue_t  _laneQueue[PV_MAX_RENDER_LANES];
+    BOOL              _laneRunning[PV_MAX_RENDER_LANES];
+    // Per lane, for the same reason _expressYielded was per queue: the
+    // hand-back has to be bounded on the lane that performs it.
+    BOOL              _laneExpressYielded[PV_MAX_RENDER_LANES];
+    NSUInteger        _laneCount;
     NSLock           *_lock;
     NSMutableArray   *_pending;
     // Work that has been taken off _pending and not yet accounted for by the
@@ -86,16 +119,8 @@
     // heavy page could be rasterised two or three times over. Bounded by the
     // size of the pending set, because only the main thread adds to it.
     NSMutableArray   *_inFlight;
-    BOOL              _running;
     BOOL              _suspended;
     BOOL              _shutdown;
-    // Set when an ordinary worker has given up its slot so that pending
-    // express work can be re-dispatched at raised QoS, and cleared when a
-    // promoted block actually starts or when the express work goes away. It
-    // exists to bound that hand-back to one per episode: if the promotion
-    // cannot be created after all, the express work is simply rendered at
-    // background QoS rather than handed back and forth forever.
-    BOOL              _expressYielded;
     // Full-resolution bitmaps rasterised and not yet handed to the delegate.
     //
     // The quantity PV_MAX_INFLIGHT_FULL bounds. A bitmap counted here is ~28 MB
@@ -110,6 +135,22 @@
     // that has shut down never increments, because its result is released on
     // the spot instead of being dispatched.
     NSUInteger        _undeliveredFull;
+    // Full-resolution bitmaps a lane is rasterising RIGHT NOW.
+    //
+    // Guarded by _lock, and the other half of what PV_MAX_INFLIGHT_FULL is
+    // supposed to bound. _undeliveredFull alone counted bitmaps that already
+    // existed, which is a check with no reservation behind it: two lanes could
+    // pass it in the same instant, and a lane that had just handed one bitmap
+    // over could start a second before the first was delivered. Reproduced
+    // deterministically at three concurrent-or-undelivered full bitmaps
+    // against a declared limit of two -- ~84 MB where the design says ~56 MB,
+    // on a machine chosen for having enough cores to do it twice as fast.
+    //
+    // Incremented under the same lock acquisition that takes the request off
+    // _pending, so the slot is claimed and the work is taken in one indivisible
+    // step; decremented when the rasterisation ends, at which point the bitmap
+    // either becomes an undelivered one or nothing at all.
+    NSUInteger        _fullInProgress;
     // Guarded by _lock. Read on the render queue and cleared under the lock by
     // -shutdown, so a delivery can never race a deallocating delegate.
     __unsafe_unretained id <PVRenderQueueDelegate> _delegate;
@@ -122,6 +163,15 @@
     // page queue's rate and mixing them would be failure 2 in PVCostModel.h.
     PVCostModel      *_cost;
 }
+// `maxLanes` is a ceiling, not a request: the queue still decides from the
+// power source and the core count whether a second lane is worth having, and
+// clamps to PV_MAX_RENDER_LANES. Pass 1 for work where a second lane buys
+// nothing -- thumbnails are 1/100 the pixels of a page, so a second thumbnail
+// lane would cost a second PVPDFSource and a second helper process to
+// parallelise something that was never the bottleneck.
+- (id)initWithSource:(PVPDFSource *)source label:(const char *)label
+            maxLanes:(NSUInteger)maxLanes;
+// As above with maxLanes: PV_MAX_RENDER_LANES.
 - (id)initWithSource:(PVPDFSource *)source label:(const char *)label;
 - (void)setDelegate:(id <PVRenderQueueDelegate>)delegate;
 - (void)setDesiredRequests:(NSArray *)requests;
@@ -129,9 +179,23 @@
 - (void)shutdown;                       // must be called before release
 - (BOOL)isIdle;                         // for tests and soak instrumentation
 - (NSUInteger)inFlightCount;            // ditto: must always return to zero
-// Full bitmaps rasterised but not yet delivered. Never exceeds
-// PV_MAX_INFLIGHT_FULL, and returns to zero like the two above.
+// Full bitmaps rasterised but not yet delivered. Returns to zero like the two
+// above.
 - (NSUInteger)undeliveredFullCount;
+
+// Everything PV_MAX_INFLIGHT_FULL actually bounds: full bitmaps being
+// rasterised right now, plus full bitmaps rasterised and not yet delivered.
+//
+// This, and not -undeliveredFullCount, is the quantity the cap is a cap on.
+// A test that watched only the delivered half saw two and concluded the limit
+// held, while three full-page bitmaps were alive at once on a two-lane machine.
+// Never exceeds PV_MAX_INFLIGHT_FULL; returns to zero when the queue is idle.
+- (NSUInteger)fullCapacityInUse;
+
+// How many lanes this queue actually built. For tests: a forced two-lane
+// configuration that quietly fell back to one would satisfy every assertion
+// about the cap without having exercised it.
+- (NSUInteger)laneCount;
 
 // What this document's renders have been measured to cost. Never nil.
 //

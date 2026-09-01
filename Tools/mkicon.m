@@ -447,7 +447,7 @@ static void WritePNG(NSString *dir, NSString *name, int px)
     DrawIcon(c, (CGFloat)px);
     CGImageRef img = CGBitmapContextCreateImage(c);
     NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithCGImage:img];
-    NSData *png = [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+    NSData *png = [rep representationUsingType:NSPNGFileType properties:@{}];
     [png writeToFile:[dir stringByAppendingPathComponent:name] atomically:YES];
     CGImageRelease(img);
     CGContextRelease(c);

@@ -4,10 +4,35 @@
 //  shipping code paths.   make test
 
 #import "PVCommon.h"
-#include <dispatch/block.h>
 #include <dlfcn.h>
-#include <sys/qos.h>
 #include <unistd.h>
+
+// <dispatch/block.h> and <sys/qos.h> arrived in 10.10. On a real 10.9 SDK they
+// are not there to include, so the tests that pin the express lane's hardcoded
+// constants against the SDK's own cannot be compiled -- and requiring them
+// would mean this suite could not be built on the machine it is meant to
+// qualify. Where the SDK has them the constants are pinned; where it does not,
+// what is checked instead is that the lane degrades to its documented fallback.
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 101000
+#include <dispatch/block.h>
+#include <sys/qos.h>
+#define PV_TEST_HAS_QOS_SDK 1
+#else
+#define PV_TEST_HAS_QOS_SDK 0
+#endif
+
+// Whether this machine can report the QoS a block ran at. qos_class_self() is
+// 10.10+; on 10.9 there is nothing to observe and no promotion to observe it
+// on, which is a supported configuration rather than a failure.
+static BOOL QoSObservable(void)
+{
+    static BOOL resolved, answer;
+    if (!resolved) {
+        answer = (dlsym(RTLD_DEFAULT, "qos_class_self") != NULL);
+        resolved = YES;
+    }
+    return answer;
+}
 #import "PVPDFSource.h"
 #import "PVImageCache.h"
 #import "PVRenderQueue.h"
@@ -119,6 +144,33 @@ static void InkCoverage(CGImageRef img, double *outW, double *outH)
     free(buf);
 }
 
+// Many renders from ONE source, which is what a reading session is.
+//
+// The helper protocol names a POSIX shared-memory segment per render, and
+// shm_open refuses any name longer than 31 characters including the slash --
+// PSHMNAMLEN, not PATH_MAX, and nothing in the API hints at it. The first
+// scheme embedded the source pointer and a per-source counter and so grew by a
+// character every power of ten: it fitted for 99 renders and then failed for
+// every render afterwards, permanently, leaving blank pages behind.
+//
+// 250 is chosen to be past that cliff. Everything before it passed; the point
+// of the number is what comes after 99.
+static void TestSourceManyRenders(PVPDFSource *src)
+{
+    printf("\n[PVPDFSource: a long session's worth of renders from one source]\n");
+    NSUInteger produced = 0, i;
+    for (i = 0; i < 250; i++) {
+        @autoreleasepool {
+            CGImageRef im = [src createImageForPage:(i % [src pageCount])
+                                          pixelSize:CGSizeMake(80, 104)];
+            if (im) { produced++; CGImageRelease(im); }
+        }
+    }
+    printf("  %lu of 250 renders produced a bitmap\n", (unsigned long)produced);
+    OK(produced == 250,
+       "render 100 and everything after it still succeeds (shm name stays legal)");
+}
+
 static void TestSource(PVPDFSource *src)
 {
     printf("\n[PVPDFSource]\n");
@@ -188,6 +240,7 @@ static void TestSource(PVPDFSource *src)
 static void TestDispatchConstants(void)
 {
     printf("\n[dispatch constants used by the express lane]\n");
+#if PV_TEST_HAS_QOS_SDK
     // Reading these enumerators is what the availability guard objects to, but
     // they are compile-time integers: no symbol is bound and nothing executes
     // on 10.9. Suppressed for this comparison only -- the guard stays armed
@@ -207,11 +260,23 @@ static void TestDispatchConstants(void)
        "PV_QOS_CLASS_UTILITY matches QOS_CLASS_UTILITY");
     OK(PV_BLOCK_ENFORCE_QOS_CLASS != sdkDetached,
        "the enforce flag is not confused with DISPATCH_BLOCK_DETACHED");
+#else
+    printf("  skip  SDK has no <sys/qos.h>; constants cannot be pinned here\n");
+#endif
 
-    // And the entry point itself must still be resolvable, or the express lane
-    // silently degrades to the slow path on every machine.
-    OK(dlsym(RTLD_DEFAULT, "dispatch_block_create_with_qos_class") != NULL,
-       "dispatch_block_create_with_qos_class resolves at runtime");
+    // The entry point is 10.10+, so on the target itself it is expected to be
+    // absent. What must hold on every machine is that the two cases are
+    // distinguishable and the queue has a path for each: present means the
+    // promotion is available, absent means the ordinary lane is used.
+    BOOL haveEntryPoint =
+        (dlsym(RTLD_DEFAULT, "dispatch_block_create_with_qos_class") != NULL);
+    if (QoSObservable()) {
+        OK(haveEntryPoint,
+           "dispatch_block_create_with_qos_class resolves where QoS exists");
+    } else {
+        OK(!haveEntryPoint,
+           "no QoS on this OS, and no promotion entry point either");
+    }
 }
 
 static void TestRenderSpeed(PVPDFSource *src)
@@ -615,7 +680,14 @@ static void TestRenderQueueFailureReporting(NSURL *url, PVPDFSource *geom)
     return self;
 }
 - (void)dealloc { [qos release]; [lock release]; [super dealloc]; }
+// PVPDFSource's designated override point, which is the only method
+// PVRenderQueue calls. Overriding any of the convenience spellings instead
+// leaves this instrumentation recording nothing while the suite still reports a
+// pass -- which has happened twice, so the primitive is named in the header now
+// and this comment says which one it is.
 - (CGImageRef)createImageForPage:(NSUInteger)index pixelSize:(CGSize)px
+                     interactive:(BOOL)interactive
+                         failure:(PVRenderFailure *)failure
 {
     // qos_class_self() is 10.10+, and this file is compiled at the app's own
     // 10.9 deployment target with -Werror=unguarded-availability. Resolved the
@@ -630,7 +702,8 @@ static void TestRenderQueueFailureReporting(NSURL *url, PVPDFSource *geom)
     [lock lock];
     [qos addObject:[NSNumber numberWithUnsignedInt:q]];
     [lock unlock];
-    return [super createImageForPage:index pixelSize:px];
+    return [super createImageForPage:index pixelSize:px
+                          interactive:interactive failure:failure];
 }
 - (BOOL)sawQoSAtLeast:(unsigned int)want
 {
@@ -644,6 +717,155 @@ static void TestRenderQueueFailureReporting(NSURL *url, PVPDFSource *geom)
 }
 - (void)resetQoS { [lock lock]; [qos removeAllObjects]; [lock unlock]; }
 @end
+
+// The promotion reaches the process that actually draws.
+//
+// The express lane raises the QoS of the dispatch block that issues a render.
+// Since rasterisation moved into a helper, that block does nothing but write a
+// pipe and wait on it -- the drawing happens in another process, which backs
+// itself into Darwin's background class at startup and stays there unless the
+// command says otherwise. Promoting the waiter while the worker stays
+// backgrounded is a promotion of nothing, and it is invisible: every test of
+// the express lane still passes, because they all check the QoS of the caller.
+//
+// Measured rather than inspected, because the state being asserted about is not
+// readable from outside: getpriority(PRIO_DARWIN_PROCESS) answers only for the
+// calling process, so another process's background flag cannot be queried. What
+// can be observed is the consequence, and the consequence is large -- around 5x
+// on this machine, which is the whole reason the background class is used at
+// all.
+// The snapshot sweep: what it reclaims, and what it must never touch.
+//
+// A snapshot is unlinked in -dealloc, which covers every ordinary exit and none
+// of the others -- kill -9, a crash, a power cut. Measured on the development
+// machine after a day of testing: 41 abandoned copies, about 100 MB. The sweep
+// reclaims them.
+//
+// It also runs `unlink` on files this process did not create, which is the kind
+// of thing that should be tested rather than reasoned about. The property that
+// matters is the negative one: a snapshot belonging to a LIVE document is never
+// swept, no matter how old the file looks.
+static void TestSnapshotSweep(NSURL *url)
+{
+    printf("\n[abandoned snapshot sweep]\n");
+
+    NSString *dir = NSTemporaryDirectory();
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    // An abandoned snapshot: right name, old enough, and nothing holding it.
+    NSString *stale = [dir stringByAppendingPathComponent:
+                          @"Postview-PDF-ZZstale"];
+    [fm removeItemAtPath:stale error:NULL];
+    OK([[NSData data] writeToFile:stale atomically:YES],
+       "a stand-in for a snapshot left behind by a crash");
+    // Backdated well past the staleness threshold.
+    NSDictionary *old = [NSDictionary dictionaryWithObject:
+        [NSDate dateWithTimeIntervalSinceNow:-(48 * 3600)]
+        forKey:NSFileModificationDate];
+    [fm setAttributes:old ofItemAtPath:stale error:NULL];
+
+    // A file with the same age that is NOT ours. The sweep is keyed on the
+    // name, and a sweep that ignored the name would be deleting other people's
+    // temporary files.
+    NSString *foreign = [dir stringByAppendingPathComponent:@"NotPostview-ZZ"];
+    [fm removeItemAtPath:foreign error:NULL];
+    [[NSData data] writeToFile:foreign atomically:YES];
+    [fm setAttributes:old ofItemAtPath:foreign error:NULL];
+
+    // And a LIVE document, whose snapshot is then backdated to look every bit
+    // as abandoned as the first one. Only the lock distinguishes them.
+    NSError *err = nil;
+    PVPDFSource *live = [[PVPDFSource alloc] initWithURL:url error:&err];
+    OK(live != nil, "a live document to protect");
+    NSString *livePath = nil;
+    if (live) {
+        livePath = [[[live valueForKey:@"_snapshot"] path] copy];
+        OK([livePath length] > 0, "the live document has a snapshot on disk");
+        [fm setAttributes:old ofItemAtPath:livePath error:NULL];
+    }
+
+    PVSweepAbandonedSnapshotsNow();
+
+    OK(![fm fileExistsAtPath:stale],
+       "an old, unheld snapshot is reclaimed");
+    OK([fm fileExistsAtPath:foreign],
+       "a file that is not ours is left alone, however old");
+    OK(livePath && [fm fileExistsAtPath:livePath],
+       "the snapshot of an OPEN document survives, however old it looks");
+
+    // And once the document closes, the same file is gone -- by -dealloc, not
+    // by the sweep, which is the ordinary path.
+    [live release];
+    OK(livePath && ![fm fileExistsAtPath:livePath],
+       "closing the document removes its snapshot without waiting for a sweep");
+
+    [fm removeItemAtPath:foreign error:NULL];
+    [livePath release];
+}
+
+static void TestHelperRenderPriority(NSURL *url, PVPDFSource *geom)
+{
+    printf("\n[render priority reaches the helper process]\n");
+
+    NSError *err = nil;
+    PVPDFSource *src = [[PVPDFSource alloc] initWithURL:url geometryFrom:geom error:&err];
+    if (!src) { OK(NO, "could not open the fixture for the priority test"); return; }
+
+    CGSize px = CGSizeMake(1100, 1420);
+    // Warm: the first render of a document pays for parsing it, which belongs
+    // to neither measurement.
+    CGImageRef warm = [src createImageForPage:0 pixelSize:px];
+    if (warm) CGImageRelease(warm);
+
+    const int kRounds = 4;
+    double background = 0, interactive = 0;
+    int i, ok = 0;
+    // Interleaved rather than run in two blocks, so a machine that gets busier
+    // partway through the test loads both measurements equally instead of
+    // whichever one happened to be second.
+    for (i = 0; i < kRounds; i++) {
+        double t0 = PVMonotonicSeconds();
+        CGImageRef a = [src createImageForPage:(NSUInteger)(i % 8) pixelSize:px
+                                   interactive:NO failure:NULL];
+        background += PVMonotonicSeconds() - t0;
+        if (a) { ok++; CGImageRelease(a); }
+
+        double t1 = PVMonotonicSeconds();
+        CGImageRef b = [src createImageForPage:(NSUInteger)(i % 8) pixelSize:px
+                                   interactive:YES failure:NULL];
+        interactive += PVMonotonicSeconds() - t1;
+        if (b) { ok++; CGImageRelease(b); }
+    }
+    background  /= kRounds;
+    interactive /= kRounds;
+
+    OK(ok == kRounds * 2, "every render in the priority comparison succeeded");
+    printf("  background  %.0f ms/page\n  interactive %.0f ms/page\n",
+           background * 1000.0, interactive * 1000.0);
+
+    // Asserted only when the background figure is big enough to have measured
+    // anything. Below that the page is too cheap for the scheduling class to
+    // show through the noise, and a ratio taken from two small numbers on a
+    // loaded machine is not evidence of anything.
+    if (background > 0.150) {
+        char msg[200];
+        snprintf(msg, sizeof msg,
+                 "an express render is materially faster than a background one "
+                 "(%.2fx: %.0f ms vs %.0f ms)",
+                 background / (interactive > 0 ? interactive : 1e-9),
+                 background * 1000.0, interactive * 1000.0);
+        // 1.5x against a measured ~5x. The margin is deliberately loose: what
+        // this has to catch is the promotion not arriving at all, which reads as
+        // 1.0x, and a threshold set near the true ratio would fail on a busy
+        // machine for no useful reason.
+        OK(interactive * 1.5 < background, msg);
+    } else {
+        printf("  note  the background render took only %.0f ms; too fast to "
+               "compare meaningfully on this machine\n", background * 1000.0);
+    }
+
+    [src release];
+}
 
 static void TestExpressLanePromotion(NSURL *url, PVPDFSource *geom)
 {
@@ -661,8 +883,16 @@ static void TestExpressLanePromotion(NSURL *url, PVPDFSource *geom)
         [PVRenderRequest page:0 pixels:CGSizeMake(700, 900)
                      priority:PVPriorityVisibleFull preview:NO express:YES]]];
     PumpRunLoop(3.0);
-    OK([own sawQoSAtLeast:PV_QOS_CLASS_UTILITY],
-       "an express request on an idle queue runs at raised QoS");
+    // On 10.9 there is no QoS to raise and no way to read one back. The lane's
+    // documented behaviour there is to render the page on the ordinary queue,
+    // so that is what is asserted -- requiring a symbol the target does not
+    // have would fail the suite on the one machine it exists to qualify.
+    if (QoSObservable())
+        OK([own sawQoSAtLeast:PV_QOS_CLASS_UTILITY],
+           "an express request on an idle queue runs at raised QoS");
+    else
+        OK([col->pages count] > 0,
+           "with no QoS available an express request still renders");
 
     // The real case. Fill the queue with ordinary background work, let the
     // worker get into a page, and only then ask for the express one -- which
@@ -685,8 +915,12 @@ static void TestExpressLanePromotion(NSURL *url, PVPDFSource *geom)
     [q setDesiredRequests:withExpress];
     PumpRunLoop(4.0);
 
-    OK([own sawQoSAtLeast:PV_QOS_CLASS_UTILITY],
-       "an express request arriving while the queue is busy is still promoted");
+    if (QoSObservable())
+        OK([own sawQoSAtLeast:PV_QOS_CLASS_UTILITY],
+           "an express request arriving while the queue is busy is still promoted");
+    else
+        OK([col->pages count] > 0,
+           "with no QoS available a busy queue still drains the express request");
 
     [q shutdown];
     PumpRunLoop(0.5);
@@ -737,6 +971,8 @@ static void TestRenderQueue(PVPDFSource *src, NSURL *url)
     TestRenderQueueDeduplication(url, src);
     TestRenderQueueFailureReporting(url, src);
     TestExpressLanePromotion(url, src);
+    TestHelperRenderPriority(url, src);
+    TestSnapshotSweep(url);
 }
 
 // The file on disk is untrusted input: it can be hand-edited, restored from a
@@ -1119,15 +1355,30 @@ static void TestRunningLocation(void)
     OK(PVVolumeKindForURL([NSURL fileURLWithPath:@"/Applications"]) == PVVolumeFixed,
        "nor does /Applications");
 
-    // Anything unanswerable is answered "fixed": a question the file system
-    // declines is not evidence of danger, and must not put a dialog in front
-    // of someone who has done nothing wrong.
-    OK(PVVolumeKindForURL(nil) == PVVolumeFixed,
-       "no URL raises nothing");
-    OK(PVVolumeKindForURL([NSURL URLWithString:@"http://example.com/"]) == PVVolumeFixed,
-       "a non-file URL raises nothing");
-    OK(PVVolumeKindForURL([NSURL fileURLWithPath:@"/no/such/path/at/all"]) == PVVolumeFixed,
-       "an unreadable path raises nothing");
+    // Anything unanswerable is answered "removable", which is the conservative
+    // direction rather than the quiet one.
+    //
+    // This used to answer "fixed", so that a question the file system declined
+    // put no dialog in front of anyone. But the only caller is the check that
+    // warns about running from a disk that can vanish, and PVVolumeFixed is the
+    // answer that suppresses that warning -- so "I could not tell" and "I
+    // checked and it is safe" produced identical behaviour, and the warning was
+    // silenced in precisely the case where safety could not be established.
+    //
+    // The two errors do not cost the same. A false "removable" is one dialog
+    // the user can decline. A false "fixed" is Postview killed mid-session with
+    // no warning ever shown, which is the outcome the check exists to prevent.
+    OK(PVVolumeKindForURL(nil) == PVVolumeRemovable,
+       "no URL is not evidence of safety");
+    OK(PVVolumeKindForURL([NSURL URLWithString:@"http://example.com/"]) == PVVolumeRemovable,
+       "nor is a non-file URL");
+    OK(PVVolumeKindForURL([NSURL fileURLWithPath:@"/no/such/path/at/all"]) == PVVolumeRemovable,
+       "nor is a path whose volume cannot be read");
+
+    // And the common cases still resolve, so this is not a check that has
+    // simply been made to say "removable" about everything.
+    OK(PVVolumeKindForURL([NSURL fileURLWithPath:NSHomeDirectory()]) == PVVolumeFixed,
+       "a real path on the boot volume is still fixed");
 }
 
 #pragma mark - Scheduler budget arithmetic
@@ -1387,6 +1638,141 @@ static void TestInFlightFullCap(PVPDFSource *geom, NSURL *url)
     [q release];
     [c release];
     [src release];
+    PVResidentReset();
+}
+
+// ---------------------------------------------------------------------------
+// The same cap, on two lanes, which is where it was not holding.
+//
+// PV_MAX_INFLIGHT_FULL bounds the full-page bitmaps that exist at once, and the
+// scheduler used to enforce it by counting only the ones already RASTERISED and
+// waiting for the main thread. That is a check with no reservation behind it.
+// Two lanes read the same count in the same instant and both proceed; worse, a
+// lane that had just finished a bitmap could start another before the first was
+// delivered. Three ~28 MB bitmaps against a declared limit of two.
+//
+// It cannot be reproduced on one lane, and it cannot be reproduced on a laptop,
+// because a machine with a battery is given one lane by policy. So the machine
+// is forced: AC, no internal battery -- a 2013 Mac Pro, which is the hardware
+// the second lane exists for and the hardware this was reported on.
+//
+// The costs are made asymmetric on purpose. Pages are sharded across lanes by
+// page number, so giving the even pages a large bitmap and the odd pages a
+// small one guarantees the two lanes finish at different times, which is the
+// interleaving that opens the gap. Equal costs make the lanes finish together
+// and the bug hides.
+// ---------------------------------------------------------------------------
+static void TestTwoLaneFullCap(PVPDFSource *geom, NSURL *url)
+{
+    printf("\nTwo-lane in-flight cap (forced Mac Pro configuration)\n");
+
+    NSUInteger cores = [[NSProcessInfo processInfo] activeProcessorCount];
+    if (cores < 6) {
+        printf("  skip  this machine has %lu cores; the second lane needs 6\n",
+               (unsigned long)cores);
+        return;
+    }
+
+    PVSetPowerSourceOverride(PVPowerAC, YES);
+    PVSetInternalBatteryOverride(NO, YES);
+
+    NSError *err = nil;
+    PVPDFSource *src = [[PVPDFSource alloc] initWithURL:url geometryFrom:geom error:&err];
+    PVRenderQueue *q = src ? [[PVRenderQueue alloc] initWithSource:src
+                                                             label:"pv.test.twolane"] : nil;
+    Collector *c = [[Collector alloc] init];
+    c->quiet = YES;
+    [q setDelegate:c];
+
+    // The configuration is asserted, not assumed. A queue that quietly built
+    // one lane would pass every assertion below without testing anything.
+    OK(q != nil && [q laneCount] == 2,
+       "the forced configuration really did build two lanes");
+
+    if (q && [q laneCount] == 2) {
+        const NSUInteger kRequests = 12;
+        NSUInteger pages = [src pageCount];
+        if (pages > kRequests) pages = kRequests;
+
+        // Sampled from another thread, as tightly as it will go. The peak this
+        // is looking for lasts exactly as long as one lane's head start, and a
+        // sampler sharing the main thread with the polling loop would step over
+        // it. Plain loads and stores under the queue's own lock, published
+        // through it: -fullCapacityInUse takes that lock for the whole read.
+        __block volatile int32_t stop = 0;
+        __block NSUInteger observedMax = 0;
+        NSLock *seen = [[NSLock alloc] init];
+        dispatch_queue_t sampler =
+            dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0);
+        dispatch_async(sampler, ^{
+            while (!stop) {
+                NSUInteger n = [q fullCapacityInUse];
+                [seen lock];
+                if (n > observedMax) observedMax = n;
+                [seen unlock];
+            }
+        });
+
+        NSMutableArray *reqs = [NSMutableArray array];
+        NSUInteger i;
+        for (i = 0; i < pages; i++) {
+            // Even pages are ~4x the pixels of odd ones, and the lanes are
+            // sharded by page parity: lane 0 gets the slow work, lane 1 the fast.
+            CGSize px = (i % 2 == 0) ? CGSizeMake(900, 1160)
+                                     : CGSizeMake(450, 580);
+            [reqs addObject:[PVRenderRequest page:i pixels:px
+                                         priority:PVPriorityVisibleFull preview:NO]];
+        }
+        [q setDesiredRequests:reqs];
+
+        // usleep, not PumpRunLoop, for the same reason as the one-lane test: no
+        // delivery may run, so the bitmaps have nowhere to go and the cap is the
+        // only thing that can stop the lanes.
+        double waited = 0;
+        while (waited < 20.0) {
+            usleep(50000);
+            waited += 0.05;
+            [seen lock];
+            NSUInteger peak = observedMax;
+            [seen unlock];
+            if (peak >= PV_MAX_INFLIGHT_FULL && waited > 3.0) break;
+        }
+
+        stop = 1;
+        [seen lock];
+        NSUInteger peak = observedMax;
+        [seen unlock];
+
+        char msg[220];
+        snprintf(msg, sizeof msg,
+                 "two lanes never held more than %d full bitmaps at once "
+                 "(rasterising + undelivered, observed peak %lu)",
+                 PV_MAX_INFLIGHT_FULL, (unsigned long)peak);
+        OK(peak <= PV_MAX_INFLIGHT_FULL, msg);
+        OK(peak == PV_MAX_INFLIGHT_FULL,
+           "...and the cap is what stopped them, not the machine being slow");
+
+        // Nothing was dropped to achieve it. A cap that loses work is not a cap,
+        // and with two lanes the requeue path has two ways to go wrong.
+        BOOL drained = PumpUntil2(^{
+            return (BOOL)([q isIdle] && [c->pages count] >= pages); }, 120.0);
+        snprintf(msg, sizeof msg,
+                 "every deferred request completed on two lanes (%lu of %lu)",
+                 (unsigned long)[c->pages count], (unsigned long)pages);
+        OK(drained, msg);
+        OK([q fullCapacityInUse] == 0,
+           "the two-lane capacity returns to zero when the queue is idle");
+        [seen release];
+    }
+
+    [q shutdown];
+    PumpUntil2(^{ return (BOOL)([q inFlightCount] == 0); }, 60.0);
+    [q release];
+    [c release];
+    [src release];
+
+    PVSetInternalBatteryOverride(NO, NO);
+    PVSetPowerSourceOverride(PVPowerUnknown, NO);
     PVResidentReset();
 }
 
@@ -2249,6 +2635,7 @@ int main(int argc, const char *argv[])
                             [[err localizedDescription] UTF8String]); return 2; }
 
         TestSource(src);
+        TestSourceManyRenders(src);
         TestDispatchConstants();
         TestRenderSpeed(src);
         TestCache();
@@ -2270,12 +2657,18 @@ int main(int argc, const char *argv[])
         TestCostAwareGate();
         TestCostAwareEviction();
         TestInFlightFullCap(src, url);
+        TestTwoLaneFullCap(src, url);
         TestArrowScrollStep();
         TestScenarioReplay();
         if (argc > 2) TestRotation([NSString stringWithUTF8String:argv[2]]);
         if (argc > 3) TestArbitrary([NSString stringWithUTF8String:argv[3]]);
 
         printf("\n%d passed, %d failed\n", gPass, gFail);
-        return gFail ? 1 : 0;
+        // The fixture source, handed back. A leak in the harness is small, but
+        // this harness is one of the things that argues the app does not leak,
+        // and `leaks` cannot tell whose object it is looking at.
+        int result = gFail ? 1 : 0;
+        [src release];
+        return result;
     }
 }

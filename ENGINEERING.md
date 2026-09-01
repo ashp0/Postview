@@ -218,13 +218,27 @@ memory on a photograph is a preference no measurement resolves. Not built.
   are no efficiency cores, and a render is not one joule cheaper for being
   backgrounded. What it buys is lower scheduling priority, timer coalescing and
   throttled I/O. The energy win on the target comes from doing less work.
-- **The express lane's QoS promotion never runs on 10.9.**
-  `dispatch_block_create_with_qos_class` and `QOS_CLASS_UTILITY` are 10.10+, so
-  the `dlsym` returns NULL and an express request gets ordering priority only.
-  Both the ~8× energy cost and the latency benefit are absent on Mavericks.
+- **The express lane's QoS promotion never runs on 10.9 — but the express lane
+  now works there anyway.** `dispatch_block_create_with_qos_class` and
+  `QOS_CLASS_UTILITY` are 10.10+, so the `dlsym` returns NULL and the *dispatch*
+  promotion is absent on Mavericks. That stopped being the mechanism that
+  matters when rasterisation moved into the render helper: promoting the
+  dispatch block promotes the thread that waits on a pipe, while the drawing
+  happens in another process. The helper puts itself in Darwin's background
+  class (`setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG)`, which 10.9 has)
+  and leaves it for the duration of one page when the command says the request
+  is express. Measured on the development host: 1401 ms backgrounded against
+  266 ms at ordinary priority for the same 1200×1550 page — a 5.3× spread, and
+  it is the same call on Mavericks.
 - **Rasterisation cannot be cancelled.** One CoreGraphics call, no resume. The
   available half is never starting it, and dropping a result for a page the
   viewport has left.
+- **Nothing in the viewer process calls `CGPDF*`.** Opening the document,
+  walking the page tree and measuring every page are done by the render helper
+  and reported over the pipe, for exactly the reason the drawing is: those calls
+  fault, hang and abort on malformed input, and none of it is an Objective-C
+  exception that `@try` can see. A viewer that opened the document itself could
+  be killed by a document before the helper it built was ever asked for a page.
 
 ---
 

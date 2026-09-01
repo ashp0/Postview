@@ -1,6 +1,20 @@
 #import "PVImageCache.h"
 #include <limits.h>
 
+// A ceiling on the number of ENTRIES, independent of the byte budget.
+//
+// The byte budget bounds bitmaps, and bitmaps are what dominate -- but an entry
+// is not free even when the bitmap it holds is tiny. Each one costs an
+// NSNumber key, a dictionary slot and a PVCacheEntry: on the order of a hundred
+// bytes that the byte budget does not see, because the byte budget counts
+// pixels. A long session over a document of small pages at a small zoom can
+// therefore sit under budget forever while the dictionary grows without limit.
+//
+// Trimming to a lower mark than the ceiling makes this amortised: the walk runs
+// once every 512 insertions rather than on every insertion past the line.
+#define PV_MAX_CACHE_ENTRIES     ((NSUInteger)2048)
+#define PV_CACHE_TRIM_TO_ENTRIES ((NSUInteger)1536)
+
 @interface PVCacheEntry : NSObject {
 @public
     CGImageRef full;  CGSize fullPx;  size_t fullBytes;
@@ -114,12 +128,62 @@
     _clock = 0;
 }
 
+// Make room for one more entry, if the dictionary is at its ceiling.
+//
+// Deliberately deterministic: oldest stamp first, page number breaking ties, so
+// the same sequence of insertions always evicts the same entries. Dictionary
+// enumeration order is not a policy, and a cache whose contents depend on hash
+// order cannot be tested.
+//
+// Pinned pages and the page being inserted are stepped over, exactly as in
+// -evictExcept:. That is why this returns a BOOL rather than promising room: if
+// the whole cache is pinned there is nothing it may throw away, and the caller
+// has to be able to decline rather than evict something the layer above is
+// about to ask for again.
+- (BOOL)makeRoomForPage:(NSUInteger)page
+{
+    if ([_entries count] < PV_MAX_CACHE_ENTRIES) return YES;
+
+    NSMutableDictionary *entries = _entries;
+    NSArray *order = [[_entries allKeys]
+        sortedArrayUsingComparator:^NSComparisonResult(id a, id b) {
+            PVCacheEntry *ea = (PVCacheEntry *)[entries objectForKey:a];
+            PVCacheEntry *eb = (PVCacheEntry *)[entries objectForKey:b];
+            if (ea->stamp < eb->stamp) return (NSComparisonResult)NSOrderedAscending;
+            if (ea->stamp > eb->stamp) return (NSComparisonResult)NSOrderedDescending;
+            return [(NSNumber *)a compare:(NSNumber *)b];
+        }];
+
+    NSUInteger i, n = [order count];
+    for (i = 0; i < n; i++) {
+        if ([_entries count] <= PV_CACHE_TRIM_TO_ENTRIES) break;
+        NSNumber *key = [order objectAtIndex:i];
+        NSUInteger victim = (NSUInteger)[key unsignedLongLongValue];
+        if (victim == page || [self isPinned:victim]) continue;
+
+        PVCacheEntry *e = [_entries objectForKey:key];
+        if (!e) continue;
+        if (e->full) {
+            [self subtractBytes:e->fullBytes];
+            CGImageRelease(e->full); e->full = NULL; e->fullBytes = 0;
+            if (_fullCount > 0) _fullCount--;
+        }
+        if (e->prev) {
+            [self subtractBytes:e->prevBytes];
+            CGImageRelease(e->prev); e->prev = NULL; e->prevBytes = 0;
+        }
+        [_entries removeObjectForKey:key];
+    }
+    return [_entries count] < PV_MAX_CACHE_ENTRIES;
+}
+
 - (PVCacheEntry *)entryForPage:(NSUInteger)page create:(BOOL)create
 {
     [self resetClockIfNeeded];
     NSNumber *key = [NSNumber numberWithUnsignedLongLong:(unsigned long long)page];
     PVCacheEntry *e = [_entries objectForKey:key];
     if (!e && create) {
+        if (![self makeRoomForPage:page]) return nil;
         e = [[[PVCacheEntry alloc] init] autorelease];
         [_entries setObject:e forKey:key];
     }
@@ -207,7 +271,14 @@
         CGImageRelease(incoming);
         return;
     }
-    if (e->full) { [self subtractBytes:e->fullBytes]; CGImageRelease(e->full); }
+    if (e->full) {
+        [self subtractBytes:e->fullBytes];
+        CGImageRelease(e->full);
+    } else {
+        // Only when this entry did not already hold one: replacing a full
+        // bitmap with another leaves the population unchanged.
+        _fullCount++;
+    }
     e->full      = incoming;
     e->fullPx    = px;
     e->fullBytes = PVImageBytes(incoming);
@@ -340,6 +411,7 @@
                 CGImageRelease(e->full); e->full = NULL; e->fullBytes = 0;
                 e->fullH = 0;
                 if (fulls > 0) fulls--;
+                if (_fullCount > 0) _fullCount--;
             } else {
                 if (!e->prev) continue;
                 if (e->prevH > _gdsL) _gdsL = e->prevH;
@@ -366,6 +438,7 @@
         if (e->full) {
             [self subtractBytes:e->fullBytes];
             CGImageRelease(e->full); e->full = NULL; e->fullBytes = 0;
+            if (_fullCount > 0) _fullCount--;
             // Not folded into _gdsL. This is memory pressure discarding every
             // full bitmap at once, not the policy choosing between them, and
             // inflating the aging term by the most expensive page in the cache
@@ -389,6 +462,7 @@
 - (void)removeAll
 {
     [_entries removeAllObjects];
+    _fullCount = 0;
     [self subtractBytes:_bytes];      // leaves _bytes at 0 and squares the census
     // The aging term goes with them. It is denominated in the utilities of the
     // bitmaps that were resident, and a cache emptied for a new document would
@@ -401,13 +475,6 @@
 - (size_t)byteCount { return _bytes; }
 - (NSUInteger)entryCount { return [_entries count]; }
 
-- (NSUInteger)fullImageCount
-{
-    NSUInteger n = 0;
-    NSEnumerator *it = [_entries objectEnumerator];
-    PVCacheEntry *e;
-    while ((e = [it nextObject])) if (e->full) n++;
-    return n;
-}
+- (NSUInteger)fullImageCount { return _fullCount; }
 
 @end

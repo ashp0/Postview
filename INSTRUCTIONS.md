@@ -36,11 +36,14 @@ make verify-all  # every test gate; takes a while
    the process instantly. That is the one crash report this project has.
 3. Copy the rest (the `.command` files and `pvband`) somewhere on the internal
    disk, e.g. `~/Desktop/Postview-Tools`.
-4. **Right-click `/Applications/Postview.app` → Open**, then confirm. Do not
-   double-click it the first time: the app is unsigned, so double-clicking gives
-   "unidentified developer" with no way past it. Right-click → Open gives you an
-   "Open anyway" button. Once, ever. (Signing needs a paid Apple Developer ID;
-   Mavericks predates notarization entirely.)
+4. **If this build is unsigned:** right-click `/Applications/Postview.app` →
+   Open, then confirm. Do not double-click it the first time — an unsigned app
+   gives "unidentified developer" with no way past it, and right-click → Open
+   gives you an "Open anyway" button. Once, ever. A build signed with a
+   Developer ID (`make dist SIGN_IDENTITY=...`) opens on a double click:
+   Mavericks predates notarization but understands Developer ID perfectly well,
+   and what 10.9.5 will not accept is a SHA-256-only signature — which is why
+   the Makefile signs with both SHA-1 and SHA-256.
 
 ---
 
@@ -194,7 +197,9 @@ Those decide whether this is finished or whether there is more to do.
   limit, recorded and pinned by tests (`ENGINEERING.md` §4.1).
 - Peak memory is higher than Preview's — the one metric it loses on across the
   board. Known, measured, still open (`ENGINEERING.md` §9.5).
-- Right-click → Open on first launch is normal for an unsigned app.
+- Right-click → Open on first launch is normal for an *unsigned* build. A
+  release built with `make dist SIGN_IDENTITY=...` is Developer ID signed with a
+  dual SHA-1/SHA-256 digest, which 10.9.5 accepts, and opens with a double click.
 
 ## If something goes wrong
 
@@ -204,7 +209,14 @@ rm -rf ~/Library/Application\ Support/Postview
 ```
 
 Deleting `/Applications/Postview.app` removes the app entirely. It installs
-nothing else — no background processes, no login items, no kernel extensions.
+nothing else — no login items, no kernel extensions, nothing outside its own
+bundle.
+
+While a document is open you will see one or more `PostviewRenderHelper`
+processes in Activity Monitor. Those are Postview's own, they live inside the
+bundle, and they exist so that a malformed PDF that hangs or crashes CoreGraphics
+takes down a helper instead of the viewer. They start when a document opens and
+are gone the moment it closes; quitting Postview ends them.
 
 ---
 

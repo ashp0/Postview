@@ -97,6 +97,12 @@ on run argv
 end run
 AS
     fi
+    # Guarded because cleanup is defined before the settings helpers are, and
+    # the trap is armed immediately: an argument error exits before those
+    # definitions have been parsed.
+    if command -v postview_settings_clear >/dev/null 2>&1; then
+        postview_settings_clear
+    fi
     [ -n "$WORKDIR" ] && [ -d "$WORKDIR" ] && /bin/rm -rf -- "$WORKDIR"
     return 0
 }
@@ -343,6 +349,61 @@ sample_process() {
 OUTPUT="$PWD/Postview-Profile-$(/bin/date +%Y%m%d-%H%M%S).tsv"
 printf 'app\tscenario\trun\twall_seconds\tcpu_seconds\tcpu_per_second\tmean_cpu_percent\tpeak_cpu_percent\tmean_rss_kb\tpeak_rss_kb\twindow_size\tstart_idle\tstart_title\tend_title\trenders_full\trenders_preview\tmegapixels_total\trequests_suppressed\trequests_suppressed_motion\n' > "$OUTPUT"
 
+# Statistics are switched on through the defaults system, not through
+# `open --args`.
+#
+# Mavericks' `open` has no --args flag. It is not that the flag is ignored: the
+# words after it are taken as further FILENAMES, so `open -a Postview doc.pdf
+# --args -PVStats YES -PVStatsPath /tmp/x` asks Postview to open five documents,
+# four of which do not exist, and never enables the census at all. Every
+# internal-render column in a profile taken that way was blank, and the profile
+# reported it as a dash rather than as a failure -- so the tool shipped as
+# "works on the target" while measuring nothing it claimed to measure.
+#
+# `defaults write` reaches the same NSUserDefaults the app reads, on every OS
+# version this has to run on.
+POSTVIEW_DOMAIN=com.postview.Postview
+
+# Whatever the user already had, so a profiling run does not silently discard
+# their own settings. Read once, before anything is written.
+POSTVIEW_SAVED_STATS=
+POSTVIEW_SAVED_STATSPATH=
+POSTVIEW_SETTINGS_SAVED=0
+
+postview_settings_save() {
+    [ "$POSTVIEW_SETTINGS_SAVED" = "1" ] && return 0
+    POSTVIEW_SAVED_STATS=$(/usr/bin/defaults read "$POSTVIEW_DOMAIN" PVStats 2>/dev/null || true)
+    POSTVIEW_SAVED_STATSPATH=$(/usr/bin/defaults read "$POSTVIEW_DOMAIN" PVStatsPath 2>/dev/null || true)
+    POSTVIEW_SETTINGS_SAVED=1
+    return 0
+}
+
+postview_settings_set() {
+    postview_settings_save
+    /usr/bin/defaults write "$POSTVIEW_DOMAIN" PVStats -bool YES &&
+    /usr/bin/defaults write "$POSTVIEW_DOMAIN" PVStatsPath "$1"
+}
+
+# Restore rather than delete. Deleting unconditionally is only correct if the
+# user had nothing set, and the tool has no way to know that after the fact --
+# which is why the previous values are captured before the first write.
+postview_settings_clear() {
+    [ "$POSTVIEW_SETTINGS_SAVED" = "1" ] || return 0
+    if [ -n "$POSTVIEW_SAVED_STATS" ]; then
+        /usr/bin/defaults write "$POSTVIEW_DOMAIN" PVStats "$POSTVIEW_SAVED_STATS" \
+            >/dev/null 2>&1 || true
+    else
+        /usr/bin/defaults delete "$POSTVIEW_DOMAIN" PVStats >/dev/null 2>&1 || true
+    fi
+    if [ -n "$POSTVIEW_SAVED_STATSPATH" ]; then
+        /usr/bin/defaults write "$POSTVIEW_DOMAIN" PVStatsPath "$POSTVIEW_SAVED_STATSPATH" \
+            >/dev/null 2>&1 || true
+    else
+        /usr/bin/defaults delete "$POSTVIEW_DOMAIN" PVStatsPath >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
 # $1 bundle  $2 app  $3 process  $4 scenario  $5 run
 run_scenario() {
     bundle=$1; app=$2; process=$3; scen=$4; iter=$5
@@ -358,11 +419,11 @@ run_scenario() {
     statfile="$WORKDIR/stat-$app-$scen-$iter.txt"
 
     if [ "$app" = "Postview" ]; then
-        /usr/bin/open -n -a "$bundle" "$trial_pdf" --args \
-            -PVStats YES -PVStatsPath "$statfile" || die "could not launch $app"
-    else
-        /usr/bin/open -n -a "$bundle" "$trial_pdf" || die "could not launch $app"
+        postview_settings_set "$statfile" ||
+            die "could not configure Postview statistics"
     fi
+
+    /usr/bin/open -n -a "$bundle" "$trial_pdf" || die "could not launch $app"
 
     wait_for_document_window "$process" "$trial_name" || die "$app did not show a window in 30 s"
     pid=$(pid_for "$process")
