@@ -684,8 +684,20 @@ NSString *PVStatsReport(void);
 //                           budget, which is exactly why it is counted.
 //   PVResidentCache         held by a PVImageCache.
 //
-// Disjoint means every byte is in at most one bucket at a time, so the sum is a
-// figure that can be compared against RSS rather than an upper bound on it.
+// Disjoint means every byte is in at most one bucket at a time, so the sum is
+// an exact figure rather than an upper bound.
+//
+// What it is NOT, any more, is comparable with this process's RSS, and the
+// difference matters enough to name. These bytes are counted when a bitmap is
+// MAPPED. Since rasterisation moved out of process the pixels are written by
+// the render helper into shared memory and mapped read-only here, so the
+// physical pages are charged to whichever process touched them -- the helper,
+// always; this one only if the page was actually drawn to screen before it was
+// evicted. The census is therefore logical live bitmap bytes, and the viewer's
+// RSS can legitimately be far below it. Observed on one host at 178.4 MB of
+// census against 78.0 MB of RSS, and on another at 178.4 MB against 206.9 MB,
+// from the same build: the two numbers are not two measurements of one
+// quantity, and subtracting them does not yield a third.
 // Ownership is handed over at one point per boundary: the queue drops its
 // undelivered claim immediately before the delegate is called, and the delegate
 // either stores the image -- where the cache's own accounting picks it up

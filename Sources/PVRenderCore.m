@@ -110,7 +110,7 @@ CGAffineTransform PVPageDrawingTransform(CGRect box, int rotation,
     return t;
 }
 
-BOOL PVRenderPDFPageToBuffer(CGPDFDocumentRef document,
+PVRenderCoreResult PVRenderPDFPageToBuffer(CGPDFDocumentRef document,
                             NSUInteger zeroBasedPage,
                             CGSize naturalSize,
                             size_t width,
@@ -118,28 +118,33 @@ BOOL PVRenderPDFPageToBuffer(CGPDFDocumentRef document,
                             void *buffer,
                             size_t bytesPerRow)
 {
-    if (!document || !buffer || width == 0 || height == 0) return NO;
-    if (bytesPerRow < width * 4 || height > SIZE_MAX / bytesPerRow) return NO;
+    if (!document || !buffer || width == 0 || height == 0)
+        return PVRenderCoreInvalidPage;
+    if (bytesPerRow < width * 4 || height > SIZE_MAX / bytesPerRow)
+        return PVRenderCoreInvalidPage;
     // Still validated, though the transform no longer derives from it: a
     // command carrying a natural size the page cannot have is a command from a
     // caller that has lost track of this document, and rendering it would put
     // pixels in a buffer sized for something else.
     if (!isfinite(naturalSize.width) || !isfinite(naturalSize.height) ||
         !(naturalSize.width >= 1) || !(naturalSize.height >= 1))
-        return NO;
+        return PVRenderCoreInvalidPage;
 
     CGPDFPageRef page = CGPDFDocumentGetPage(document, (size_t)zeroBasedPage + 1);
-    if (!page) return NO;
+    if (!page) return PVRenderCoreInvalidPage;
 
+    // The two allocations below are the reason this function stopped returning
+    // a BOOL. Neither says anything about the page: both are Quartz declining
+    // to hand out memory, which is the definition of worth-trying-again.
     CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
-    if (!colorSpace) return NO;
+    if (!colorSpace) return PVRenderCoreTransientResource;
     CGContextRef context = CGBitmapContextCreate(buffer, width, height, 8,
         bytesPerRow, colorSpace,
         (CGBitmapInfo)kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Host);
     CGColorSpaceRelease(colorSpace);
-    if (!context) return NO;
+    if (!context) return PVRenderCoreTransientResource;
 
-    BOOL ok = NO;
+    PVRenderCoreResult result = PVRenderCoreDrawFailure;
     @try {
         CGContextSetFillColorWithColor(context,
             CGColorGetConstantColor(kCGColorWhite));
@@ -158,12 +163,12 @@ BOOL PVRenderPDFPageToBuffer(CGPDFDocumentRef document,
             CGContextConcatCTM(context, transform);
             CGContextClipToRect(context, box);
             CGContextDrawPDFPage(context, page);
-            ok = YES;
+            result = PVRenderCoreOK;
         }
     } @catch (id exception) {
-        ok = NO;
+        result = PVRenderCoreDrawFailure;
     } @finally {
         CGContextRelease(context);
     }
-    return ok;
+    return result;
 }

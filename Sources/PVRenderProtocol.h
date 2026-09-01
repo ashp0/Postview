@@ -3,12 +3,37 @@
 
 #include <stdint.h>
 
-// Bumped from 1 when the helper took over opening the document. A version-1
-// helper answers render commands but never sends the open reply the parent now
-// waits for, so the two cannot be mixed and the number has to move.
+// Bumped from 1 when the helper took over opening the document, and from 2 when
+// the bitmap stopped being addressed by name. A version-1 helper never sends the
+// open reply the parent waits for; a version-2 helper expects a shared-memory
+// NAME in the command and would read the field the descriptor replaced. Neither
+// can be mixed with this one, so the number moves.
 #define PV_RENDER_PROTOCOL_MAGIC   ((uint32_t)0x50565231) /* PVR1 */
-#define PV_RENDER_PROTOCOL_VERSION ((uint32_t)2)
-#define PV_RENDER_SHM_NAME_MAX     96
+#define PV_RENDER_PROTOCOL_VERSION ((uint32_t)3)
+
+// How the bitmap reaches the helper: as a descriptor, over the command socket,
+// in the SCM_RIGHTS control message attached to the command itself.
+//
+// It used to travel as a POSIX shared-memory NAME, and a name is a thing that
+// outlives the processes that agreed on it. The viewer created the object,
+// named it in the command, and the helper unlinked it once it had mapped it --
+// which is correct on every path where both processes live long enough to run
+// it, and on no other. A viewer killed between shm_open and the helper's unlink
+// left the object with no owner and no name that anything would ever look up
+// again, and a POSIX shared-memory object with no link survives until the
+// machine is rebooted. Measured after a forced crash: one 12,800,000-byte
+// object, permanently.
+//
+// A descriptor cannot leak that way. The viewer now unlinks the name
+// immediately after sizing the object -- before it is ever mapped or sent -- so
+// from that instant the object exists only as long as some descriptor or
+// mapping refers to it. Every way either process can die, including SIGKILL,
+// closes descriptors and drops mappings, so every crash path is kernel-clean by
+// construction rather than by remembering to tidy up.
+//
+// This is why the command channel is a socketpair and not a pipe: SCM_RIGHTS
+// needs an AF_UNIX socket. The reply channel is still an ordinary pipe.
+#define PV_RENDER_COMMAND_CARRIES_FD 1
 
 // Layout is precomputed so neither the main thread nor the renderer has to ask
 // CoreGraphics for page geometry again. Put a finite bound on that up front: an
@@ -89,6 +114,56 @@ static inline unsigned PVRenderAlarmSeconds(uint64_t width, uint64_t height)
 #define PV_HELPER_MODE_META   "meta"     /* open reply, then geometry records */
 #define PV_HELPER_MODE_RENDER "render"   /* open reply only */
 
+// Copying the source document into the snapshot, in a process of its own.
+//
+// This is the same argument as rasterising, applied to the other end. open()
+// and read() on a network or removable volume are not interruptible calls: when
+// an SMB or NFS mount goes away, or a USB disk is pulled mid-read, the thread
+// making them blocks in the kernel and stays there. No timeout, no signal and
+// no amount of care in the calling code brings it back -- the only thing that
+// can be bounded is a process that can be killed.
+//
+// So the viewer no longer touches the source file at all. It creates the empty
+// snapshot, hands the descriptor to a copier, and watches: the copier's exit
+// wakes it immediately, and a copier that stops making progress is killed and
+// its half-written snapshot unlinked. Nothing the source volume does can wedge
+// the viewer, and nothing a wedged copier holds is waited for on a thread that
+// matters.
+#define PV_HELPER_MODE_COPY   "copy"     /* copy argv[1] into fd 1, then exit */
+
+// The descriptor the copier writes the snapshot to. stdout, so that the file
+// actions that set it up are the same two lines every other spawn uses.
+#define PV_COPY_OUTPUT_FD 1
+
+// How long the snapshot may fail to GROW before its copier is presumed wedged.
+//
+// Deliberately a stall bound and not a total one. A 2 GB document off a slow
+// USB 2 disk is a legitimate multi-minute copy, and a flat deadline would kill
+// it for being large rather than for being stuck. What distinguishes a hung
+// mount is that nothing arrives at all.
+#define PV_COPY_STALL_SECONDS (20.0)
+
+// How often the supervisor wakes to check that growth, when the copier has not
+// exited. Short enough that a wedge is noticed promptly, long enough that a
+// normal copy is not measurably watched.
+#define PV_COPY_POLL_SECONDS  (1)
+
+// The largest source document this viewer will copy, and the free space it
+// insists on having left over afterwards.
+//
+// Neither bound existed, and the copy loop reads until EOF. A sparse regular
+// file is the cheap way to demonstrate the problem -- a hundred gigabytes of
+// holes costs nothing to create and fills the boot volume when copied -- but
+// any large regular file does it, and the temporary directory filling up takes
+// the rest of the system with it, not just Postview. Two gigabytes is far past
+// any PDF that can be presented on the target hardware.
+//
+// Shared with the copier rather than private to the viewer, because the copier
+// is now the process that enforces both.
+#define PV_MAX_PDF_BYTES     (2LL * 1024LL * 1024LL * 1024LL)
+#define PV_SNAPSHOT_HEADROOM (256LL * 1024LL * 1024LL)
+#define PV_COPY_CHUNK_BYTES  (128 * 1024)
+
 // Why the helper could not present the document. Carried instead of an errno
 // because these are the cases the viewer has distinct wording for, and because
 // the interesting ones (encrypted, no pages) are not errno values at all.
@@ -156,7 +231,8 @@ typedef struct {
     uint64_t bytesPerRow;
     double   naturalWidth;
     double   naturalHeight;
-    char     sharedMemoryName[PV_RENDER_SHM_NAME_MAX];
+    // No shared-memory name. The bitmap arrives as the descriptor in this
+    // command's SCM_RIGHTS control message; see PV_RENDER_COMMAND_CARRIES_FD.
 } PVRenderCommand;
 
 typedef struct {

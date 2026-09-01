@@ -4,6 +4,11 @@
 #include <sys/stat.h>
 #include <sys/mount.h>
 #include <sys/file.h>
+#include <sys/socket.h>       // socketpair, sendmsg, SCM_RIGHTS
+#include <sys/event.h>        // kqueue/NOTE_EXIT, for supervising the copier
+#include <pthread.h>          // the detached reaper
+#include <crt_externs.h>      // _NSGetEnviron, for handing a helper the environment
+#include <sys/time.h>          // futimes, for the snapshot freshness guard
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <mach/mach_time.h>
@@ -16,18 +21,6 @@
 
 // Deliberately no PVRenderCore.h and no <CoreGraphics/CGPDFDocument.h> use.
 // This process does not open PDFs. See PVPDFSource.h.
-
-// The largest source document this viewer will copy, and the free space it
-// insists on having left over afterwards.
-//
-// Neither bound existed, and the copy loop below reads until EOF. A sparse
-// regular file is the cheap way to demonstrate the problem -- a hundred
-// gigabytes of holes costs nothing to create and fills the boot volume when
-// copied -- but any large regular file does it, and the temporary directory
-// filling up takes the rest of the system with it, not just Postview. Two
-// gigabytes is far past any PDF that can be presented on the target hardware.
-#define PV_MAX_PDF_BYTES     (2LL * 1024LL * 1024LL * 1024LL)
-#define PV_SNAPSHOT_HEADROOM (256LL * 1024LL * 1024LL)
 
 // Renders one helper serves before it is retired and replaced.
 //
@@ -111,15 +104,267 @@ static CGSize PVUsablePageSize(CGSize s)
     return out;
 }
 
+// Whether a helper keeps its diagnostics: its stderr, and this process's
+// environment.
+//
+// Both are suppressed in a shipping viewer, and for good reasons. A helper's
+// stderr has nowhere useful to go, and an empty environment is one less thing a
+// deliberately contained process inherits.
+//
+// Under test that same suppression threw away the only evidence the tests
+// existed to collect. A sanitized helper writes its findings to stderr and
+// takes its configuration from the environment, so a helper spawned with
+// neither reports nothing and is configured by nothing -- which means every
+// "address/thread sanitizer stress passed" only ever established that the
+// PARENT passed. The renderer, the process that does the drawing and holds the
+// shared mapping, was never actually being watched.
+//
+// Opt-in through the environment, so that no shipping build can take this path
+// by accident and a developer can turn it on for a single run.
+static BOOL PVHelperKeepsDiagnostics(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *value = getenv("PV_HELPER_DIAGNOSTICS");
+        cached = (value && *value && strcmp(value, "0") != 0) ? 1 : 0;
+    }
+    return cached ? YES : NO;
+}
+
+// The environment a helper is spawned with: none at all, unless diagnostics are
+// wanted. posix_spawn takes NULL to mean an empty environment, which is what a
+// contained renderer should have and exactly the wrong thing for a sanitized
+// one.
+static char *const *PVHelperEnvironment(void)
+{
+    return PVHelperKeepsDiagnostics() ? (char *const *)*_NSGetEnviron() : NULL;
+}
+
+// Where the render helper lives: beside this executable, whatever this
+// executable is. A C function because the copier needs it before any
+// PVPDFSource exists.
+static NSString *PVRenderHelperPath(void)
+{
+    NSString *directory = [[[NSBundle mainBundle] executablePath]
+        stringByDeletingLastPathComponent];
+    return [directory stringByAppendingPathComponent:@"PostviewRenderHelper"];
+}
+
+static void *PVReaperThread(void *context)
+{
+    pid_t pid = (pid_t)(intptr_t)context;
+    int status = 0;
+    pid_t reaped;
+    do { reaped = waitpid(pid, &status, 0); }
+    while (reaped < 0 && errno == EINTR);
+    return NULL;
+}
+
+// Reap a child without ever blocking this thread on one that will not die.
+//
+// waitpid(..., 0) on a process that has been SIGKILLed is normally instant, and
+// for every child this program starts on a good day it is. It is not instant
+// for a child wedged in an uninterruptible filesystem call: SIGKILL is recorded
+// and delivered when the call returns, which for a dead SMB mount can be
+// minutes, or never. A blocking wait there hangs the viewer on exactly the
+// fault the child process exists to contain -- the containment holds right up
+// until the tidying up throws it away.
+//
+// So the wait is bounded, and what cannot be waited for here is waited for
+// somewhere that does not matter. The zombie is reaped whenever the kernel lets
+// go of it; nothing is leaked and nothing is blocked.
+static void PVReapEventually(pid_t pid)
+{
+    if (pid <= 0) return;
+
+    int attempt;
+    for (attempt = 0; attempt < 50; attempt++) {
+        int status = 0;
+        pid_t reaped = waitpid(pid, &status, WNOHANG);
+        if (reaped == pid) return;
+        // ECHILD means it is already reaped and there is nothing owed.
+        if (reaped < 0 && errno != EINTR) return;
+        usleep(2000);
+    }
+
+    pthread_t thread;
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0) return;
+    (void)pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    (void)pthread_create(&thread, &attr, PVReaperThread, (void *)(intptr_t)pid);
+    pthread_attr_destroy(&attr);
+}
+
+// Watch a copier until it finishes, stalls, or the world ends.
+//
+// Two things are being waited for at once and they need different mechanisms.
+// The copier EXITING is an event, and NOTE_EXIT delivers it the instant it
+// happens, so an ordinary local copy costs nothing in latency. The copier
+// STALLING is the absence of an event, and the only honest evidence for it is
+// the snapshot not growing -- which is why the file itself is the progress
+// report and there is no second channel to keep in step with the first.
+//
+// Returns 0 when the copier exited successfully, or the errno to fail with.
+static int PVSuperviseCopier(pid_t pid, int output)
+{
+    int queue = kqueue();
+    if (queue < 0) {
+        // Nothing to watch with. Failing closed is right: this is a machine out
+        // of descriptors, the copy is about to fail anyway, and the alternative
+        // -- waiting on an unwatched child -- is the unbounded wait this whole
+        // function exists to prevent.
+        int saved = errno;
+        (void)kill(pid, SIGKILL);
+        PVReapEventually(pid);
+        return saved ? saved : ENOMEM;
+    }
+
+    struct kevent change;
+    EV_SET(&change, (uintptr_t)pid, EVFILT_PROC, EV_ADD | EV_ENABLE,
+           NOTE_EXIT, 0, NULL);
+    if (kevent(queue, &change, 1, NULL, 0, NULL) != 0) {
+        // The usual reason is that the child is already gone, which is not a
+        // failure -- the status is waiting to be collected.
+        if (errno != ESRCH) {
+            int saved = errno;
+            close(queue);
+            (void)kill(pid, SIGKILL);
+            PVReapEventually(pid);
+            return saved;
+        }
+    }
+
+    off_t grown = 0;
+    double moved = PVMonotonicSeconds();
+    int result = 0;
+
+    for (;;) {
+        struct kevent event;
+        struct timespec wait;
+        wait.tv_sec = PV_COPY_POLL_SECONDS;
+        wait.tv_nsec = 0;
+
+        int n = kevent(queue, NULL, 0, &event, 1, &wait);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) { result = errno; (void)kill(pid, SIGKILL); break; }
+
+        if (n > 0) {
+            // Exited. waitpid cannot block here: the child is already a zombie,
+            // which is the whole reason NOTE_EXIT was worth waiting on.
+            int status = 0;
+            pid_t reaped;
+            do { reaped = waitpid(pid, &status, 0); }
+            while (reaped < 0 && errno == EINTR);
+            close(queue);
+            if (reaped != pid) return EIO;
+            // A copier that died of a signal did not decide anything; only one
+            // that exited chose its status, and that status is an errno.
+            if (!WIFEXITED(status)) return EIO;
+            return WEXITSTATUS(status);
+        }
+
+        // A tick with no exit. The snapshot is the evidence.
+        struct stat info;
+        if (fstat(output, &info) == 0 && info.st_size > grown) {
+            grown = info.st_size;
+            moved = PVMonotonicSeconds();
+            continue;
+        }
+        if (PVMonotonicSeconds() - moved > PV_COPY_STALL_SECONDS) {
+            result = ETIMEDOUT;
+            (void)kill(pid, SIGKILL);
+            break;
+        }
+    }
+
+    close(queue);
+    // Whatever it was doing, it is not being waited for on this thread.
+    PVReapEventually(pid);
+    return result ? result : EIO;
+}
+
+// Copy `url` into `output` in a process that can be killed. Returns 0, or the
+// errno to fail the document open with.
+static int PVCopyThroughCopier(NSURL *url, int output)
+{
+    NSString *helperPath = PVRenderHelperPath();
+    if (![[NSFileManager defaultManager] isExecutableFileAtPath:helperPath])
+        return ENOENT;
+
+    NSString *source = [[url path] stringByStandardizingPath];
+    if (![source length]) return EINVAL;
+
+    posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attr;
+    BOOL actionsReady = NO, attrReady = NO;
+    pid_t pid = 0;
+    int saved = 0;
+
+    if (posix_spawn_file_actions_init(&actions) != 0) return errno ? errno : ENOMEM;
+    actionsReady = YES;
+
+    // The snapshot at stdout, and nothing else of this process's. The copier
+    // reads a path it is given and writes one descriptor it is handed; it has
+    // no use for anything else the viewer holds and must not be able to take
+    // any of it into a wedged state.
+    if (posix_spawn_file_actions_adddup2(&actions, output, PV_COPY_OUTPUT_FD) != 0 ||
+        posix_spawn_file_actions_addopen(&actions, STDIN_FILENO,
+                                         "/dev/null", O_RDONLY, 0) != 0) {
+        saved = ENOMEM;
+        goto done;
+    }
+    if (!PVHelperKeepsDiagnostics() &&
+        posix_spawn_file_actions_addopen(&actions, STDERR_FILENO,
+                                         "/dev/null", O_WRONLY, 0) != 0) {
+        saved = ENOMEM;
+        goto done;
+    }
+
+    if (posix_spawnattr_init(&attr) != 0) { saved = ENOMEM; goto done; }
+    attrReady = YES;
+    if (posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT) != 0) {
+        saved = ENOMEM;
+        goto done;
+    }
+
+    {
+        char *argv[4];
+        argv[0] = (char *)[helperPath fileSystemRepresentation];
+        argv[1] = (char *)[source fileSystemRepresentation];
+        argv[2] = (char *)PV_HELPER_MODE_COPY;
+        argv[3] = NULL;
+        int rc = posix_spawn(&pid, argv[0], &actions, &attr, argv,
+                             PVHelperEnvironment());
+        if (rc != 0) { pid = 0; saved = rc; goto done; }
+    }
+
+done:
+    if (attrReady)    posix_spawnattr_destroy(&attr);
+    if (actionsReady) posix_spawn_file_actions_destroy(&actions);
+    if (saved != 0)   return saved;
+
+    return PVSuperviseCopier(pid, output);
+}
+
 @interface PVPDFSnapshot : NSObject {
     NSString *_path;
-    // Held open for the snapshot's whole life, carrying a shared advisory lock
-    // and nothing else. It is never read or written through. See
-    // PVSweepAbandonedSnapshots.
-    int       _lockFD;
+    // Held open for the snapshot's whole life. It is never read or written
+    // through: it exists to carry the shared advisory lock, and to be the
+    // thing -refresh touches, so that neither operation can ever land on a
+    // file that merely has the same name. See PVSweepAbandonedSnapshots.
+    int       _fd;
+    // Whether _fd currently carries the lock. Separate from _fd because a
+    // descriptor without a lock is still worth keeping -- it is what lets
+    // -refresh push the mtime forward and try for the lock again.
+    BOOL      _locked;
+    // What file this snapshot IS. Recorded at creation so that a reopen by
+    // path can prove it found the same inode and not a successor.
+    dev_t     _dev;
+    ino_t     _ino;
 }
 - (id)initWithSourceURL:(NSURL *)url error:(NSError **)outError;
 - (NSString *)path;
+- (void)refresh;
 @end
 
 // The prefix every snapshot's name begins with. One definition, because a
@@ -135,16 +380,22 @@ static CGSize PVUsablePageSize(CGSize s)
 // does eventually reap its temporary directory, but "eventually" is not a
 // bound, and a reader who crashes twice a week accumulates.
 //
-// Whether a file is abandoned is asked, not guessed. Every live snapshot holds
-// a shared advisory lock on its own file for as long as it exists, so a file
-// that will accept an exclusive lock is a file no live snapshot is using. That
-// is exact, unlike an age heuristic, which would eventually delete the snapshot
-// of a document somebody has had open all week.
+// Whether a file is abandoned is asked twice, not guessed, and a file is
+// deleted only if both answers agree.
 //
-// The age test is kept as well, and only as a courtesy to a DIFFERENT build:
-// a Postview old enough not to take the lock would otherwise have its snapshot
-// swept while it was still reading it. An hour is far longer than the window
-// between making a snapshot and opening it.
+// The lock is the exact question. Every live snapshot holds a shared advisory
+// lock on its own file, so a file that will accept an exclusive lock is a file
+// no live snapshot is using.
+//
+// The age is the independent one, and it is a real guard rather than the
+// courtesy to older builds it was first written as. -[PVPDFSnapshot refresh]
+// pushes a live snapshot's mtime forward every time a helper starts, so a
+// document being read is never `old` no matter what happened to its lock. That
+// matters because the lock CAN fail to be taken -- a process out of descriptors
+// at exactly the wrong moment -- and when it did, this test was the only thing
+// standing between a live document and its snapshot being deleted out from
+// under it. Two guards that fail independently are the point; either one alone
+// was not enough.
 #define PV_SNAPSHOT_STALE_SECONDS (3600.0)
 
 static void PVSweepAbandonedSnapshots(void)
@@ -208,7 +459,8 @@ void PVSweepAbandonedSnapshotsNow(void)
 {
     self = [super init];
     if (!self) return nil;
-    _lockFD = -1;
+    _fd = -1;
+    _locked = NO;
 
     // Once per process, and here rather than at launch: this is the moment a
     // temporary directory full of abandoned copies actually costs something,
@@ -219,92 +471,28 @@ void PVSweepAbandonedSnapshotsNow(void)
     NSString *pattern = [NSTemporaryDirectory()
         stringByAppendingPathComponent:@"" PV_SNAPSHOT_PREFIX "XXXXXX"];
     char *tmp = strdup([pattern fileSystemRepresentation]);
-    void *buffer = NULL;
-    int input = -1, output = -1, saved = 0;
-    long long copied = 0;
-    struct stat before, after;
-    struct statfs space;
-    memset(&before, 0, sizeof(before));
-    memset(&after, 0, sizeof(after));
+    int output = -1, saved = 0;
 
     if (!tmp) { saved = ENOMEM; goto failed; }
-    input = open([[[url path] stringByStandardizingPath] fileSystemRepresentation],
-                 O_RDONLY);
-    if (input < 0) { saved = errno; goto failed; }
-    (void)fcntl(input, F_SETFD, FD_CLOEXEC);
-    // The two failures are separated because only one of them sets errno.
-    // fstat succeeding on something that is not a regular file leaves errno
-    // holding whatever the last unrelated call left there -- or nothing at all,
-    // which is an undefined read -- and the error the user is then shown is a
-    // strerror() of that.
-    if (fstat(input, &before) != 0) { saved = errno; goto failed; }
-    if (!S_ISREG(before.st_mode))   { saved = EINVAL; goto failed; }
-    // Bounded before a single byte is read, not discovered partway through.
-    if (before.st_size < 0 || (long long)before.st_size > PV_MAX_PDF_BYTES) {
-        saved = EFBIG;
-        goto failed;
-    }
 
+    // The destination first, and it is the only file this process opens.
+    //
+    // Everything that touches the SOURCE now happens in a copier subprocess.
+    // Nothing below this point can block on a volume that has gone away: a
+    // local mkstemp cannot hang, and the copy itself is watched from the
+    // outside and killed if it stops moving. See PV_HELPER_MODE_COPY.
     output = mkstemp(tmp);
     if (output < 0) { saved = errno; goto failed; }
     (void)fcntl(output, F_SETFD, FD_CLOEXEC);
     (void)fchmod(output, S_IRUSR | S_IWUSR);
 
-    // Filling the volume is not Postview's failure to have alone: everything
-    // else on the machine is writing to the same disk. Asked once, of the
-    // volume the temporary file actually landed on rather than of the path it
-    // was requested at.
-    if (fstatfs(output, &space) == 0) {
-        long long available = (long long)space.f_bavail * (long long)space.f_bsize;
-        if (available < (long long)before.st_size + PV_SNAPSHOT_HEADROOM) {
-            saved = ENOSPC;
-            goto failed;
-        }
-    }
-
-    buffer = malloc(128 * 1024);
-    if (!buffer) { saved = ENOMEM; goto failed; }
-    for (;;) {
-        ssize_t got;
-        do { got = read(input, buffer, 128 * 1024); }
-        while (got < 0 && errno == EINTR);
-        if (got < 0) { saved = errno; goto failed; }
-        if (got == 0) break;
-
-        // The bound again, this time against what is actually arriving. fstat
-        // reported a size; a file being appended to, or one whose size the
-        // filesystem misreports, can still deliver more than that, and the
-        // ceiling has to hold against the bytes rather than against the claim.
-        copied += (long long)got;
-        if (copied > PV_MAX_PDF_BYTES) { saved = EFBIG; goto failed; }
-
-        ssize_t offset = 0;
-        while (offset < got) {
-            ssize_t put;
-            do { put = write(output, (char *)buffer + offset,
-                             (size_t)(got - offset)); }
-            while (put < 0 && errno == EINTR);
-            if (put <= 0) { saved = errno ? errno : EIO; goto failed; }
-            offset += put;
-        }
-    }
-    if (fstat(input, &after) != 0) { saved = errno; goto failed; }
-    // st_ctimespec as well as st_mtimespec: a rename, a permission change or a
-    // truncation-and-rewrite that lands on the same mtime still moves ctime,
-    // and any of them means the bytes just copied are not one coherent file.
-    if (before.st_dev != after.st_dev || before.st_ino != after.st_ino ||
-        before.st_size != after.st_size ||
-        before.st_mtimespec.tv_sec != after.st_mtimespec.tv_sec ||
-        before.st_mtimespec.tv_nsec != after.st_mtimespec.tv_nsec ||
-        before.st_ctimespec.tv_sec != after.st_ctimespec.tv_sec ||
-        before.st_ctimespec.tv_nsec != after.st_ctimespec.tv_nsec) {
-        saved = EBUSY;
-        goto failed;
-    }
-    // What was actually copied, against what was promised. The size comparison
-    // above comes from two fstats of the same descriptor; this one is the only
-    // check that the copy loop itself moved the whole file.
-    if (copied != (long long)after.st_size) { saved = EBUSY; goto failed; }
+    // Every bound that used to be enforced inline -- the size ceiling, the
+    // free-space headroom, the regular-file test, and the before/after identity
+    // comparison that proves the bytes are one coherent file -- is enforced by
+    // the copier, on the far side of the process boundary. What comes back is
+    // the errno it decided on, or ETIMEDOUT if it had to be killed.
+    saved = PVCopyThroughCopier(url, output);
+    if (saved != 0) goto failed;
 
     // No fsync.
     //
@@ -323,32 +511,41 @@ void PVSweepAbandonedSnapshotsNow(void)
         stringWithFileSystemRepresentation:tmp length:strlen(tmp)] copy];
     if (!_path) { saved = ENOMEM; goto failed; }
 
+    // What this file is, before anything else can claim the name.
+    {
+        struct stat made;
+        if (fstat(output, &made) != 0) { saved = errno; goto failed; }
+        _dev = made.st_dev;
+        _ino = made.st_ino;
+    }
+
     // The claim on this file, held until -dealloc. Shared rather than
     // exclusive, so several snapshots of the same document -- which cannot
     // happen, but the lock should not be the thing that decides that -- and,
     // more usefully, so the sweeper's LOCK_EX is the only thing that ever
-    // conflicts. A failure to take it is not fatal: the worst case is that a
-    // future sweep reclaims this file an hour early, and refusing to open the
-    // document over it would be far worse.
-    _lockFD = dup(output);
-    if (_lockFD >= 0) {
-        (void)fcntl(_lockFD, F_SETFD, FD_CLOEXEC);
-        if (flock(_lockFD, LOCK_SH | LOCK_NB) != 0) {
-            close(_lockFD);
-            _lockFD = -1;
-        }
+    // conflicts.
+    //
+    // A failure to take it still does not refuse the document: that was the
+    // right call and it stands. What has changed is that the failure is no
+    // longer permanent and no longer unguarded -- the descriptor is kept
+    // regardless, and -refresh retries the lock and pushes the mtime forward
+    // every time a helper starts. See -refresh for why one guard was not
+    // enough.
+    _fd = dup(output);
+    if (_fd >= 0) {
+        (void)fcntl(_fd, F_SETFD, FD_CLOEXEC);
+        _locked = (flock(_fd, LOCK_SH | LOCK_NB) == 0);
     }
 
-    free(buffer);
-    close(input);
     close(output);
     free(tmp);
     return self;
 
 failed:
-    if (buffer) free(buffer);
-    if (input >= 0) close(input);
     if (output >= 0) close(output);
+    // The partial snapshot goes with the failure. A copier that was killed
+    // leaves a half-written file behind, and leaving it for the sweeper would
+    // mean an hour of a truncated document sitting in the temporary directory.
     if (tmp) {
         unlink(tmp);
         free(tmp);
@@ -360,6 +557,16 @@ failed:
                      @"before opening a document.";
         } else if (saved == ENOSPC) {
             reason = @"There is not enough free space to copy it safely.";
+        } else if (saved == ETIMEDOUT) {
+            // The one failure that is about the VOLUME rather than the file,
+            // and the one a reader can actually act on: the disk or share the
+            // document is on has stopped answering.
+            reason = @"The disk or network share it is on stopped responding. "
+                     @"Check that the volume is still connected, then try "
+                     @"again.";
+        } else if (saved == ENOENT) {
+            reason = @"It could not be found, or Postview's renderer is "
+                     @"missing from the application bundle.";
         } else {
             reason = [NSString stringWithFormat:
                 @"The source changed or became unreadable (%s).",
@@ -373,12 +580,67 @@ failed:
 
 - (NSString *)path { return _path; }
 
+// Say, twice over, that this snapshot is still in use.
+//
+// PVSweepAbandonedSnapshots deletes a file only when it is BOTH older than
+// PV_SNAPSHOT_STALE_SECONDS and willing to give up an exclusive lock. Those
+// read like two independent guards, and they were written as two, but only one
+// of them was ever actually maintained: the lock was taken once at creation and
+// a failure to take it was ignored for the rest of the document's life. An
+// unlocked snapshot was therefore protected by its mtime alone, and after an
+// hour a sweep in another Postview would delete a file this process was still
+// reading.
+//
+// The shape of that fault is the reason it is worth this much code. The
+// document goes on rendering perfectly out of the helper that already has it
+// open, and stops the moment that helper is recycled -- so it is minutes of
+// entirely normal behaviour, then permanent blankness, with the cause an hour
+// in the past and in a different process.
+//
+// So both guards are now really held, and re-held on every helper start:
+//   * the mtime is pushed forward, so a snapshot in use is never `old`;
+//   * a lock that was never taken, or was lost, is taken now.
+// Neither can refuse to open a document, and neither is load-bearing alone.
+- (void)refresh
+{
+    if (!_path) return;
+
+    // No descriptor at all: creation could not dup one. Reopen by name, and
+    // prove it is the same inode -- if a sweep has already taken this file the
+    // name may belong to something else entirely.
+    if (_fd < 0) {
+        int fd = open([_path fileSystemRepresentation], O_RDONLY);
+        if (fd >= 0) {
+            struct stat found;
+            if (fstat(fd, &found) == 0 &&
+                found.st_dev == _dev && found.st_ino == _ino) {
+                (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+                _fd = fd;
+            } else {
+                close(fd);
+            }
+        }
+    }
+    if (_fd < 0) return;
+
+    if (!_locked) _locked = (flock(_fd, LOCK_SH | LOCK_NB) == 0);
+
+    // NULL is "now". By descriptor, so it cannot touch a file that merely has
+    // the same name as ours.
+    (void)futimes(_fd, NULL);
+}
+
 - (void)dealloc
 {
     if (_path) unlink([_path fileSystemRepresentation]);
     // After the unlink, so the lock is held across it and a sweep running in
     // another process cannot get between the two.
-    if (_lockFD >= 0) { flock(_lockFD, LOCK_UN); close(_lockFD); _lockFD = -1; }
+    if (_fd >= 0) {
+        if (_locked) flock(_fd, LOCK_UN);
+        close(_fd);
+        _fd = -1;
+        _locked = NO;
+    }
     [_path release];
     [super dealloc];
 }
@@ -412,16 +674,65 @@ static void PVReleaseSharedBitmap(void *info, const void *data, size_t size)
     }
 }
 
-static BOOL PVWriteExact(int fd, const void *bytes, size_t length)
+// One command, with the bitmap's descriptor attached.
+//
+// The descriptor rides in an SCM_RIGHTS control message on the same sendmsg as
+// the command it belongs to, so the two cannot be separated, reordered or
+// mismatched: a helper that has a command has the buffer that command refers
+// to, or it has neither.
+//
+// A short send is treated as a failure rather than resumed. The protocol is
+// strictly one command in flight at a time and the struct is a couple of
+// hundred bytes against a socket buffer measured in kilobytes, so a partial
+// write here does not mean "busy", it means something is wrong with the
+// channel -- and the caller's answer to that, killing the helper and starting
+// a fresh one, is the right answer to all of it.
+static BOOL PVSendCommandWithDescriptor(int socket,
+                                        const PVRenderCommand *command,
+                                        int descriptor)
 {
-    size_t offset = 0;
-    while (offset < length) {
-        ssize_t count = write(fd, (const char *)bytes + offset, length - offset);
-        if (count < 0 && errno == EINTR) continue;
-        if (count <= 0) return NO;
-        offset += (size_t)count;
-    }
-    return YES;
+    struct iovec item;
+    item.iov_base = (void *)command;
+    item.iov_len  = sizeof(*command);
+
+    // Aligned as a cmsghdr, and sized by a constant.
+    //
+    // Two separate hazards, both invisible until they are not. The union gives
+    // the storage cmsghdr alignment, which CMSG_FIRSTHDR needs and a bare char
+    // array does not promise. The odd-looking length is because CMSG_SPACE is
+    // NOT a constant expression on the 10.9 SDK -- __DARWIN_ALIGN32 casts
+    // through a size_t -- so using it to size an array quietly produced a
+    // variable-length array inside a union, which is a clang extension rather
+    // than C. sizeof(struct cmsghdr) + sizeof(int) + 32 is a genuine constant
+    // and is comfortably above CMSG_SPACE(sizeof(int)), which cannot exceed
+    // sizeof(struct cmsghdr) + 3 + sizeof(int) + 3.
+    union {
+        struct cmsghdr align;
+        char           bytes[sizeof(struct cmsghdr) + sizeof(int) + 32];
+    } control;
+    memset(&control, 0, sizeof(control));
+
+    // Stated rather than trusted to the arithmetic above.
+    if (sizeof(control.bytes) < CMSG_SPACE(sizeof(int))) return NO;
+
+    struct msghdr message;
+    memset(&message, 0, sizeof(message));
+    message.msg_iov        = &item;
+    message.msg_iovlen     = 1;
+    message.msg_control    = control.bytes;
+    message.msg_controllen = CMSG_SPACE(sizeof(int));
+
+    struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+    if (!header) return NO;
+    header->cmsg_level = SOL_SOCKET;
+    header->cmsg_type  = SCM_RIGHTS;
+    header->cmsg_len   = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(header), &descriptor, sizeof(descriptor));
+
+    ssize_t sent;
+    do { sent = sendmsg(socket, &message, 0); }
+    while (sent < 0 && errno == EINTR);
+    return (sent == (ssize_t)sizeof(*command));
 }
 
 // Read exactly `length` bytes, or give up at `deadline`.
@@ -444,9 +755,14 @@ static BOOL PVReadExactUntil(int fd, void *bytes, size_t length, double deadline
         item.fd = fd;
         item.events = POLLIN | POLLHUP | POLLERR;
         item.revents = 0;
-        int ready;
-        do { ready = poll(&item, 1, milliseconds); }
-        while (ready < 0 && errno == EINTR);
+        // A signal sends this back to the top of the loop rather than round an
+        // inner one, so `left` is recomputed from the absolute deadline. The
+        // inner retry passed the ORIGINAL timeout to poll again, which quietly
+        // extended the deadline by up to one full interval every time a signal
+        // arrived -- and the deadline is the only thing bounding a helper that
+        // has stopped answering.
+        int ready = poll(&item, 1, milliseconds);
+        if (ready < 0 && errno == EINTR) continue;
         if (ready == 0) { if (outTimedOut) *outTimedOut = YES; return NO; }
         if (ready < 0 || (item.revents & (POLLERR | POLLNVAL))) return NO;
 
@@ -690,9 +1006,7 @@ static NSError *PVOpenStatusError(int32_t status)
 
 - (NSString *)renderHelperPath
 {
-    NSString *directory = [[[NSBundle mainBundle] executablePath]
-        stringByDeletingLastPathComponent];
-    return [directory stringByAppendingPathComponent:@"PostviewRenderHelper"];
+    return PVRenderHelperPath();
 }
 
 // Kill the helper and reap it. Safe from any thread, and safe from -dealloc:
@@ -710,10 +1024,11 @@ static NSError *PVOpenStatusError(int32_t status)
 
     if (_helperPid > 0) {
         (void)kill(_helperPid, SIGKILL);
-        int status = 0;
-        pid_t reaped;
-        do { reaped = waitpid(_helperPid, &status, 0); }
-        while (reaped < 0 && errno == EINTR);
+        // Bounded. A helper wedged inside Quartz takes the SIGKILL only when
+        // the call it is stuck in returns, and blocking here for that would
+        // hang the viewer on the exact fault the process boundary exists to
+        // contain. See PVReapEventually.
+        PVReapEventually(_helperPid);
         _helperPid = 0;
     }
     _helperRenders = 0;
@@ -727,6 +1042,11 @@ static NSError *PVOpenStatusError(int32_t status)
     if (!outFailure) outFailure = &ignored;
     *outFailure = PVRenderFailureNone;
     [self stopRenderHelper];
+
+    // Both sweep guards, re-asserted. Here rather than on a timer because this
+    // is the moment that matters: a helper is about to open the snapshot by
+    // name, so the name had better still be this file's.
+    [_snapshot refresh];
 
     NSString *helperPath = [self renderHelperPath];
     if (![[NSFileManager defaultManager] isExecutableFileAtPath:helperPath]) {
@@ -749,7 +1069,11 @@ static NSError *PVOpenStatusError(int32_t status)
     BOOL actionsReady = NO, attrReady = NO;
     pid_t pid = 0;
 
-    if (pipe(toHelper) != 0)   goto failed;
+    // Commands travel over a socketpair rather than a pipe, because each one
+    // carries the bitmap's descriptor in an SCM_RIGHTS control message and only
+    // an AF_UNIX socket can carry those. Replies are still an ordinary pipe:
+    // nothing travels back but bytes.
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, toHelper) != 0) goto failed;
     if (pipe(fromHelper) != 0) goto failed;
 
     if (posix_spawn_file_actions_init(&actions) != 0) goto failed;
@@ -760,7 +1084,12 @@ static NSError *PVOpenStatusError(int32_t status)
     // server connection -- is closed in the child by POSIX_SPAWN_CLOEXEC_DEFAULT
     // below, so a helper that is killed cannot be holding anything open.
     if (posix_spawn_file_actions_adddup2(&actions, toHelper[0], STDIN_FILENO) != 0 ||
-        posix_spawn_file_actions_adddup2(&actions, fromHelper[1], STDOUT_FILENO) != 0 ||
+        posix_spawn_file_actions_adddup2(&actions, fromHelper[1], STDOUT_FILENO) != 0)
+        goto failed;
+    // stderr is discarded in a shipping viewer and kept under test. See
+    // PVHelperKeepsDiagnostics: a sanitized helper that cannot write its
+    // findings anywhere is a sanitized helper nobody is reading.
+    if (!PVHelperKeepsDiagnostics() &&
         posix_spawn_file_actions_addopen(&actions, STDERR_FILENO,
                                          "/dev/null", O_WRONLY, 0) != 0)
         goto failed;
@@ -782,7 +1111,8 @@ static NSError *PVOpenStatusError(int32_t status)
         argv[2] = (char *)(wantGeometry ? PV_HELPER_MODE_META
                                         : PV_HELPER_MODE_RENDER);
         argv[3] = NULL;
-        int rc = posix_spawn(&pid, argv[0], &actions, &attr, argv, NULL);
+        int rc = posix_spawn(&pid, argv[0], &actions, &attr, argv,
+                             PVHelperEnvironment());
         if (rc != 0) { pid = 0; goto failed; }
     }
 
@@ -818,9 +1148,22 @@ static NSError *PVOpenStatusError(int32_t status)
         if (!got || reply.magic != PV_RENDER_PROTOCOL_MAGIC ||
             reply.version != PV_RENDER_PROTOCOL_VERSION) {
             [self stopRenderHelper];
-            *outFailure = !got && timedOut ? PVRenderFailureTimeout
-                        : !got             ? PVRenderFailureHelperUnavailable
-                                           : PVRenderFailureProtocol;
+            // EOF here is NOT "the renderer is missing".
+            //
+            // Reaching this point means the executable was found, was
+            // executable, and was spawned -- all of that is settled far above,
+            // and that check is the only thing that can honestly report a
+            // broken installation. What EOF means HERE is that a helper which
+            // did start died before it answered: a crash in Quartz on the
+            // document being opened, an out-of-memory kill, a signal. Calling
+            // that PVRenderFailureHelperUnavailable put the viewer into its
+            // permanent _helperUnavailable state and told the reader to
+            // reinstall the application, for a fault in the file they had just
+            // opened. It is a helper that cannot be trusted to be at a message
+            // boundary, which is exactly PVRenderFailureProtocol, and the layer
+            // above retries it under backoff instead of retiring the document.
+            *outFailure = timedOut ? PVRenderFailureTimeout
+                                   : PVRenderFailureProtocol;
             return NO;
         }
         if (outReply) *outReply = reply;
@@ -836,10 +1179,7 @@ failed:
     if (fromHelper[1] >= 0) close(fromHelper[1]);
     if (pid > 0) {
         (void)kill(pid, SIGKILL);
-        int status = 0;
-        pid_t reaped;
-        do { reaped = waitpid(pid, &status, 0); }
-        while (reaped < 0 && errno == EINTR);
+        PVReapEventually(pid);
     }
     // A resource failure, not a broken installation. Everything reaching this
     // label is a pipe that could not be made, a spawn_file_actions that could
@@ -881,11 +1221,20 @@ failed:
 static PVRenderFailure PVFailureForReplyStatus(int32_t status)
 {
     switch (status) {
-        // The renderer declined this page: a page object the document would not
-        // hand back, or a bitmap context Quartz refused to build over a buffer
-        // it had already been told the shape of. Deterministic.
+        // The renderer declined this page as asked for: no such page, or a
+        // request whose shape contradicts itself. Deterministic.
         case EINVAL:  return PVRenderFailureInvalidPage;
+        // Drawing refused: a non-finite transform out of the page's own boxes,
+        // or an exception from inside CGContextDrawPDFPage. Also deterministic,
+        // and carried separately from EINVAL only so that a malformed page and
+        // a malformed request are distinguishable after the fact.
+        case EILSEQ:  return PVRenderFailureInvalidPage;
+        // The two ends disagreed about a structure they both computed.
         case EPROTO:  return PVRenderFailureProtocol;
+        // Quartz could not get the memory to draw into. Stated rather than left
+        // to the default, because this is the case the whole split exists for:
+        // nothing is wrong with the page and it must be asked for again.
+        case ENOMEM:  return PVRenderFailureTransientResource;
         // Everything else is an errno from shm_open or mmap inside the helper:
         // a resource that was not available at that instant.
         default:      return PVRenderFailureTransientResource;
@@ -935,7 +1284,7 @@ static PVRenderFailure PVFailureForReplyStatus(int32_t status)
     // "/pv-" + 5 + "-" + 16 = 26 characters, comfortably inside
     // PV_SHM_NAME_MAX for the life of the process. See PV_SHM_NAME_MAX for what
     // went wrong when the name could outgrow it.
-    char name[PV_RENDER_SHM_NAME_MAX + 1];
+    char name[PV_SHM_NAME_MAX + 1];
     int sharedFD = -1;
     unsigned attempt;
     for (attempt = 0; attempt < 16; attempt++) {
@@ -961,6 +1310,18 @@ static PVRenderFailure PVFailureForReplyStatus(int32_t status)
         return NULL;
     }
 
+    // The name is finished with the moment the object has a size, and it is
+    // dropped here rather than after the render for exactly that reason. From
+    // this point the object is reachable only through `sharedFD` and the
+    // mappings made from it, so there is no window in which a SIGKILL to either
+    // process can strand a named segment that nothing will ever unlink. See
+    // PV_RENDER_COMMAND_CARRIES_FD.
+    //
+    // Unchecked: the name was created O_EXCL a few lines above and belongs to
+    // this process, so the only way this fails is if it never existed, and the
+    // shm_open above already proved otherwise.
+    (void)shm_unlink(name);
+
     // PROT_READ, and no memset.
     //
     // Both halves of that are the same decision. The viewer used to map the
@@ -976,10 +1337,13 @@ static PVRenderFailure PVFailureForReplyStatus(int32_t status)
     // Read-only here also states the direction of the channel: the helper
     // writes pixels, the viewer reads them, and neither needs the other's
     // permission.
+    //
+    // sharedFD stays open past this mapping: it is what gets sent to the
+    // helper, and with the name already gone it is now the only way to name
+    // this object at all.
     void *map = mmap(NULL, bytes, PROT_READ, MAP_SHARED, sharedFD, 0);
-    close(sharedFD);
     if (map == MAP_FAILED) {
-        shm_unlink(name);
+        close(sharedFD);
         *failure = PVRenderFailureTransientResource;
         return NULL;
     }
@@ -1012,9 +1376,13 @@ static PVRenderFailure PVFailureForReplyStatus(int32_t status)
         command.bytesPerRow = bytesPerRow;
         command.naturalWidth = _sizes[index].width;
         command.naturalHeight = _sizes[index].height;
-        strlcpy(command.sharedMemoryName, name, sizeof(command.sharedMemoryName));
 
-        BOOL wrote = PVWriteExact(_helperIn, &command, sizeof(command));
+        // The descriptor goes with the command and is closed the instant it has
+        // been sent. The helper holds its own copy from here; this process
+        // keeps only the read-only mapping it already made.
+        BOOL wrote = PVSendCommandWithDescriptor(_helperIn, &command, sharedFD);
+        close(sharedFD);
+        sharedFD = -1;
         PVRenderReply reply;
         memset(&reply, 0, sizeof(reply));
         BOOL timedOut = NO;
@@ -1084,7 +1452,10 @@ static PVRenderFailure PVFailureForReplyStatus(int32_t status)
         }
     }
     @finally {
-        shm_unlink(name);
+        // No shm_unlink here any more: the name was dropped before the mapping
+        // was made. Only the descriptor could still be open, and only if the
+        // send never happened.
+        if (sharedFD >= 0) close(sharedFD);
         PVResidentSub(PVResidentRender, bytes);
         if (!handed) munmap(map, bytes);
         if (retire) [self stopRenderHelper];

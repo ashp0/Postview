@@ -734,6 +734,52 @@ int main(int argc, const char *argv[])
             OK([wc pageIsUnrenderable:9 preview:NO],
                "a page CoreGraphics refuses is still retired after three tries");
 
+            // Two pages whose backoffs expire at DIFFERENT times.
+            //
+            // One timer serves every outstanding backoff, and -scheduleRetryAt:
+            // keeps only the earliest deadline on the reasoning that a later
+            // one is covered because the fire re-examines every slot. It is
+            // not. Re-examining a slot whose wait has not expired reports it
+            // unrenderable and returns -- no failure is recorded for it, so
+            // nothing calls -scheduleRetryAt: again. The timer only survived as
+            // long as the pages coming due kept FAILING; the first time one
+            // succeeded, every page with a longer backoff was left waiting on a
+            // scroll or a zoom that need never come, and stayed blank.
+            //
+            // Two failures give page 21 a 0.50 s deadline and one gives page 20
+            // a 0.25 s deadline, so 20's timer supersedes 21's. What is asserted
+            // is what happens at 20's fire: the timer must be re-armed for 21,
+            // not simply consumed.
+            //
+            // Note that -pageIsUnrenderable: alone cannot see this bug -- it
+            // compares the deadline against the clock, so page 21 reports
+            // renderable the moment its deadline passes whether or not anything
+            // ever asks for it again. The timer is the thing that does the
+            // asking, so the timer is what this checks.
+            [wc resetRenderFailures];
+            for (i = 0; i < 2; i++)
+                [wc renderQueue:pq didFailPage:21 pixelSize:px preview:NO
+                        failure:PVRenderFailureTransientResource];
+            [wc renderQueue:pq didFailPage:20 pixelSize:px preview:NO
+                    failure:PVRenderFailureTransientResource];
+
+            double armedFirst = [[wc valueForKey:@"_retryTimerAt"] doubleValue];
+            OK(armedFirst > 0,
+               "a staggered pair arms a retry timer for the earlier deadline");
+
+            OK(PumpUntil(^BOOL{
+                   return (BOOL)([[wc valueForKey:@"_retryTimerAt"] doubleValue]
+                                 != armedFirst); }, 5.0),
+               "...the earlier deadline fires");
+            OK([[wc valueForKey:@"_retryTimerAt"] doubleValue] > 0,
+               "...and re-arms for the page still waiting, rather than "
+               "abandoning it");
+
+            OK(PumpUntil(^BOOL{
+                   return (BOOL)![wc pageIsUnrenderable:21 preview:NO]; }, 5.0),
+               "...so the later page comes back too");
+            [wc resetRenderFailures];
+
             // A failure recorded at one bitmap size must not retire another.
             [wc resetRenderFailures];
             for (i = 0; i < 2; i++)
@@ -1468,26 +1514,36 @@ int main(int argc, const char *argv[])
             OK(motion > 0,
                "the motion gate now reports the full renders it withheld");
 
-            // The paired RSS reading. The showdown subtracts this from the
-            // resident high-water mark to say how much of the peak is NOT
-            // rendered pixels, and that subtraction is only a quantity if both
-            // terms describe the same instant -- which is the whole reason the
-            // app takes the reading itself instead of the sampler taking a
-            // maximum of its own.
+            // The paired RSS reading: this process's footprint at the instant
+            // the bitmap census peaked, taken by the app itself so that the two
+            // numbers describe one moment rather than two maxima found on
+            // different schedules.
             //
-            // Asserted as an inequality rather than a value, because the value
-            // is whatever this machine's frameworks weigh. The inequality is
-            // the part that would break if the pairing did: RSS at the moment
-            // the bitmaps peaked cannot be smaller than the bitmaps, since they
-            // are resident memory and are counted in it.
+            // What is asserted is that the reading was TAKEN. What is
+            // deliberately not asserted is rssAtPeak >= residentPeak, which
+            // used to sit here reading like a sanity check.
+            //
+            // It was a claim about page-fault behaviour in another process. The
+            // census counts bitmap bytes from the moment they are MAPPED, and
+            // since rasterisation moved out of process those pixels are written
+            // by the render helper into shared memory and mapped read-only
+            // here -- so their physical pages are charged to the helper, and
+            // land in this process's RSS only for the ones it happened to touch
+            // by drawing them before they were evicted. Both orderings occur on
+            // the same build: 178.4 MB of census against 78.0 MB of RSS on one
+            // host, and 178.4 MB against 206.9 MB on another. An inequality
+            // that holds or fails for reasons unrelated to the code under test
+            // is not a gate, and the two quantities are not two measurements of
+            // one thing.
             double rssAtPeak = (double)PVResidentRSSAtHighWater();
-            double residentPeak = (double)PVResidentHighWater();
-            printf("  rss at the bitmap peak: %.1f MB, bitmaps %.1f MB\n",
-                   rssAtPeak / (1024.0 * 1024.0), residentPeak / (1024.0 * 1024.0));
+            double liveBitmaps = (double)PVResidentHighWater();
+            printf("  rss at the bitmap peak: %.1f MB, live bitmaps %.1f MB\n",
+                   rssAtPeak / (1024.0 * 1024.0),
+                   liveBitmaps / (1024.0 * 1024.0));
             OK(rssAtPeak > 0,
                "RSS is sampled at the instant the bitmap census peaks");
-            OK(rssAtPeak >= residentPeak,
-               "...and is never smaller than the bitmaps it contains");
+            OK(liveBitmaps > 0,
+               "the bitmap census recorded a peak to pair it with");
 
             // Slow: 8 pt every 40 ms is 200 pt/s, a deliberate read-along drag.
             // Every page survives the dwell test at that speed, so the per-page

@@ -725,6 +725,57 @@ static double PVTransientBackoff(unsigned attempts)
     _retryTimerAt = 0;
 }
 
+// The earliest backoff still in the future, re-armed after a fire.
+//
+// -scheduleRetryAt: deliberately keeps only the EARLIEST deadline, on the
+// reasoning that a later one is already covered because the fire re-examines
+// every slot. Re-examining is not the same as re-arming. -pageIsUnrenderable:
+// reports a slot whose wait has not expired as unrenderable and returns, so
+// nothing records a fresh failure for it and nothing calls -scheduleRetryAt:
+// again. The timer therefore survived only as long as the pages that came due
+// kept FAILING; the moment one of them succeeded, every slot with a longer
+// backoff was left waiting on an unrelated event -- a scroll, a zoom, another
+// failure -- that need never arrive. Two pages failing a few hundred
+// milliseconds apart was enough to strand the second one indefinitely blank.
+//
+// So the fire ends by asking the tables directly. A slot at 0 is not waiting; a
+// slot in the past is eligible and has just been retried; anything else is an
+// outstanding deadline, and the nearest of them is the next time there is
+// something new to ask.
+- (void)armNextOutstandingRetry
+{
+    if (_closing) return;
+
+    double now = PVMonotonicSeconds();
+    double next = 0;
+    BOOL found = NO;
+    NSUInteger i;
+
+    // Both tables, because one timer serves both. A NaN deadline -- which
+    // nothing writes, but which this loop must not propagate into an
+    // NSTimer interval -- fails the comparison and is skipped like a 0.
+    if (_pageRetryAt) {
+        for (i = 0; i < _failureSlots * 2; i++) {
+            double deadline = _pageRetryAt[i];
+            if (deadline > now && (!found || deadline < next)) {
+                next = deadline;
+                found = YES;
+            }
+        }
+    }
+    if (_thumbRetryAt) {
+        for (i = 0; i < _failureSlots; i++) {
+            double deadline = _thumbRetryAt[i];
+            if (deadline > now && (!found || deadline < next)) {
+                next = deadline;
+                found = YES;
+            }
+        }
+    }
+
+    if (found) [self scheduleRetryAt:next];
+}
+
 - (void)retryFired:(NSTimer *)timer
 {
     _retryTimer = nil;
@@ -737,6 +788,10 @@ static double PVTransientBackoff(unsigned attempts)
     _haveRequestState = NO;
     _haveThumbState = NO;
     [self updateVisibleContent];
+    // -updateVisibleContent has re-asked for everything that came due. Anything
+    // still waiting needs a timer of its own, and this is the only place that
+    // knows the one just consumed is gone.
+    [self armNextOutstandingRetry];
 }
 
 // The renderer is missing from the bundle. Said once per document, because it
@@ -1689,6 +1744,13 @@ static double PVTransientBackoff(unsigned attempts)
 
     CGFloat fraction = 0;
     NSUInteger page = [self currentPageWithFraction:&fraction];
+    // The same reasoning as -windowDidEndLiveResize:, and it has to be here
+    // too. Not every resize is a drag: toggling the sidebar, entering or
+    // leaving full screen, and any programmatic -setFrame: all arrive through
+    // this path with -inLiveResize false, and all of them change the bitmap
+    // dimensions. A page retired at the old size was being filtered out of the
+    // wanted set before it could ever be attempted at the new one.
+    [self resetRenderFailures];
     [self relayoutKeepingPage:page fraction:fraction];
     [self updateVisibleContent];
 }

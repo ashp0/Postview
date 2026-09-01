@@ -156,6 +156,43 @@ static unsigned int Rnd(void)
 // requests off the other end. This is the app's hottest lock by a wide margin:
 // during a live scroll it is taken on every bounds notification, and the worker
 // takes it once per page and once per delivery.
+// Somewhere to notice that renders happened at all.
+//
+// Every assertion in this harness is about TEARDOWN -- queues settle, objects
+// reach a zero census, nothing survives a close. Every one of them is equally
+// true of a build in which no page ever rendered: a queue that fails all sixty
+// requests settles just as cleanly as one that served them, and the census is
+// just as zero. So the sanitizer runs that this file is the gate for could have
+// been reporting on a viewer that rasterised nothing, and would have passed.
+//
+// It counts failures too, and separately. A failure is not a crash and this
+// harness is not a correctness suite -- what would be wrong is silence.
+static int gDelivered = 0;
+static int gFailed = 0;
+
+@interface PVStressCollector : NSObject <PVRenderQueueDelegate>
+@end
+
+@implementation PVStressCollector
+- (void)renderQueue:(PVRenderQueue *)queue
+      didRenderPage:(NSUInteger)page
+              image:(CGImageRef)image
+          pixelSize:(CGSize)px
+            preview:(BOOL)preview
+{
+    (void)queue; (void)page; (void)px; (void)preview;
+    if (image) gDelivered++;
+}
+- (void)renderQueue:(PVRenderQueue *)queue
+        didFailPage:(NSUInteger)page
+          pixelSize:(CGSize)px
+            preview:(BOOL)preview
+{
+    (void)queue; (void)page; (void)px; (void)preview;
+    gFailed++;
+}
+@end
+
 static void StressQueueChurn(NSURL *url, int rounds)
 {
     printf("\n[queue churn: %d rounds of wanted-set replacement under load]\n", rounds);
@@ -166,6 +203,8 @@ static void StressQueueChurn(NSURL *url, int rounds)
     NSUInteger pages = [src pageCount];
     @autoreleasepool {
     PVRenderQueue *q = [[PVRenderQueue alloc] initWithSource:src label:"com.postview.stress"];
+    PVStressCollector *collector = [[PVStressCollector alloc] init];
+    [q setDelegate:collector];
     int i;
     for (i = 0; i < rounds; i++) {
         NSMutableArray *reqs = [NSMutableArray array];
@@ -193,12 +232,41 @@ static void StressQueueChurn(NSURL *url, int rounds)
     [q setSuspended:NO];
     Pump(0.30);
 
+    // Waited for, not raced against.
+    //
+    // The churn above is deliberately hostile to completion -- it replaces the
+    // wanted set 400 times without letting the queue breathe -- so whether any
+    // bitmap survives to delivery in a flat 0.30 s is a statement about how
+    // fast the host is, not about whether the renderer works. Measured before
+    // this wait existed: exactly ONE bitmap delivered across the whole phase,
+    // and zero as soon as anything shifted the timing slightly. That is the
+    // same mistake the flat teardown deadlines made, and it gets the same fix.
+    //
+    // The queue is idle here and the last wanted set is still outstanding, so
+    // this returns as soon as the first page lands and only spends the full
+    // deadline when nothing is going to.
+    {
+        double waited = 0, limit = 30.0 * DeadlineScale();
+        while (gDelivered == 0 && waited < limit) {
+            Pump(0.05);
+            waited += 0.05;
+        }
+    }
+
     [q shutdown];
     // Waited for, not guessed at: see QueueSettles.
     BOOL settled = QueueSettles(q, 30.0);
     OK(settled, "queue settles after churn and shutdown");
     OK([q isIdle], "queue is idle after churn and shutdown");
     OK([q inFlightCount] == 0, "nothing is left marked in flight after churn");
+    // The assertion this file existed without. Without it every sanitizer run
+    // below is a statement about a viewer that may have drawn nothing.
+    OK(gDelivered > 0, "the renderer actually produced bitmaps during churn");
+    if (gDelivered == 0)
+        printf("        (delivered=%d failed=%d -- no page rendered at all)\n",
+               gDelivered, gFailed);
+    [q setDelegate:nil];
+    [collector release];
     [q release];
     }
     [src release];
@@ -379,6 +447,25 @@ int main(int argc, const char *argv[])
                 "  HOME is currently %s\n"
                 "  Run it through `make stress`, which creates one.\n",
                 home ? home : "(unset)");
+            return 2;
+        }
+
+        // The same argument as the scratch HOME above, for the same reason.
+        //
+        // A render helper is spawned with its stderr on /dev/null and an empty
+        // environment unless PV_HELPER_DIAGNOSTICS says otherwise, which is
+        // correct for a shipping viewer and useless for this harness: a
+        // sanitized helper writes its findings to stderr and configures itself
+        // from the environment, so a run without them is a run in which the
+        // renderer -- the process holding the shared mapping and doing the
+        // drawing -- was never actually being watched. Every "sanitizer stress
+        // passed" collected that way only ever meant the parent passed.
+        if (!getenv("PV_HELPER_DIAGNOSTICS")) {
+            fprintf(stderr,
+                "pvstress: refusing to run without PV_HELPER_DIAGNOSTICS.\n"
+                "  Helper stderr would go to /dev/null and its environment\n"
+                "  would be empty, so nothing the render helper reports could\n"
+                "  be seen. Run it through `make stress`, which sets it.\n");
             return 2;
         }
 
