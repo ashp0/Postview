@@ -452,15 +452,27 @@ REALPDF ?=
 # has only python3.
 PYTHON ?= $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null)
 
-# Everything the suite links. main.m has its own main(), and PVAppDelegate and
-# PVDocument are the application shell -- the suite drives PVWindowController
-# directly, which is the point.
+# Everything the suite links. main.m has its own main(), and PVDocument is the
+# NSDocument shell -- the suite drives PVWindowController directly, which is
+# the point.
 #
 # This used to be two lists: the unit suite additionally excluded
 # PVWindowController.o, because pvtest.m did not reference it. One file
 # references all of it now, and -Wl,-dead_strip means an object nothing calls
 # costs the binary nothing.
-SUITEOBJ := $(filter-out $(BUILD)/main.o $(BUILD)/PVAppDelegate.o $(BUILD)/PVDocument.o,$(OBJECTS))
+#
+# PVAppDelegate came off this list when the sleep hook was added. It is the
+# application shell, but it is also where the reading position is committed
+# before the machine sleeps, and that registration is on NSWorkspace's
+# notification centre rather than the default one -- a distinction with no
+# symptom except silence. Testing it needs the class. It drags in nothing new:
+# PVAppDelegate references only PVWindowController and
+# PVWelcomeWindowController, both of which the suite already linked.
+#
+# Three builds compile Tests/pvsuite.m -- this one, the native cross-check in
+# `band`, and the stress/sanitizer builds below. All three list the same
+# exclusions and all three had to change together.
+SUITEOBJ := $(filter-out $(BUILD)/main.o $(BUILD)/PVDocument.o,$(OBJECTS))
 SUITE    := $(BUILD)/pvsuite
 
 # The heavy fixture, generated once and reused by every suite below.
@@ -556,7 +568,7 @@ band: $(SUITE)
 	@echo ""
 	@echo "== $(shell uname -m) (native, as a cross-check that the ratio is not a Rosetta artefact) =="
 	@mkdir -p $(BUILD)/native
-	@for f in $(filter-out Sources/main.m Sources/PVAppDelegate.m Sources/PVDocument.m,$(SOURCES)) Tests/pvsuite.m; do \
+	@for f in $(filter-out Sources/main.m Sources/PVDocument.m,$(SOURCES)) Tests/pvsuite.m; do \
 	   $(CC) -arch $(shell uname -m) -mmacosx-version-min=11.0 -isysroot $(HOST_SDK) \
 	     -fno-objc-arc -fobjc-exceptions -Os -ISources -Wno-deprecated-declarations \
 	     -c $$f -o $(BUILD)/native/$$(basename $$f .m).o || exit 1; \
@@ -596,7 +608,7 @@ STRESSSDK := $(if $(SAN),$(HOST_SDK),$(SDK))
 STRESSCFLAGS := $(STRESSARCH) -isysroot $(STRESSSDK) -fno-objc-arc -fobjc-exceptions                 -g -O1 $(SAN) -Wall -Wextra -Wno-unused-parameter                 -Wno-deprecated-declarations -ISources
 STRESSLD := $(STRESSARCH) -isysroot $(STRESSSDK) $(SAN) -framework Cocoa -framework CoreGraphics
 STRESSHELPERLD := $(STRESSARCH) -isysroot $(STRESSSDK) $(SAN) -framework Foundation -framework CoreGraphics
-STRESSSRC := $(filter-out Sources/main.m Sources/PVAppDelegate.m Sources/PVDocument.m,$(SOURCES))
+STRESSSRC := $(filter-out Sources/main.m Sources/PVDocument.m,$(SOURCES))
 STRESSSCALE ?= 1
 
 # Multiplier on the stress suite's teardown deadlines, in a sanitized build only.

@@ -20,6 +20,13 @@
     _zoom         = 1.0;
     _backingScale = 1.0;
     _contentWidth = 600;
+    _columns      = 1;
+    // Both start at one, and they agree until the first -setColumns:. The
+    // laid-out count is what queries read; see PVPageView.h.
+    _laidOutColumns = 1;
+    // The row table is built by the first layout pass, which is where the
+    // column count it has to be sized for is finally known.
+    _layoutDirty  = YES;
     _backgroundColor = [[NSColor colorWithCalibratedWhite:0.42 alpha:1.0] retain];
     return self;
 }
@@ -28,6 +35,7 @@
 {
     PVLiveAdjust("PVPageView", -1);
     [_backgroundColor release];
+    [_rows release];
     [_frames release];
     [_cache release];
     [_source release];
@@ -44,7 +52,20 @@
 - (BOOL)acceptsFirstResponder { return YES; }
 
 - (CGFloat)zoom { return _zoom; }
+- (NSUInteger)columns { return _columns ? _columns : 1; }
+// The count the geometry on screen was built with, which is the only one the
+// row table may be indexed by. Never the requested count: see PVPageView.h.
+- (NSUInteger)laidOutColumns { return _laidOutColumns ? _laidOutColumns : 1; }
 - (void)setDelegate:(id <PVPageViewDelegate>)delegate { _delegate = delegate; }
+
+- (void)setColumns:(NSUInteger)columns
+{
+    if (columns < 1) columns = 1;
+    if (columns > PV_MAX_PAGE_COLUMNS) columns = PV_MAX_PAGE_COLUMNS;
+    if (columns == _columns) return;
+    _columns = columns;
+    _layoutDirty = YES;
+}
 
 #pragma mark - Pinch to zoom
 
@@ -109,7 +130,42 @@
 }
 
 - (NSRect *)frameArray { return (NSRect *)[_frames mutableBytes]; }
+- (PVPageRow *)rowArray { return (PVPageRow *)[_rows mutableBytes]; }
 - (BOOL)isLaidOut { return _laidOut; }
+
+// Pages in the row starting at `first`. The last row of an odd-length
+// document in the spread holds one page, and it is the only short row there
+// can be.
+//
+// The column count is an argument rather than a read of the ivar because the
+// two callers want different ones: the layout pass is building a table and
+// passes the count it is building it with, while every query is reading the
+// table that exists and passes the count it was built with. Those are the same
+// number except in the window -setColumns: opens, and that window is precisely
+// where reading the wrong one indexes off the end of the document.
+- (NSUInteger)pagesInRowAt:(NSUInteger)first columns:(NSUInteger)k
+{
+    if (k < 1) k = 1;
+    if (first >= _pageCount) return 0;
+    NSUInteger left = _pageCount - first;
+    return (left < k) ? left : k;
+}
+
+// The laid-out width of a row, gaps included. Cheap enough to recompute --
+// there are at most PV_MAX_PAGE_COLUMNS terms in it -- that storing it would
+// be a third array to keep in agreement with the other two.
+- (CGFloat)widthOfRowAt:(NSUInteger)first columns:(NSUInteger)k
+{
+    const NSRect *f = [self frameArray];
+    if (!f) return 0;
+    NSUInteger count = [self pagesInRowAt:first columns:k], j;
+    CGFloat w = 0;
+    for (j = 0; j < count; j++) {
+        if (j) w += PV_PAGE_GAP;
+        w += f[first + j].size.width;
+    }
+    return w;
+}
 
 #pragma mark - Layout
 
@@ -130,8 +186,10 @@
     // settling, and every frame of a resize that has stopped changing width
     // all arrive here; a 1200-page document was being laid out for each of
     // them. Only the first call, when nothing has been laid out yet, must
-    // always go through.
-    if (_laidOut && zoom == _zoom && scale == _backingScale && contentWidth == _contentWidth)
+    // always go through -- as must the first after the column count changes,
+    // which none of the three compared quantities can tell you about.
+    if (_laidOut && !_layoutDirty &&
+        zoom == _zoom && scale == _backingScale && contentWidth == _contentWidth)
         return;
 
     _zoom = zoom;
@@ -140,34 +198,89 @@
 
     NSRect *f = [self frameArray];
     if (!f && _pageCount > 0) return;      // allocation failed; nothing is safe to lay out
+
+    NSUInteger k = [self columns];
+    NSUInteger rowCount = (_pageCount + k - 1) / k;
+    // Sized from a page count -[PVPDFSource init] has already bounded, and
+    // never larger than the frame table beside it, so the multiplication that
+    // -initWithLength: is given cannot overflow where that one did not.
+    //
+    // Built into a fresh allocation and swapped in only once it exists: on a
+    // machine too short of memory to widen the table, the layout that is
+    // already up there is left whole and on screen rather than being torn down
+    // in favour of nothing.
+    if (!_rows || rowCount != _rowCount) {
+        NSMutableData *fresh =
+            [[NSMutableData alloc] initWithLength:rowCount * sizeof(PVPageRow)];
+        if (!fresh) return;
+        [_rows release];
+        _rows     = fresh;
+        _rowCount = rowCount;
+    }
+    PVPageRow *rows = [self rowArray];
+    if (!rows) return;
+
     CGFloat y = PV_EDGE_GAP;
     CGFloat widest = 0;
-    NSUInteger i;
+    NSUInteger r, j;
 
-    for (i = 0; i < _pageCount; i++) {
-        CGSize p = [_source pointSizeOfPage:i];
-        // Round the on-screen size to whole points first, then derive the pixel
-        // size from it. That guarantees bitmap pixels land exactly on device
-        // pixels, so the common case is a 1:1 blit with no resampling at all.
-        CGFloat w = floor(p.width  * _zoom + 0.5);
-        CGFloat h = floor(p.height * _zoom + 0.5);
-        if (w < 1) w = 1;
-        if (h < 1) h = 1;
-        f[i] = NSMakeRect(0, y, w, h);
-        if (w > widest) widest = w;
-        y += h + PV_PAGE_GAP;
+    for (r = 0; r < rowCount; r++) {
+        NSUInteger first = r * k;
+        NSUInteger count = [self pagesInRowAt:first columns:k];
+        CGFloat rowWidth = 0, rowHeight = 0;
+
+        for (j = 0; j < count; j++) {
+            CGSize p = [_source pointSizeOfPage:first + j];
+            // Round the on-screen size to whole points first, then derive the
+            // pixel size from it. That guarantees bitmap pixels land exactly on
+            // device pixels, so the common case is a 1:1 blit with no
+            // resampling at all.
+            CGFloat w = floor(p.width  * _zoom + 0.5);
+            CGFloat h = floor(p.height * _zoom + 0.5);
+            if (w < 1) w = 1;
+            if (h < 1) h = 1;
+            // Facing pages are aligned at the top, the way an open book is.
+            // Their heights differ often enough -- a scanned document, a
+            // landscape plate among portrait text -- that this has to be said
+            // rather than assumed, and the row is as tall as the taller one.
+            f[first + j] = NSMakeRect(0, y, w, h);
+            if (j) rowWidth += PV_PAGE_GAP;
+            rowWidth += w;
+            if (h > rowHeight) rowHeight = h;
+        }
+
+        rows[r].y      = y;
+        rows[r].height = rowHeight;
+        if (rowWidth > widest) widest = rowWidth;
+        y += rowHeight + PV_PAGE_GAP;
     }
 
-    CGFloat totalHeight = (_pageCount > 0) ? (y - PV_PAGE_GAP + PV_EDGE_GAP) : PV_EDGE_GAP * 2;
+    CGFloat totalHeight = (rowCount > 0) ? (y - PV_PAGE_GAP + PV_EDGE_GAP) : PV_EDGE_GAP * 2;
     CGFloat totalWidth  = widest + PV_EDGE_GAP * 2;
     if (totalWidth < _contentWidth) totalWidth = _contentWidth;
 
-    // Centre the page column horizontally within whatever width we end up with.
-    for (i = 0; i < _pageCount; i++) {
-        f[i].origin.x = floor((totalWidth - f[i].size.width) / 2.0 + 0.5);
-        if (f[i].origin.x < PV_EDGE_GAP) f[i].origin.x = PV_EDGE_GAP;
+    // Centre each ROW horizontally within whatever width we end up with, and
+    // lay its pages out left to right inside it. With one column this is the
+    // page centred on its own, which is what it has always been; with two, the
+    // pair is centred as a unit so the gutter between them sits in the middle
+    // of the window rather than each page being centred on top of the other.
+    for (r = 0; r < rowCount; r++) {
+        NSUInteger first = r * k;
+        NSUInteger count = [self pagesInRowAt:first columns:k];
+        CGFloat x = floor((totalWidth - [self widthOfRowAt:first columns:k]) / 2.0 + 0.5);
+        if (x < PV_EDGE_GAP) x = PV_EDGE_GAP;
+        for (j = 0; j < count; j++) {
+            f[first + j].origin.x = x;
+            x += f[first + j].size.width + PV_PAGE_GAP;
+        }
     }
 
+    // The table now has the shape `k` describes, and only here -- after every
+    // row of it has been written -- does it become the count queries may index
+    // it by. Every early return above leaves the previous value in place, which
+    // is the value that still matches the table still up there.
+    _laidOutColumns = k;
+    _layoutDirty = NO;
     _laidOut = YES;
     [self setFrameSize:NSMakeSize(totalWidth, totalHeight)];
     [self setNeedsDisplay:YES];
@@ -179,6 +292,24 @@
     NSRect *f = [self frameArray];
     if (!f) return NSZeroRect;
     return f[index];
+}
+
+- (NSUInteger)firstPageOfRowContainingPage:(NSUInteger)index
+{
+    if (_pageCount == 0) return 0;
+    if (index >= _pageCount) index = _pageCount - 1;
+    NSUInteger k = [self laidOutColumns];
+    return index - (index % k);
+}
+
+- (NSRect)rectForRowContainingPage:(NSUInteger)index
+{
+    if (index >= _pageCount) return NSZeroRect;
+    NSUInteger first = [self firstPageOfRowContainingPage:index];
+    NSUInteger count = [self pagesInRowAt:first columns:[self laidOutColumns]], j;
+    NSRect r = [self rectForPage:first];
+    for (j = 1; j < count; j++) r = NSUnionRect(r, [self rectForPage:first + j]);
+    return r;
 }
 
 - (CGSize)pixelSizeForPage:(NSUInteger)index
@@ -193,16 +324,18 @@
     // below would then match every page in the document. On a large PDF that
     // turned the pre-layout draw into a full-length loop over thousands of
     // degenerate rects.
-    if (_pageCount == 0 || !_laidOut) return NSMakeRange(0, 0);
-    NSRect *f = [self frameArray];
-    if (!f) return NSMakeRange(0, 0);
+    if (_pageCount == 0 || !_laidOut || _rowCount == 0) return NSMakeRange(0, 0);
+    PVPageRow *rows = [self rowArray];
+    if (!rows) return NSMakeRange(0, 0);
 
-    // Pages are stacked in increasing y, so a binary search finds the first one
-    // whose bottom edge is still below the top of the rect.
-    NSUInteger lo = 0, hi = _pageCount - 1, first = _pageCount;
+    // Rows are stacked in increasing y, so a binary search finds the first one
+    // whose bottom edge is still below the top of the rect. Over rows and not
+    // over pages: see PVPageRow for why the page frames are not something a
+    // binary search may be run against once a row can hold two of them.
+    NSUInteger lo = 0, hi = _rowCount - 1, first = _rowCount;
     while (lo <= hi) {
         NSUInteger mid = lo + (hi - lo) / 2;
-        if (NSMaxY(f[mid]) >= NSMinY(rect)) {
+        if (rows[mid].y + rows[mid].height >= NSMinY(rect)) {
             first = mid;
             if (mid == 0) break;
             hi = mid - 1;
@@ -210,11 +343,16 @@
             lo = mid + 1;
         }
     }
-    if (first >= _pageCount) return NSMakeRange(_pageCount ? _pageCount - 1 : 0, 0);
+    if (first >= _rowCount) return NSMakeRange(_pageCount - 1, 0);
 
     NSUInteger last = first;
-    while (last + 1 < _pageCount && NSMinY(f[last + 1]) <= NSMaxY(rect)) last++;
-    return NSMakeRange(first, last - first + 1);
+    while (last + 1 < _rowCount && rows[last + 1].y <= NSMaxY(rect)) last++;
+
+    NSUInteger k = [self laidOutColumns];
+    NSUInteger firstPage = first * k;
+    NSUInteger lastPage  = last * k + k - 1;
+    if (lastPage >= _pageCount) lastPage = _pageCount - 1;
+    return NSMakeRange(firstPage, lastPage - firstPage + 1);
 }
 
 - (NSUInteger)pageAtTopOfRect:(NSRect)rect fraction:(CGFloat *)outFraction
@@ -223,7 +361,10 @@
     NSUInteger p = r.location;
     if (p >= _pageCount) p = _pageCount ? _pageCount - 1 : 0;
     if (outFraction) {
-        NSRect f = [self rectForPage:p];
+        // Into the ROW, not into the page: the two pages of a spread occupy
+        // the same band, and a fraction measured against one of them would not
+        // survive being handed back to -scrollToPage:fraction:.
+        NSRect f = [self rectForRowContainingPage:p];
         CGFloat frac = (f.size.height > 0) ? (NSMinY(rect) - NSMinY(f)) / f.size.height : 0;
         if (frac < 0) frac = 0;
         if (frac > 1) frac = 1;

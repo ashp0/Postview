@@ -200,6 +200,7 @@ static NSString *PVString(NSDictionary *d, NSString *key)
             zoomMode:(PVZoomMode)mode
                 zoom:(CGFloat)zoom
              sidebar:(BOOL)sidebarVisible
+             columns:(NSUInteger)columns
          windowFrame:(NSString *)frameString
 {
     NSString *key = [self keyForURL:url];
@@ -211,6 +212,15 @@ static NSString *PVString(NSDictionary *d, NSString *key)
     [d setObject:[NSNumber numberWithInt:(int)mode]           forKey:@"zoomMode"];
     [d setObject:[NSNumber numberWithDouble:(double)zoom]     forKey:@"zoom"];
     [d setObject:[NSNumber numberWithBool:sidebarVisible]     forKey:@"sidebar"];
+    // Clamped on the way in as well as on the way out. The comparison below
+    // decides whether anything is written at all, and it compares dictionaries:
+    // a value the reader would clamp to 1 but the writer stored as 7 is a
+    // difference that reads as a change on every save, so the file would be
+    // rewritten forever over a number nothing can observe.
+    if (columns < 1) columns = 1;
+    if (columns > PV_MAX_PAGE_COLUMNS) columns = PV_MAX_PAGE_COLUMNS;
+    [d setObject:[NSNumber numberWithUnsignedLongLong:(unsigned long long)columns]
+          forKey:@"columns"];
     if (frameString) [d setObject:frameString forKey:@"windowFrame"];
 
     // Nothing has moved since the last time this document was recorded, so
@@ -241,6 +251,7 @@ static NSString *PVString(NSDictionary *d, NSString *key)
            zoomMode:(PVZoomMode *)outMode
                zoom:(CGFloat *)outZoom
             sidebar:(BOOL *)outSidebar
+            columns:(NSUInteger *)outColumns
         windowFrame:(NSString **)outFrame
 {
     NSString *key = [self keyForURL:url];
@@ -271,6 +282,15 @@ static NSString *PVString(NSDictionary *d, NSString *key)
         *outZoom = (CGFloat)z;
     }
     if (outSidebar)  *outSidebar  = (PVNumber(d, @"sidebar", 0) != 0);
+    if (outColumns) {
+        // Defaulting to 1 is what makes a state file written before the spread
+        // existed read correctly rather than merely safely: those documents
+        // were all single-column, so the missing key and the truthful answer
+        // are the same number.
+        double c = PVNumber(d, @"columns", 1);
+        if (!(c >= 1) || c > PV_MAX_PAGE_COLUMNS) c = 1;
+        *outColumns = (NSUInteger)c;
+    }
     if (outMode) {
         double m = PVNumber(d, @"zoomMode", PVZoomModeFitWidth);
         if (!(m >= 0) || m > 3) m = PVZoomModeFitWidth;

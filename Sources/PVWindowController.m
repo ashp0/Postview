@@ -45,6 +45,30 @@ static void PVAddRequest(NSMutableArray *reqs, PVRenderRequest *request)
     if (request) [reqs addObject:request];
 }
 
+// Does any part of this page lie within the viewport's horizontal window?
+//
+// The scheduler's vertical question is asked by -pageRangeInRect:, and until
+// the two-page spread there was no horizontal question to ask: a single column
+// is centred in a document exactly as wide as its widest page, so whatever the
+// horizontal scroll position, the one page in a row always overlaps the
+// viewport. This returns YES for every page of every single-column layout, and
+// the gates below are therefore exactly what they were there.
+//
+// A spread breaks that. A row is two pages plus a gutter, so once the zoom
+// takes it past the window width the reader can scroll sideways until one of
+// the two is entirely off screen -- and nothing in the scheduler noticed. It
+// went on asking for a preview AND a full-resolution bitmap for a page with no
+// pixels on screen, which is the most expensive thing this program does, spent
+// on the one thing section 1 says is worth more than every other lever
+// together: not rendering at all.
+//
+// -drawRect: has always culled this way (NSIntersectsRect against the dirty
+// rect). This is the same test, moved to the decision that costs something.
+static BOOL PVPageOverlapsColumn(NSRect page, NSRect viewport)
+{
+    return (NSMaxX(page) > NSMinX(viewport)) && (NSMinX(page) < NSMaxX(viewport));
+}
+
 @implementation PVWindowController
 
 #pragma mark - Setup
@@ -117,6 +141,7 @@ static void PVAddRequest(NSMutableArray *reqs, PVRenderRequest *request)
 
     _zoomMode        = PVZoomModeFitWidth;
     _zoom            = 1.0;
+    _columns         = 1;
     _restorePage     = 0;
     _restoreFraction = 0.0;
     _restoreSidebar  = NO;
@@ -153,7 +178,7 @@ static void PVAddRequest(NSMutableArray *reqs, PVRenderRequest *request)
 
 - (void)loadSavedStateIntoWindow:(NSWindow *)window
 {
-    NSUInteger page = 0;
+    NSUInteger page = 0, columns = 1;
     CGFloat fraction = 0, zoom = 1.0;
     PVZoomMode mode = PVZoomModeFitWidth;
     BOOL sidebar = NO;
@@ -161,6 +186,7 @@ static void PVAddRequest(NSMutableArray *reqs, PVRenderRequest *request)
 
     if ([[PVStateStore sharedStore] stateForURL:_url page:&page fraction:&fraction
                                        zoomMode:&mode zoom:&zoom sidebar:&sidebar
+                                        columns:&columns
                                     windowFrame:&frameString]) {
         NSUInteger pc = [_source pageCount];
         if (pc == 0) return;
@@ -169,6 +195,10 @@ static void PVAddRequest(NSMutableArray *reqs, PVRenderRequest *request)
         _restoreFraction = fraction;
         _restoreSidebar  = sidebar;
         _zoomMode        = mode;
+        // A document last read as a spread reopens as one. The store has
+        // already bounded the value; this is the second half of the same
+        // clamp, because the ivar is what the rest of the class trusts.
+        if (columns >= 1 && columns <= PV_MAX_PAGE_COLUMNS) _columns = columns;
         if (zoom >= PV_MIN_ZOOM && zoom <= PV_MAX_ZOOM) _zoom = zoom;
         if ([frameString length] > 0) {
             [window setFrameFromString:frameString];
@@ -395,9 +425,18 @@ static void PVAddRequest(NSMutableArray *reqs, PVRenderRequest *request)
     if (availW < 20) availW = 20;
     if (availH < 20) availH = 20;
 
+    // What has to fit across the window is a ROW, which in the spread is two
+    // of the widest page the document has, plus the gutter between them.
+    // Measured against the widest page rather than against this particular
+    // pair, for the same reason the single-page column is: a fit that changed
+    // as you scrolled past a landscape plate would be a fit of nothing.
+    NSUInteger cols = (_columns > 0) ? _columns : 1;
+    CGFloat rowW = maxPage.width * (CGFloat)cols + PV_PAGE_GAP * (CGFloat)(cols - 1);
+    if (rowW < 1) rowW = 1;
+
     switch (_zoomMode) {
-        case PVZoomModeFitWidth: return availW / maxPage.width;
-        case PVZoomModeFitPage:  return fmin(availW / maxPage.width, availH / maxPage.height);
+        case PVZoomModeFitWidth: return availW / rowW;
+        case PVZoomModeFitPage:  return fmin(availW / rowW, availH / maxPage.height);
         case PVZoomModeActual:   return 1.0;
         case PVZoomModeCustom:
         default:                 return _zoom;
@@ -416,6 +455,12 @@ static void PVAddRequest(NSMutableArray *reqs, PVRenderRequest *request)
     if (z < PV_MIN_ZOOM) z = PV_MIN_ZOOM;
     if (z > PV_MAX_ZOOM) z = PV_MAX_ZOOM;
     _zoom = z;
+    // Stated on every relayout rather than only when it changes, so the view's
+    // idea of the layout and the controller's cannot drift apart: there is one
+    // place that decides the geometry and it decides all of it at once. The
+    // view early-outs on an unchanged count, and -setZoom: below is what
+    // actually rebuilds the frames either way.
+    [_pageView setColumns:_columns];
     [_pageView setZoom:z
           backingScale:[self backingScale]
         containerWidth:[self viewportSize].width];
@@ -460,7 +505,9 @@ static void PVAddRequest(NSMutableArray *reqs, PVRenderRequest *request)
     if (page >= pageCount) page = pageCount - 1;
     if (!isfinite(fraction)) fraction = 0;
     NSClipView *clip = [_scrollView contentView];
-    NSRect r  = [_pageView rectForPage:page];
+    // The row, not the page: in the spread the fraction was measured into the
+    // band the two facing pages share, and this is the inverse of that.
+    NSRect r  = [_pageView rectForRowContainingPage:page];
     NSRect cb = [clip bounds];
 
     CGFloat y = NSMinY(r) + fraction * NSHeight(r);
@@ -1084,6 +1131,7 @@ static double PVTransientBackoff(unsigned attempts)
     [_pageCache setPinnedPages:range];
 
     _lastRequestRange = range;
+    _lastRequestX     = NSMinX(vis);
     _haveRequestState = YES;
 
     NSMutableArray *reqs = [NSMutableArray array];
@@ -1125,6 +1173,15 @@ static double PVTransientBackoff(unsigned attempts)
 
     for (i = range.location; i < NSMaxRange(range) && i < pageCount; i++) {
         if ([self pageIsUnrenderable:i]) continue;
+        // The row this page belongs to is on screen; this page need not be.
+        // In a spread zoomed past the window width the far page of the pair
+        // has no pixels visible, and rendering it is pure waste. Free in the
+        // single-page column, where the answer is always YES.
+        //
+        // Deliberately before the express-lane test as well: a page nobody can
+        // see is not the page the user is waiting on, and promoting it would
+        // spend the raised-QoS energy budget on the wrong half of the spread.
+        if (!PVPageOverlapsColumn([_pageView rectForPage:i], vis)) continue;
         BOOL cold = (i == _expressPage);
 
         // Read once per page and shared by both bitmaps below, for the same
@@ -1238,6 +1295,12 @@ static double PVTransientBackoff(unsigned attempts)
         NSUInteger p = (NSUInteger)[[near objectAtIndex:k] integerValue];
         if ([_pageCache hasPreviewForPage:p]) continue;
         if ([self pageIsUnrenderable:p preview:YES]) continue;
+        // Prefetch is off screen vertically on purpose -- that is what makes
+        // it prefetch -- but not horizontally. A reader who has scrolled a
+        // zoomed spread over to the left-hand page will still be on the
+        // left-hand page one spread further down, so the right-hand column is
+        // as invisible there as it is here. Always YES in a single column.
+        if (!PVPageOverlapsColumn([_pageView rectForPage:p], vis)) continue;
         CGSize px     = [_pageView pixelSizeForPage:p];
         CGSize prevPx = CGSizeMake(ceil(px.width  / PV_PREVIEW_DIVISOR),
                                    ceil(px.height / PV_PREVIEW_DIVISOR));
@@ -1289,6 +1352,9 @@ static double PVTransientBackoff(unsigned attempts)
         for (k = 0; k < fullPrefetchLimit; k++) {
             NSUInteger p = (NSUInteger)[[near objectAtIndex:k] integerValue];
             if ([self pageIsUnrenderable:p preview:NO]) continue;
+            // The same column test as the previews above, on the half that
+            // costs about six times as much.
+            if (!PVPageOverlapsColumn([_pageView rectForPage:p], vis)) continue;
             CGSize px = [_pageView pixelSizeForPage:p];
             if (![_pageCache fullImageForPage:p pixelSize:px]) {
                 // The per-page test is not optional here the way it was while
@@ -1354,8 +1420,27 @@ static double PVTransientBackoff(unsigned attempts)
     NSUInteger shown = (_displayedPage == NSNotFound) ? _restorePage : _displayedPage;
     if (pages == 0) return name;
     if (shown >= pages) shown = pages - 1;
+
+    // The title is this app's only page indicator -- there is no page field in
+    // the toolbar -- so in a spread it has to name both of the pages that are
+    // actually on screen. Naming only the left one is not merely terse: the
+    // number stops changing on every second turn, which reads as a window that
+    // has stopped following the document.
+    //
+    // Taken from the page view's laid-out count rather than from _columns, for
+    // the same reason the view's own queries are: this describes what is on
+    // screen, and what is on screen is what has been laid out. The last page of
+    // an odd-length document is a row of one and is titled as one.
+    NSUInteger k     = _pageView ? [_pageView laidOutColumns] : 1;
+    NSUInteger first = shown - (shown % k);
+    NSUInteger last  = first + k - 1;
+    if (last >= pages) last = pages - 1;
+    if (last > first)
+        return [NSString stringWithFormat:@"%@ (pages %lu-%lu of %lu)",
+                name, (unsigned long)(first + 1), (unsigned long)(last + 1),
+                (unsigned long)pages];
     return [NSString stringWithFormat:@"%@ (page %lu of %lu)",
-            name, (unsigned long)(shown + 1), (unsigned long)pages];
+            name, (unsigned long)(first + 1), (unsigned long)pages];
 }
 
 // AppKit's own hook, so that a title it decides to rebuild -- on a rename, or
@@ -1645,17 +1730,37 @@ static double PVTransientBackoff(unsigned attempts)
 
     NSRange range = [_pageView pageRangeInRect:vis];
     BOOL movingNow = [self viewportIsMoving];
+
+    // Sideways travel changes the wanted set only in a spread wide enough to
+    // scroll: there, and only there, a page can leave or enter the window
+    // horizontally without the visible page RANGE changing at all -- both
+    // pages of the pair stay in the range whichever one you are looking at.
+    // Leaving x out of this test is what would make the cull in
+    // -updateVisibleContent a bug rather than a saving: the far page would be
+    // dropped correctly on the way out and never asked for on the way back in,
+    // because the rebuild that would ask never runs.
+    //
+    // Guarded so the single-page column is untouched. There a page always
+    // overlaps the window horizontally (see PVPageOverlapsColumn), so its
+    // wanted set does not depend on x and this term is constant YES -- the
+    // early-out is bit for bit the one that was measured.
+    BOOL sideways = ([_pageView laidOutColumns] > 1) &&
+                    (NSWidth([_pageView frame]) > NSWidth(vis) + 0.5);
+    BOOL sameColumn = (!sideways || fabs(NSMinX(vis) - _lastRequestX) < 0.5);
+
     BOOL unchanged = (_haveRequestState &&
                       NSEqualRanges(range, _lastRequestRange) &&
                       dir == _lastDirection &&
-                      movingNow == _lastMovingState);
+                      movingNow == _lastMovingState &&
+                      sameColumn);
     _lastDirection   = dir;
     _lastMovingState = movingNow;
 
     [self updatePageIndicator];
 
     // The desired set genuinely only changes when the visible page range, the
-    // direction of travel, or the motion state changes. Rebuilding it on every
+    // direction of travel, the motion state, or -- in a spread wide enough to
+    // scroll sideways -- the horizontal position changes. Rebuilding it on every
     // bounds notification meant allocating a fresh request set and taking the
     // render queue's lock 60-120 times a second to arrive at an identical
     // answer. Skipping that is invisible on screen and is pure main-thread and
@@ -2222,6 +2327,47 @@ static double PVTransientBackoff(unsigned attempts)
     if (_sidebarVisible) [self hideSidebar]; else [self showSidebar];
 }
 
+// One page across, or two side by side.
+//
+// The reading position is taken before the change and restored after it, the
+// way every zoom already is, so the page you were on is the page you are on --
+// it simply acquires a neighbour. In a spread that page becomes the left-hand
+// half of its own row when its index is even and the right-hand half when it
+// is odd, which is the same pairing on the way back out, so turning the mode
+// on and off again returns you exactly where you were.
+- (void)applyColumns:(NSUInteger)columns
+{
+    if (columns < 1) columns = 1;
+    if (columns > PV_MAX_PAGE_COLUMNS) columns = PV_MAX_PAGE_COLUMNS;
+    if (columns == _columns) return;
+
+    CGFloat f = 0;
+    NSUInteger p = [self currentPageWithFraction:&f];
+    _columns = columns;
+    _haveRequestState = NO;
+    // The title has to be rewritten even though the page under the reader has
+    // not changed, because what changed is how many pages are beside it:
+    // "page 4 of 100" becomes "pages 4-5 of 100" at the same scroll position.
+    // -updatePageIndicator early-outs on an unchanged page number and would
+    // otherwise leave the old wording up until the next scroll -- and on a
+    // document short enough to need no scrolling, forever.
+    _displayedPage = NSNotFound;
+    [self noteUserActivity];
+    // In fit-width and fit-page the zoom itself changes -- half the width per
+    // page buys half the zoom -- so every bitmap is about to be asked for at a
+    // size CoreGraphics has not been asked about before. Exactly the argument
+    // -applyZoomMode:zoom: makes, and it holds here for the same reason: a page
+    // retired at one size is a different question at another.
+    [self resetRenderFailures];
+    [self relayoutKeepingPage:p fraction:f];
+    [self updateVisibleContent];
+}
+
+- (IBAction)toggleTwoPageView:(id)sender
+{
+    [self applyColumns:(_columns > 1) ? 1 : PV_MAX_PAGE_COLUMNS];
+}
+
 - (void)applyZoomMode:(PVZoomMode)mode zoom:(CGFloat)zoom
 {
     CGFloat f = 0;
@@ -2308,13 +2454,51 @@ static double PVTransientBackoff(unsigned attempts)
     }];
 }
 
+// How many pages a row holds on screen right now. The view's laid-out count
+// when there is a view, and the requested one before the first layout, which
+// is the only moment the two can differ and no row exists to contradict.
+- (NSUInteger)pagesPerRow
+{
+    if (_pageView) {
+        NSUInteger k = [_pageView laidOutColumns];
+        if (k >= 1) return k;
+    }
+    return (_columns > 0) ? _columns : 1;
+}
+
+// Next and previous move by a ROW, so in the spread they turn both pages at
+// once. Stepping by one page there would leave the viewport where it was for
+// every second press -- the page asked for is already on screen, beside the
+// one you were reading -- which reads as a menu item that half works.
+//
+// The step is taken from the first page of the current row rather than from
+// the current page, so an odd page and its even neighbour agree about where
+// the next spread begins.
+- (NSUInteger)firstPageOfCurrentRow
+{
+    NSUInteger p = [self currentPageWithFraction:NULL];
+    // Asked of the view rather than worked out from _columns here. The pairing
+    // rule belongs to whoever laid the pages out, and stating it twice is how
+    // the two come to disagree -- the view's answer is derived from the table
+    // it actually built, while _columns is the count that has been asked for
+    // and may be one relayout ahead of it. A nil view answers 0, which is the
+    // first page of the first row and the safe answer during teardown.
+    return [_pageView firstPageOfRowContainingPage:p];
+}
+
 - (IBAction)goToNextPage:(id)sender
 {
-    [self goToPageNumber:(NSInteger)[self currentPageWithFraction:NULL] + 2];
+    NSUInteger k = [self pagesPerRow];
+    [self goToPageNumber:(NSInteger)([self firstPageOfCurrentRow] + k) + 1];
 }
 - (IBAction)goToPreviousPage:(id)sender
 {
-    [self goToPageNumber:(NSInteger)[self currentPageWithFraction:NULL]];
+    NSUInteger first = [self firstPageOfCurrentRow];
+    NSUInteger k = [self pagesPerRow];
+    // Already on the first row: -goToPageNumber: clamps, so this lands at the
+    // top of the document, which is what the single-page column has always
+    // done from page one.
+    [self goToPageNumber:(first > k) ? (NSInteger)(first - k) + 1 : 1];
 }
 - (IBAction)goToFirstPage:(id)sender { [self goToPageNumber:1]; }
 - (IBAction)goToLastPage:(id)sender  { [self goToPageNumber:(NSInteger)[_source pageCount]]; }
@@ -2326,10 +2510,21 @@ static double PVTransientBackoff(unsigned attempts)
         [item setTitle:_sidebarVisible ? @"Hide Thumbnails" : @"Show Thumbnails"];
         return YES;
     }
-    if (action == @selector(goToNextPage:))
-        return [self currentPageWithFraction:NULL] + 1 < [_source pageCount];
+    if (action == @selector(toggleTwoPageView:)) {
+        // A checkmark rather than a change of wording. "Show Thumbnails"
+        // becomes "Hide Thumbnails" because the sidebar is a thing that is
+        // there or is not; this is one of two ways of laying the same document
+        // out, and the state of a view mode is what a check mark is for.
+        [item setState:(_columns > 1) ? NSOnState : NSOffState];
+        // Nothing to lay out two of. Left enabled but unchecked rather than
+        // hidden, so the menu does not change shape between documents.
+        return [_source pageCount] > 1;
+    }
+    if (action == @selector(goToNextPage:)) {
+        return [self firstPageOfCurrentRow] + [self pagesPerRow] < [_source pageCount];
+    }
     if (action == @selector(goToPreviousPage:))
-        return [self currentPageWithFraction:NULL] > 0;
+        return [self firstPageOfCurrentRow] > 0;
     if (action == @selector(zoomIn:))  return _zoom < PV_MAX_ZOOM - 0.001;
     if (action == @selector(zoomOut:)) return _zoom > PV_MIN_ZOOM + 0.001;
     return YES;
@@ -2488,6 +2683,7 @@ static NSView *PVToolbarBox(NSControl *control)
                                     zoomMode:_zoomMode
                                         zoom:_zoom
                                      sidebar:_sidebarVisible
+                                     columns:_columns
                                  windowFrame:[[self window] stringWithSavedFrame]];
 }
 

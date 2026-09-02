@@ -72,6 +72,11 @@ static NSString *PVFnKey(unichar c)
     NSMenu *viewMenu = [[[NSMenu alloc] initWithTitle:@"View"] autorelease];
     PVAdd(viewMenu, @"Show Thumbnails", @selector(toggleSidebar:), @"2",
           NSCommandKeyMask | NSAlternateKeyMask);
+    // Two pages side by side. Cmd-3 continues the row Cmd-0/1/2 already
+    // occupy, and is the one key in it that nothing had claimed; the item is
+    // checked rather than retitled, and -validateMenuItem: sets that.
+    PVAdd(viewMenu, @"Two Pages", @selector(toggleTwoPageView:), @"3",
+          NSCommandKeyMask);
     [viewMenu addItem:[NSMenuItem separatorItem]];
     PVAdd(viewMenu, @"Zoom In", @selector(zoomIn:), @"+", NSCommandKeyMask);
     PVAdd(viewMenu, @"Zoom Out", @selector(zoomOut:), @"-", NSCommandKeyMask);
@@ -343,6 +348,45 @@ static NSString *PVFnKey(unichar c)
         });
         dispatch_resume(_memoryPressureSource);
     }
+
+    // The reading position, committed before the machine sleeps.
+    //
+    // This is not a guess about when the user might like a save. It is the one
+    // warning this process reliably gets before a class of death it cannot
+    // prevent and did not cause: on the target machine, waking is when the
+    // window server reconfigures the displays, and the GPU driver can respond
+    // to that by calling abort() on its own client from inside AppKit's redraw
+    // -- no Postview frame on the stack, no signal worth catching, and no
+    // -applicationWillTerminate:. See ENGINEERING.md section 10.
+    //
+    // Without this the state file is written on document close, on deactivate
+    // and at quit, and none of those happen to a reader who is looking at the
+    // page when the lid closes: the app is frontmost, so it never resigns
+    // active, and it never terminates -- it is killed. That reader loses the
+    // position for the whole session.
+    //
+    // The cost is one notification and one write per sleep, which is a handful
+    // of times a day. Nothing polls and no timer is armed, so the file's own
+    // rule -- writes are rare and no timer ever runs -- is kept exactly.
+    //
+    // NSWorkspace posts on its OWN notification centre, not the default one.
+    // Registering on the default centre is silent: no error, no warning, and a
+    // notification that simply never arrives.
+    [[[NSWorkspace sharedWorkspace] notificationCenter]
+        addObserver:self
+           selector:@selector(systemWillSleep:)
+               name:NSWorkspaceWillSleepNotification
+             object:nil];
+}
+
+// Sleep is a save point, not a shutdown: the process is expected to still be
+// here afterwards, so only the reading position is written and the census is
+// left to termination. Deliberately does the same work whether or not the wake
+// that follows goes wrong, because nothing here can tell in advance.
+- (void)systemWillSleep:(NSNotification *)note
+{
+    (void)note;
+    [self saveOpenDocumentState];
 }
 
 // Not -applicationWillFinishLaunching:. The alert does run there -- sampling
@@ -381,7 +425,16 @@ static NSString *PVFnKey(unichar c)
 
 
 
-- (void)saveAllOpenDocuments
+// Every open document's reading position, on disk.
+//
+// Split out from -saveAllOpenDocuments so that the sleep hook below can reach
+// it without also reaching the rasterisation census underneath. The census is
+// instrumentation about a whole run: emitting it every time the machine is
+// closed for the night would interleave several runs' counters in one log and
+// rewrite PVStatsPath with a partial total, which is a measurement changed by
+// the act of taking it. Saving the reading position has no such objection --
+// it is idempotent and it is the whole point.
+- (void)saveOpenDocumentState
 {
     NSArray *docs = [[NSDocumentController sharedDocumentController] documents];
     NSUInteger i, j;
@@ -393,6 +446,11 @@ static NSString *PVFnKey(unichar c)
         }
     }
     [[PVStateStore sharedStore] flush];
+}
+
+- (void)saveAllOpenDocuments
+{
+    [self saveOpenDocumentState];
 
     // Last thing before the process goes: the rasterisation census, when it
     // was asked for. stderr rather than a file so a benchmark can capture it
@@ -411,6 +469,21 @@ static NSString *PVFnKey(unichar c)
     }
 }
 
+// Every notification centre this object is registered with, in one place.
+//
+// Exactly the argument -releaseMemoryPressureSource makes below, and it earns
+// its own method for a sharper reason: there are two centres, and the default
+// one's -removeObserver: does not touch the workspace's. The terminate path
+// and -dealloc both used to say only the default one, so adding a workspace
+// observer to a class unregistered like that leaves the workspace holding an
+// unsafe-unretained pointer to a freed delegate, and the next sleep sends a
+// message to it. Naming both here means neither call site can forget one.
+- (void)stopObservingNotifications
+{
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+    [[[NSWorkspace sharedWorkspace] notificationCenter] removeObserver:self];
+}
+
 // Both the terminate path and -dealloc have to do this, and it has to happen
 // exactly once. Stating it once means the two copies cannot drift apart into a
 // double dispatch_release, which is not a leak but a crash.
@@ -424,7 +497,7 @@ static NSString *PVFnKey(unichar c)
 
 - (void)dealloc
 {
-    [[NSNotificationCenter defaultCenter] removeObserver:self];
+    [self stopObservingNotifications];
     [self releaseMemoryPressureSource];
     [super dealloc];
 }
@@ -435,7 +508,7 @@ static NSString *PVFnKey(unichar c)
 - (void)applicationWillTerminate:(NSNotification *)note
 {
     [self saveAllOpenDocuments];
-    [[NSNotificationCenter defaultCenter] removeObserver:self];
+    [self stopObservingNotifications];
     [self releaseMemoryPressureSource];
 }
 

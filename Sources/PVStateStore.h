@@ -36,12 +36,17 @@
 // A nil path gives a store that never touches the disk.
 - (id)initWithPath:(NSString *)path;
 
+// `columns` is how many pages were side by side: 1 for the single-page
+// column, 2 for the spread. A file written by a build that predates the
+// spread has no such key, and reads back as 1 -- the layout every one of
+// those documents was actually last seen in.
 - (void)recordForURL:(NSURL *)url
                 page:(NSUInteger)page
             fraction:(CGFloat)fraction
             zoomMode:(PVZoomMode)mode
                 zoom:(CGFloat)zoom
              sidebar:(BOOL)sidebarVisible
+             columns:(NSUInteger)columns
          windowFrame:(NSString *)frameString;
 
 - (BOOL)stateForURL:(NSURL *)url
@@ -50,6 +55,7 @@
            zoomMode:(PVZoomMode *)outMode
                zoom:(CGFloat *)outZoom
             sidebar:(BOOL *)outSidebar
+            columns:(NSUInteger *)outColumns
         windowFrame:(NSString **)outFrame;
 
 - (void)flush;

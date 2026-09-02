@@ -253,13 +253,14 @@ existed without it: it reads the rasterisation counters the `ui` suite asserts
 on and the process accounting the `soak` suite uses, and reports them against
 the kernel's own.
 
-`make verify-all` runs every gate. Current state, this host, 2026-09-01:
+`make verify-all` runs every gate. Current state, this host, 2026-09-01, after
+the sleep hook (§10) and the two-page spread (§11):
 
 | gate | result |
 |---|---|
 | Clang static analyser | clean |
-| `pvsuite unit` | 345 passed, 0 failed |
-| `pvsuite ui` (drives a real controller) | 187 passed, 0 failed |
+| `pvsuite unit` | 370 passed, 0 failed |
+| `pvsuite ui` (drives a real controller) | 210 passed, 0 failed |
 | `pvsuite soak` (175 document cycles) | 26 passed, 0 failed |
 | `pvsuite stress` | 16 passed, 0 failed |
 | `pvsuite stress` + AddressSanitizer + UBSan | 16 passed, 0 failed |
@@ -267,7 +268,23 @@ the kernel's own.
 | leak census | no Postview-owned object leaked |
 | `pvsuite power` (energy and CPU) | 23 passed, 0 failed |
 | showdown self-test | 26 instrument checks passed |
-| `make verify` (Mach-O 10.9 compatibility) | OK |
+| `make verify` (Mach-O 10.9 compatibility) | **not run — see below** |
+
+Unit is up 25 and UI up 23 on the previous run; every added assertion belongs to
+§10 or §11 and no existing one changed. The seven newest are §11.4's, and they
+were confirmed to fail with the cull reverted — reinstating the bug fails
+exactly the two assertions about the page that is off screen, and nothing
+else.
+
+**The Mach-O gate could not run on this host.** `make verify REQUIRE_SDK=any`
+passes — `x86_64`, minimum OS 10.9, and the linked dylib allow-list is
+unchanged, which is the half of the gate that these changes could have broken
+(nothing new is linked; `NSWorkspace` is AppKit, already there). The strict form
+also checks that the binary was *built against* the 10.9 SDK, and that needs a
+real `MacOSX10.9.sdk`. This machine has only Command Line Tools, and the copy
+that was unpacked at `/private/tmp/postview-sdk109` is gone — `/private/tmp`
+does not survive a reboot. **A release build must re-run
+`make all verify SDK=/path/to/MacOSX10.9.sdk` before it ships.**
 
 ### 6.1 The energy suite
 
@@ -398,6 +415,21 @@ Checked by reverting the change and re-running:
   scroll episode. Closing it means treating `[event isARepeat]` as the
   keyboard's announcement, which moves CPU and belongs after a showdown run.
 - **Zoom past the tier's cliff renders soft.** Pinned by `pvsuite unit`, not fixed.
+- **What made the crashing window a layer tree is unverified** (§10.2). Full
+  screen and injected SIMBL code can both produce an
+  `_NSUnbufferedLayerTreeWindow`, and the report does not say which was in
+  force. Worth settling only because it is the one input to that crash the
+  program has any say over — and settling it means reproducing a wake, not
+  reading the report again.
+- **The spread's cost is derived, not measured** (§11.3). The arithmetic on
+  §2's ratios says a two-page spread is a win on vector content and neutral on
+  text per page read. `make power` is the instrument that would confirm it and
+  has not been pointed at this.
+- **A sideways flick across a zoomed spread is not throttled.** The motion gate
+  measures vertical travel only, for the reason in §11.5. The horizontal cull
+  bounds the waste to at most one page render per flick, which is why this is a
+  note rather than a fix: the machinery to do better is a horizontal dwell
+  model, and nothing has measured that it would pay.
 
 ---
 
@@ -722,3 +754,308 @@ fairness gate rejected.
 
 **What no run has established:** anything about energy directly (§9.7), and
 anything about a machine other than a 64 GB Mac Pro on mains power.
+
+---
+
+## 10. The wake-from-sleep crash, 2026-09-01
+
+A crash report from the Mac Pro, taken 19:26 the same day, after the machine
+woke from sleep. `EXC_CRASH (SIGABRT)`, `abort() called`, and one line that
+names the mechanism outright:
+
+```
+Application Specific Signatures:
+Graphics kernel error: 0xfffffffe
+```
+
+**The crash is not in this program, and there is no line of Postview to fix.**
+That is a claim, so here is the evidence for it.
+
+### 10.1 What the stack says
+
+Read from the bottom, the crashing thread is:
+
+```
+22  -[NSApplication run]
+21  -[NSApplication sendEvent:]
+20  -[NSApplication _reactToDisplayChanged:resetScreens:]
+19  -[NSApplication makeWindowsPerform:inOrder:]
+16  -[NSWindow _displayChanged]
+14  -[NSWindow _screenChanged:]
+13  -[NSWindow _updateSettingsSendingScreenChangeNotificationIfNeeded:]
+10  -[_NSUnbufferedLayerTreeWindow display]
+ 9  -[NSView(NSLayerKitGlue) _drawRectAsLayerTree:]
+ 8  CAViewDraw
+ 7  view_draw(_CAView*, double, CVTimeStamp const*, bool)
+ 6  CGLFlushDrawable
+ 5  com.apple.AMDRadeonX4000GLDriver
+ 4  gpusSubmitDataBuffers
+ 3  gpusKillClient
+ 2  abort
+```
+
+Every frame is Apple's. Frame 23 is `main`, and that is the only Postview
+frame in it. The sequence is: the display configuration changed, AppKit told
+every window to redraw, the redraw went through CoreAnimation to OpenGL, the
+kernel rejected the command buffer, and `gpusKillClient` — which is exactly
+what its name says — called `abort()` on its own client.
+
+`0xfffffffe` is `-2` from the kernel GPU driver. `gpusKillClient` is not a
+crash in the ordinary sense; it is libGPUSupport deciding a context is
+unusable and destroying the process holding it.
+
+### 10.2 Why it cannot be Postview's OpenGL
+
+Postview has none.
+
+| claim | check |
+|---|---|
+| Links only Cocoa and CoreGraphics | `LDFLAGS` in the Makefile; `make verify` allow-lists the linked dylibs |
+| Never sets `wantsLayer` | `grep -rn 'wantsLayer\|CALayer\|setLayer' Sources/` → nothing |
+| Never uses OpenGL | `grep -rn 'NSOpenGL' Sources/` → nothing |
+| Never creates a `CVDisplayLink` | `grep -rn 'CVDisplayLink' Sources/` → nothing |
+| Draws by blitting `CGImage`s in `-drawRect:` | `PVPageView.m` |
+
+The report also shows OpenCL, QuartzComposer, ImageKit, QTKit, PDFKit and two
+dozen `cl_kernels` images loaded into a process that links none of them, and
+`org.w0lf.SIMBL` with four injected bundles. §8 already says to read crash
+reports from that machine accordingly, and there is precedent in this tree:
+`Resources/crash report.txt`, 2026-08-28, is a `SIGBUS` inside
+`Wowfunhappy.greenFullscreen` — a SIMBL bundle — while it swizzled
+`-[NSWindow update]`.
+
+The window in the stack is an `_NSUnbufferedLayerTreeWindow`, drawn as a layer
+tree. Postview does not ask for that. What can produce it is full-screen mode
+(the app sets `NSWindowCollectionBehaviorFullScreenPrimary`) or injected code.
+Which of the two it was on this run is **unverified** and the report does not
+say.
+
+*Confidence:* that the aborting GL context is not one Postview created is
+**certain** — the program creates none. That a MacPro6,1 with two FirePro D500s
+on 10.9.5 is a configuration where waking invalidates GPU contexts is
+**consistent with the report and with the hardware**, and is not something this
+tree has instrumented.
+
+### 10.3 What was deliberately not done
+
+- **No `SIGABRT` handler.** The abort happens after the driver has decided the
+  context is dead, on the main thread, inside a framework, with the process in
+  a state nothing here defined. Catching it would replace a clean crash with
+  undefined behaviour and a viewer that stays open showing whatever it can
+  still draw. For a program that claims mission-critical stability that is
+  strictly worse: an honest crash is a better failure than a live process
+  making things up.
+- **No change to the display-change path.** `-backingPropertiesChanged:` does
+  the most expensive thing in the app — drops both caches and re-renders — and
+  it does it at the exact moment of a wake. That is correct: at a new backing
+  scale every cached bitmap really is the wrong size. Deferring it would only
+  make the window blank for longer, and it is not what aborted.
+- **No removal of full-screen support** to avoid the layer-tree window. The
+  connection is unverified, and trading a feature for a guess is not a fix.
+
+### 10.4 What was done
+
+The crash cannot be prevented from inside the process. What it *cost* can be.
+
+State is flushed when a document closes, when the app is deactivated, and at
+quit. A reader who is looking at a page when the lid closes hits none of the
+three: the app is frontmost, so it never resigns active, and it never
+terminates — it is killed. Every position change from that whole session is
+lost.
+
+`PVAppDelegate` now observes `NSWorkspaceWillSleepNotification` and commits the
+reading position there. Sleep is the one warning this process reliably gets
+before this class of death.
+
+- One notification, one write, a handful of times a day. **Nothing polls and no
+  timer is armed**, so `PVStateStore`'s own rule is kept exactly.
+- The census stays on the termination path. `-saveOpenDocumentState` was split
+  out of `-saveAllOpenDocuments` so that sleeping does not emit the
+  rasterisation counters: those describe a whole run, and writing them per
+  sleep would interleave several runs in one log and rewrite `PVStatsPath` with
+  a partial total — a measurement changed by taking it.
+- `NSWorkspace` posts on **its own** notification centre. Registering on the
+  default centre compiles, links, runs, raises nothing, and is never called.
+  `pvsuite unit` asserts the notification arrives on the workspace centre and
+  does *not* arrive on the default one, because those two cases are otherwise
+  indistinguishable from outside.
+- Unregistration now names both centres. `-removeObserver:` on the default
+  centre does not touch the workspace's, and the workspace holds observers
+  unsafely — the previous teardown would have left a freed delegate to be
+  messaged at the next sleep.
+
+### 10.5 What the clocks already got right
+
+A wake is where interval arithmetic usually breaks, so it was audited rather
+than assumed. Nothing needed changing:
+
+- Every interval in the program comes from `PVMonotonicSeconds()`
+  (`mach_absolute_time`), which does not step and does not advance across
+  sleep on 10.9. A render deadline set before the machine slept still has its
+  full budget on wake, so a long sleep cannot spuriously time out a helper and
+  kill it. This is the safe direction and it is the one in force.
+- The single wall-clock read, `PVCurrentPowerSource`'s cache stamp, is a
+  staleness test with an explicit backwards-clock guard. On wake the stamp is
+  old, the cache expires, and the power source is read again — which is correct
+  behaviour, since the machine may well have been unplugged while it slept.
+
+---
+
+## 11. Two pages side by side
+
+Added 2026-09-01. `View ▸ Two Pages`, ⌘3, remembered per document.
+
+### 11.1 It is not a second layout
+
+`PVPageView` lays pages out in **rows**. A row holds one page or two, and the
+column count is the only thing that differs. There is no second layout path and
+no second drawing path, and nothing downstream — the visible range, the wanted
+set, the prefetch, the cache, the cost model — knows which one is in force,
+because all of them are written in pages and a row hands back pages.
+
+Two things had to be got right for that to be true rather than merely claimed:
+
+**The binary search needed a monotonic index.** `-pageRangeInRect:` finds the
+first page whose bottom edge reaches the rect. That is a binary search, and a
+binary search requires its predicate to be monotonic in the index it searches.
+Page frames stop being monotonic the moment a row holds two of them: facing
+pages are aligned at their tops, so a tall page beside a short one gives the
+*lower* index the *greater* maximum y, and the search can step past the row it
+is standing in — dropping a page that is on screen out of the visible range, so
+it is never pinned and never rendered. Rows are monotonic by construction, each
+beginning below the last, so the search runs over rows and converts to pages at
+the end. At one column it is the identical search over the identical numbers.
+
+**A reading position is a fraction into the row, not into the page.** Both
+facing pages occupy the same band, so a fraction measured against one of them
+does not survive being handed back to `-scrollToPage:fraction:`. Reopening a
+document in the spread would land the reader somewhere they had never been.
+
+### 11.2 The requested count is not the laid-out count
+
+`-setColumns:` records an intent; the row table is rebuilt by the next layout
+pass. Between those two moments the two counts disagree, and every query that
+indexes the row table answers from `_laidOutColumns` — never from `_columns`.
+
+The failure if it does not is not a stale answer but an out-of-range one: at
+two columns over a table still built one row per page, `row * columns` runs
+past the end of the document, and `NSMakeRange(first, last - first + 1)`
+underflows to a length of billions — which then goes to `-setPinnedPages:` and
+to the draw loop.
+
+Nothing in the app can currently reach that window, because the controller
+relayouts in the same turn of the run loop that it sets the count. That is a
+property of one call site, not of the class, and it is the kind of guarantee
+that holds until someone adds a call between the two. `pvsuite unit` sets the
+count without a relayout on purpose and asserts every range stays inside the
+document.
+
+### 11.3 What it costs
+
+*Derived from §2, not separately measured.* §2 is the measurement that decides
+this, and it says a page's cost has two components pulling opposite ways:
+destination traffic, proportional to pixels touched, and content-stream
+interpretation, proportional to operator count and paid in full however few
+pixels are drawn.
+
+In the spread, fit-width halves the zoom, so each page is about a quarter of
+the area it had — and a screenful still holds about the same number of pixels,
+because **the viewport bounds the pixels, not the page count**.
+
+| document kind | cost per screenful | pages per screenful | cost per page read |
+|---|---|---|---|
+| vector (`heavy.pdf`) | ~unchanged — pixel-bound, viewport-bounded | ×2 | **~halved** |
+| text (`text.pdf`) | ~doubled — two content streams walked | ×2 | **~unchanged** |
+
+So the spread is a win on vector content and neutral on text, per page
+actually read. It is not a battery regression in either direction, which is why
+it needed no new gate, no new budget and no change to the scheduler. *This is
+arithmetic on §2's ratios and has not been measured on the target;* the
+instrument to do it with is `make power`.
+
+The cache is unaffected in the way that matters. `PVRenderPolicyFitsCache`
+budgets for two visible full-resolution pages plus prefetch, evaluated at the
+tier's render ceiling; in the spread at any fit zoom each page is far under
+that ceiling, so the pinned set costs less than the invariant already reserves.
+At actual size on a large display the spread can pin four pages where the
+column pinned two — and that is the case `-setPinnedPages:` was written for: the
+cache goes over budget by a bounded amount and comes straight back, rather than
+evicting a page that is still wanted and re-rendering it forever.
+
+### 11.4 The page you cannot see is not rendered
+
+The spread introduced a way for a page to be on screen vertically and not on
+screen at all, and the scheduler did not notice.
+
+`-pageRangeInRect:` asks a purely vertical question, because until the spread
+there was no other kind. A single column is centred in a document exactly as
+wide as its widest page, so whatever the horizontal scroll position, the one
+page in a row always overlaps the window — the horizontal question has the
+answer YES by construction and nobody had to ask it.
+
+A row of two pages plus a gutter breaks that. Zoom past the point where a row
+fits the window and the reader can scroll sideways until one of the pair is
+entirely off the glass. Both pages stay in the visible page *range* — they
+share the row — so the scheduler went on asking for a preview **and** a
+full-resolution bitmap for a page with no pixels on screen. That is the most
+expensive thing this program does, spent against §1's first and largest lever:
+not rendering at all.
+
+`-drawRect:` never had the bug — it has always culled with `NSIntersectsRect`
+against the dirty rect. The fix is that same test, moved to the decision that
+costs something: `PVPageOverlapsColumn()` now gates the visible pages and both
+prefetch loops. Prefetch is gated too, and deliberately: a reader who has
+scrolled a zoomed spread over to the left-hand page will still be on the
+left-hand page one spread further down, so the right-hand column is as
+invisible there as it is here.
+
+**The cull alone would have been a bug.** The wanted set is rebuilt only when
+the visible page range, the direction of travel, or the motion state changes —
+and none of those move when you scroll across a spread. Culling without saying
+so would have dropped the far page correctly on the way out and never asked for
+it again on the way back in. `-clipBoundsChanged:` therefore also compares the
+horizontal position, guarded by `laidOutColumns > 1 &&` the document being wider
+than the window, so the single-page column's early-out is bit for bit the one
+that was measured.
+
+`pvsuite ui` `[5j]` pins all of it: zoom until a row is wider than the window,
+scroll hard left and assert the right-hand page is never named, scroll hard
+right and assert the mirror image, scroll across and assert the page that came
+into view *is* named. Verified to fail without the cull — reinstating the bug
+fails exactly the two assertions about the invisible page and nothing else.
+
+*Not measured in joules.* What is measured is the request count, which is the
+thing the energy would be spent on: at the zooms where this fires, half of every
+full-resolution render was being thrown away.
+
+### 11.5 Details that are decisions
+
+- **Pairing is (0,1), (2,3), …** — the plain "Two Pages" of the platform's own
+  viewer. No cover-page-alone variant: it doubles the state space to serve a
+  convention this program has no way to detect.
+- **Facing pages are aligned at their tops**, and the row is as tall as the
+  taller of the two. Centring them instead would be prettier on mixed page
+  sizes and would cost the monotonicity §11.1 is built on.
+- **Rows are centred as a unit**, so the gutter sits in the middle of the
+  window. At one column this is the page centred on its own, which is what it
+  always was.
+- **Next and Previous turn a whole spread.** Stepping one page would leave the
+  viewport where it was for every second press — the page asked for is already
+  on screen — which reads as a menu item that half works.
+- **The title names both pages**: "(pages 4-5 of 100)". It is the only page
+  indicator the app has, and naming just the left one makes the number stop
+  changing on every second turn.
+- **The last row of an odd-length document holds one page** and is titled as
+  one.
+- **No toolbar button.** There is no artwork for one, and inventing an icon is
+  a different job from this one.
+- **Horizontal travel does not feed the motion gate.** `_scrollSpeed` is
+  vertical, and `-secondsPageStaysVisible:` derives dwell from vertical
+  geometry; mixing a sideways speed into either would corrupt a dwell model
+  that is about pages leaving the top of the window. So a fast sideways flick
+  across a zoomed spread is not throttled the way a vertical flick is. The cull
+  in §11.4 bounds what that can cost — there are only ever two pages to choose
+  between, and only the visible one is asked for — so what remains is at most
+  one page render per flick. A horizontal dwell model would be new machinery
+  for a case nobody has measured, and §7 is where it belongs until someone
+  does.

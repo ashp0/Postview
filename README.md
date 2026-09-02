@@ -47,6 +47,7 @@ does not quietly take the association away from Preview on its own.
 | Go to page number | **⌥⌘G** |
 | Next / previous page | **⌘↓** / **⌘↑** |
 | First / last page | **⌘Home** / **⌘End** |
+| Two pages side by side | **⌘3** |
 | Show or hide thumbnails | **⌥⌘2**, or the toolbar button |
 | Full screen | **⌃⌘F** |
 | Open another PDF | drop it anywhere on the window, or **⌘O** |
@@ -54,6 +55,26 @@ does not quietly take the association away from Preview on its own.
 Which page you are on is in the window title, the way Preview has it, rather
 than in a text field in the toolbar. The toolbar is two buttons: thumbnails,
 and zoom.
+
+**Two pages side by side** (**⌘3**) is for wide displays, which is where a
+single column of one page wastes most of the glass. Pages pair up the way a
+book opens — 1 and 2, then 3 and 4 — aligned at their tops, with the last page
+of an odd-length document sitting on its own. Fit-width and fit-page fit the
+*pair*, so turning it on zooms out rather than making the window wider, and the
+title names both pages: *(pages 4-5 of 100)*. **⌘↓** and **⌘↑** turn the whole
+spread. The setting is remembered per document alongside the page and the zoom,
+so a document you read as a spread reopens as one.
+
+It costs no more battery per page read. A screenful holds about the same number
+of pixels either way — the viewport bounds the pixels, not the page count — so
+on graphics-heavy documents the spread is roughly half the work per page, and
+on text it is about the same. The reasoning is in ENGINEERING.md §11.3, derived
+from the measurement in §2.
+
+Zoom in far enough that the pair no longer fits the window and you can scroll
+sideways onto one page of it. Postview then renders only the page you are
+actually looking at, and stops asking for the other one until you scroll back
+— including when it prefetches the next spread. §11.4.
 
 Opening the app from its icon gives you an empty window that waits: drop a PDF
 anywhere on it, pick one of the documents you had open recently, or press ⌘O.

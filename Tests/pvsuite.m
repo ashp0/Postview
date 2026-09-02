@@ -28,6 +28,7 @@
 //  assertion anywhere was about cost. See "The energy and CPU suite" below.
 
 #import "PVCommon.h"
+#import "PVAppDelegate.h"
 #import "PVPDFSource.h"
 #import "PVImageCache.h"
 #import "PVRenderQueue.h"
@@ -1105,6 +1106,135 @@ static void TestLayout(PVPDFSource *src)
     [v setZoom:999 backingScale:1.0 containerWidth:900];
     OK([v zoom] <= PV_MAX_ZOOM, "zoom is clamped at the high end");
 
+    // ---- the two-page spread ------------------------------------------
+    //
+    // Everything above is asserted again with two pages to a row, because the
+    // spread is not a second layout: it is the same one with a different
+    // column count, and if the properties the rest of the app relies on hold
+    // in one column and not in two then the app is only half written.
+    [v setZoom:1.0 backingScale:1.0 containerWidth:900];
+    CGFloat singleHeight = NSHeight([v frame]);
+    NSRect  singlePage0  = [v rectForPage:0];
+
+    [v setColumns:2];
+    OK([v columns] == 2, "the column count is what it was set to");
+    // The geometry the view was last laid out for is unchanged in every
+    // argument -- same zoom, same scale, same width -- so this call is exactly
+    // the one the early-out exists to swallow. It must not swallow this.
+    [v setZoom:1.0 backingScale:1.0 containerWidth:900];
+    OK(NSHeight([v frame]) < singleHeight,
+       "turning the spread on relays out even though zoom, scale and width did not move");
+
+    BOOL paired = YES, gutter = YES, rowsApart = YES, rowStart = YES;
+    for (NSUInteger i = 0; i + 1 < n; i += 2) {
+        NSRect a = [v rectForPage:i], b = [v rectForPage:i + 1];
+        if (fabs(NSMinY(a) - NSMinY(b)) > 0.001) paired = NO;
+        if (fabs(NSMinX(b) - (NSMaxX(a) + PV_PAGE_GAP)) > 0.001) gutter = NO;
+        if ([v firstPageOfRowContainingPage:i]     != i) rowStart = NO;
+        if ([v firstPageOfRowContainingPage:i + 1] != i) rowStart = NO;
+        if (i + 2 < n) {
+            NSRect next = [v rectForPage:i + 2];
+            if (NSMinY(next) < NSMaxY(a) || NSMinY(next) < NSMaxY(b)) rowsApart = NO;
+        }
+    }
+    OK(paired,    "facing pages share a top edge");
+    OK(gutter,    "the second page of a row sits one gap to the right of the first");
+    OK(rowsApart, "rows never overlap the row above them");
+    OK(rowStart,  "both pages of a spread report the same first page of the row");
+    OK(NSWidth([v rectForRowContainingPage:1]) >= NSWidth(singlePage0) * 2,
+       "a row is as wide as the two pages in it");
+    OK(fabs(NSMinY([v rectForRowContainingPage:0]) - NSMinY([v rectForPage:1])) < 0.001 &&
+       fabs(NSMinY([v rectForRowContainingPage:1]) - NSMinY([v rectForPage:0])) < 0.001,
+       "either page of a spread names the same row");
+
+    // The search, again exhaustively. This is the property the row table
+    // exists for: a search over page frames is not guaranteed to find the row
+    // it is standing in once two pages share a band.
+    BOOL spreadSearch = YES;
+    for (NSUInteger i = 0; i < n; i++) {
+        NSRect r = [v rectForRowContainingPage:i];
+        NSRange got = [v pageRangeInRect:NSMakeRect(0, NSMinY(r) + 1, 900, 10)];
+        NSUInteger first = [v firstPageOfRowContainingPage:i];
+        NSUInteger want  = (first + 1 < n) ? 2 : 1;
+        if (got.location != first || got.length != want) spreadSearch = NO;
+    }
+    OK(spreadSearch, "a thin rect inside a row resolves to both pages of that row");
+
+    NSRange spreadAll = [v pageRangeInRect:[v frame]];
+    OK(spreadAll.location == 0 && spreadAll.length == n,
+       "whole-document rect still covers every page in the spread");
+    NSRange spreadTop = [v pageRangeInRect:NSMakeRect(0, 0, 900, 5)];
+    OK(spreadTop.location == 0, "rect above the first spread resolves to page 0");
+    NSRange spreadPast = [v pageRangeInRect:NSMakeRect(0, NSHeight([v frame]) + 500, 900, 50)];
+    OK(spreadPast.location < n, "rect past the end of the spread stays in range");
+
+    // The round trip is what saved reading positions depend on, and it is
+    // measured against the row: the fraction the controller stores is a
+    // fraction into the band the two facing pages share.
+    BOOL spreadRoundTrip = YES;
+    for (NSUInteger i = 0; i < n; i += 7) {
+        CGFloat frac = 0.37;
+        NSRect r = [v rectForRowContainingPage:i];
+        CGFloat y = NSMinY(r) + frac * NSHeight(r);
+        CGFloat outFrac = 0;
+        NSUInteger back = [v pageAtTopOfRect:NSMakeRect(0, y, 900, 600) fraction:&outFrac];
+        if (back != [v firstPageOfRowContainingPage:i]) spreadRoundTrip = NO;
+        if (fabs(outFrac - frac) > 0.02) spreadRoundTrip = NO;
+    }
+    OK(spreadRoundTrip, "page+fraction survives a round trip through the spread");
+
+    // And back. Turning the mode off has to return the exact geometry it was
+    // turned on from, or a reader who tried it once has a document that never
+    // quite goes back to how it was.
+    [v setColumns:1];
+    [v setZoom:1.0 backingScale:1.0 containerWidth:900];
+    OK(NSHeight([v frame]) == singleHeight &&
+       NSEqualRects([v rectForPage:0], singlePage0),
+       "turning the spread off restores the single-page geometry exactly");
+    OK(NSEqualRects([v rectForRowContainingPage:3], [v rectForPage:3]),
+       "a row is the page itself when there is one column");
+
+    // ---- the count asked for, against the count laid out ----------------
+    //
+    // -setColumns: records an intent; the row table is not rebuilt until the
+    // next layout pass. Everything that indexes that table has to answer from
+    // the shape it actually has, and the failure if it does not is not a stale
+    // answer but an out-of-range one: at two columns over a table still built
+    // one row per page, `row * columns` runs past the end of the document and
+    // the range built from it underflows to a length of billions -- which then
+    // goes to -setPinnedPages: and to the draw loop.
+    //
+    // The app never opens this window, because the controller relayouts in the
+    // same turn of the run loop that it sets the count. That is a property of
+    // one call site, not of this class, so it is pinned here.
+    [v setColumns:1];
+    [v setZoom:1.0 backingScale:1.0 containerWidth:900];
+    [v setColumns:2];                       // ... and deliberately no relayout
+    OK([v columns] == 2 && [v laidOutColumns] == 1,
+       "the requested column count moves ahead of the laid-out one");
+
+    BOOL staleSafe = YES;
+    for (NSUInteger i = 0; i < n; i++) {
+        if ([v firstPageOfRowContainingPage:i] != i) staleSafe = NO;
+    }
+    OK(staleSafe, "row queries answer from the layout on screen, not the one asked for");
+
+    NSRange stale = [v pageRangeInRect:[v frame]];
+    OK(stale.location < n && stale.length <= n &&
+       stale.location + stale.length <= n,
+       "the visible range stays inside the document while the two counts disagree");
+
+    NSRange staleThin = [v pageRangeInRect:NSMakeRect(0, NSMinY([v rectForPage:n - 1]) + 1,
+                                                     900, 4)];
+    OK(staleThin.location < n && staleThin.location + staleThin.length <= n,
+       "and the last row of the document is still in range from the stale count");
+
+    // The relayout that answers the request is what moves the other count.
+    [v setZoom:1.0 backingScale:1.0 containerWidth:900];
+    OK([v laidOutColumns] == 2, "the layout pass is what publishes the new count");
+    [v setColumns:1];
+    [v setZoom:1.0 backingScale:1.0 containerWidth:900];
+
     [v release];
     [cache release];
 }
@@ -1559,8 +1689,10 @@ static void TestStateStoreCorruptFile(void)
 
     NSUInteger page = 999; CGFloat frac = -5, zoom = -5;
     PVZoomMode mode = (PVZoomMode)99; BOOL sidebar = YES; NSString *frame = (NSString *)@"x";
+    NSUInteger columns = 99;
     BOOL found = [s stateForURL:junk page:&page fraction:&frac zoomMode:&mode
-                           zoom:&zoom sidebar:&sidebar windowFrame:&frame];
+                           zoom:&zoom sidebar:&sidebar columns:&columns
+                    windowFrame:&frame];
     OK(found, "the wrong-typed entry is still found, not discarded wholesale");
     OK(page == 0,                      "a non-numeric page reads back as 0");
     OK(frac >= 0 && frac <= 1,         "a non-numeric fraction is clamped into range");
@@ -1568,24 +1700,27 @@ static void TestStateStoreCorruptFile(void)
     OK(mode == PVZoomModeFitWidth,     "a non-numeric zoom mode falls back to fit width");
     OK(sidebar == NO,                  "a non-numeric sidebar flag reads back as NO");
     OK(frame == nil,                   "a non-string window frame reads back as nil");
+    OK(columns == 1,                   "a non-numeric column count falls back to one page across");
 
     // A value that is not a dictionary must not be reachable at all: -prune
     // reaches into every value it holds and would have gone down with it.
     OK(![s stateForURL:[NSURL fileURLWithPath:@"/tmp/postview-corrupt-c.pdf"]
-                  page:NULL fraction:NULL zoomMode:NULL zoom:NULL sidebar:NULL windowFrame:NULL],
+                  page:NULL fraction:NULL zoomMode:NULL zoom:NULL sidebar:NULL
+               columns:NULL windowFrame:NULL],
        "an entry that is not a dictionary is dropped on load");
 
     // The good entry must be untouched by any of that.
     page = 0; frac = 0; zoom = 0; mode = PVZoomModeCustom; sidebar = NO; frame = nil;
     OK([s stateForURL:good page:&page fraction:&frac zoomMode:&mode
-                 zoom:&zoom sidebar:&sidebar windowFrame:&frame], "the sound entry survives");
+                 zoom:&zoom sidebar:&sidebar columns:NULL windowFrame:&frame],
+       "the sound entry survives");
     OK(page == 11 && fabs(zoom - 1.25) < 0.0001 && mode == PVZoomModeFitPage &&
        sidebar == YES && [frame length] > 0, "the sound entry round-trips unchanged");
 
     // Writing after loading a hostile file must not carry the junk back out,
     // and -prune must be able to walk what is left.
     [s recordForURL:good page:3 fraction:0.1 zoomMode:PVZoomModeActual
-               zoom:1.0 sidebar:NO windowFrame:@"0 0 10 10 0 0 100 100"];
+               zoom:1.0 sidebar:NO columns:1 windowFrame:@"0 0 10 10 0 0 100 100"];
     [s flush];
     OK(YES, "flush after loading a hostile file completes");
     [s release];
@@ -1596,7 +1731,7 @@ static void TestStateStoreCorruptFile(void)
     PVStateStore *s2 = [[PVStateStore alloc] initWithPath:path];
     OK(s2 != nil, "a store loads from a file that is not a plist at all");
     OK(![s2 stateForURL:good page:NULL fraction:NULL zoomMode:NULL
-                   zoom:NULL sidebar:NULL windowFrame:NULL],
+                   zoom:NULL sidebar:NULL columns:NULL windowFrame:NULL],
        "an unreadable file yields an empty store rather than a crash");
     [s2 release];
     [[NSFileManager defaultManager] removeItemAtPath:path error:NULL];
@@ -1608,19 +1743,23 @@ static void TestStateStore(void)
     NSURL *url = [NSURL fileURLWithPath:@"/tmp/postview-selftest-doc.pdf"];
     PVStateStore *s = [PVStateStore sharedStore];
     [s recordForURL:url page:42 fraction:0.25 zoomMode:PVZoomModeFitPage
-               zoom:1.75 sidebar:YES windowFrame:@"100 100 800 600 0 0 1440 900"];
+               zoom:1.75 sidebar:YES columns:2
+        windowFrame:@"100 100 800 600 0 0 1440 900"];
     [s flush];
 
     NSUInteger page = 0; CGFloat frac = 0, zoom = 0;
     PVZoomMode mode = PVZoomModeCustom; BOOL sidebar = NO; NSString *frame = nil;
+    NSUInteger columns = 0;
     BOOL found = [s stateForURL:url page:&page fraction:&frac zoomMode:&mode
-                           zoom:&zoom sidebar:&sidebar windowFrame:&frame];
+                           zoom:&zoom sidebar:&sidebar columns:&columns
+                    windowFrame:&frame];
     OK(found, "state was recorded");
     OK(page == 42, "page number round-trips");
     OK(fabs(frac - 0.25) < 0.0001, "scroll fraction round-trips");
     OK(mode == PVZoomModeFitPage, "zoom mode round-trips");
     OK(fabs(zoom - 1.75) < 0.0001, "zoom round-trips");
     OK(sidebar == YES, "sidebar visibility round-trips");
+    OK(columns == 2, "the two-page layout round-trips");
     OK([frame length] > 0, "window frame round-trips");
 
     // Survives a full reload from disk, which is the case that actually matters:
@@ -1636,7 +1775,7 @@ static void TestStateStore(void)
     NSUInteger p2 = 7;
     BOOL missing = [s stateForURL:[NSURL fileURLWithPath:@"/tmp/never-opened-xyz.pdf"]
                              page:&p2 fraction:NULL zoomMode:NULL zoom:NULL
-                          sidebar:NULL windowFrame:NULL];
+                          sidebar:NULL columns:NULL windowFrame:NULL];
     OK(!missing, "unknown document reports no saved state");
 }
 
@@ -1863,6 +2002,64 @@ static void TestOversizedPageGeometry(void)
 
     [src release];
     [[NSFileManager defaultManager] removeItemAtPath:path error:NULL];
+}
+
+// The app delegate's private half, declared rather than added: these exist on
+// the class already, and the test has no business reaching around them.
+@interface PVAppDelegate (PVTestHooks)
+- (void)saveOpenDocumentState;
+- (void)stopObservingNotifications;
+@end
+
+// Counts the saves instead of performing them, so the test is about which
+// notification centre the delegate listened to and not about the disk.
+@interface PVSleepProbeDelegate : PVAppDelegate {
+@public
+    NSUInteger saves;
+}
+@end
+@implementation PVSleepProbeDelegate
+- (void)saveOpenDocumentState { saves++; }
+@end
+
+// Sleep is a save point. See ENGINEERING.md section 10.
+//
+// What this pins is not that a save is a good idea -- it is which centre the
+// registration went to. NSWorkspace posts its notifications on its own centre,
+// and a delegate that registers for NSWorkspaceWillSleepNotification on the
+// default centre compiles, links, runs, raises nothing and is simply never
+// called. There is no observable difference between that mistake and having
+// written no hook at all, except on the machine where the crash happens, and
+// the reader who loses their place is the one who finds out.
+static void TestSleepSavesReadingPosition(void)
+{
+    printf("\n[sleep is a save point]\n");
+
+    PVSleepProbeDelegate *d = [[PVSleepProbeDelegate alloc] init];
+    [d applicationWillFinishLaunching:nil];
+
+    NSNotificationCenter *workspace = [[NSWorkspace sharedWorkspace] notificationCenter];
+    NSUInteger before = d->saves;
+    [workspace postNotificationName:NSWorkspaceWillSleepNotification object:nil];
+    OK(d->saves == before + 1, "the machine going to sleep writes the reading position");
+
+    // The same name on the wrong centre reaches nothing, which is the whole
+    // point: this is the mistake being guarded against, asserted directly.
+    before = d->saves;
+    [[NSNotificationCenter defaultCenter]
+        postNotificationName:NSWorkspaceWillSleepNotification object:nil];
+    OK(d->saves == before,
+       "the default centre is not where that notification lives");
+
+    // And the way out. The workspace centre holds observers unsafely, so a
+    // delegate that unregistered from only the default centre would leave a
+    // freed pointer behind to be messaged at the next sleep.
+    [d stopObservingNotifications];
+    before = d->saves;
+    [workspace postNotificationName:NSWorkspaceWillSleepNotification object:nil];
+    OK(d->saves == before, "a torn-down delegate no longer hears about sleep");
+
+    [d release];
 }
 
 static void TestRunningLocation(void)
@@ -3189,6 +3386,7 @@ static int RunUnit(int argc, const char *argv[])
         TestStateStoreCorruptFile();
         TestOversizedPageGeometry();
         TestRunningLocation();
+        TestSleepSavesReadingPosition();
         TestRenderSuppressionPolicy();
         TestRamTierInvariants();
         TestResidentCensus();
@@ -3229,6 +3427,9 @@ static int RunUnit(int argc, const char *argv[])
 static BOOL       PVCountRequests = NO;
 static NSUInteger PVFullRequestCount = 0;
 static NSUInteger PVPreviewRequestCount = 0;
+// Which pages were named, not just how many. A count answers "how much work",
+// and the horizontal cull needs the other question: "work on WHICH page".
+static NSMutableIndexSet *PVRequestedPages = nil;
 
 @interface PVRenderQueue (PVTestCounting)
 - (void)pvCountingSetDesiredRequests:(NSArray *)requests;
@@ -3243,6 +3444,7 @@ static NSUInteger PVPreviewRequestCount = 0;
             PVRenderRequest *r = [requests objectAtIndex:i];
             if (![r isKindOfClass:[PVRenderRequest class]]) continue;
             if (r->preview) PVPreviewRequestCount++; else PVFullRequestCount++;
+            [PVRequestedPages addIndex:r->page];
         }
     }
     // Swapped, so this name now reaches the original implementation.
@@ -3474,6 +3676,7 @@ static int RunUI(int argc, const char *argv[])
                                         zoomMode:PVZoomModeFitWidth
                                             zoom:1.0
                                          sidebar:NO
+                                         columns:1
                                      windowFrame:nil];
 
         NSError *err = nil;
@@ -5213,6 +5416,212 @@ static int RunUI(int argc, const char *argv[])
             PumpUntil(^{ return [(PVRenderQueue *)[wc valueForKey:@"_pageQueue"] isIdle]; }, 60.0);
         }
 
+        printf("\n[5i] two pages side by side, through the real controller\n");
+        {
+            // The unit suite asserts the spread's geometry against PVPageView
+            // directly. This asserts the things only the controller can be
+            // wrong about: that the mode reaches the view at all, that the
+            // reader keeps their place across it, that the wanted set and the
+            // pins follow, and that turning it off puts everything back.
+            [wc zoomFitWidth:nil];
+            [wc goToPageNumber:37];
+            PumpUntil(^{ return [(PVRenderQueue *)[wc valueForKey:@"_pageQueue"] isIdle]; }, 60.0);
+
+            PVPageView   *pgv = [wc valueForKey:@"_pageView"];
+            PVImageCache *pc  = [wc valueForKey:@"_pageCache"];
+            NSScrollView *sv  = [wc valueForKey:@"_scrollView"];
+
+            CGFloat singleZoom = [[wc valueForKey:@"_zoom"] doubleValue];
+            NSUInteger before  = [wc currentPageWithFraction:NULL];
+            OK([pgv laidOutColumns] == 1, "a document opens in the single-page column");
+
+            [wc toggleTwoPageView:nil];
+            Pump(0.5);
+            OK([pgv laidOutColumns] == 2,
+               "the menu action reaches the view's laid-out geometry, not just the ivar");
+            OK([[wc valueForKey:@"_columns"] unsignedLongValue] == 2,
+               "and the controller agrees with it");
+
+            // The place in the document is kept. In the spread page 36 shares
+            // its row with 37, so the row the reader is on begins at 36 --
+            // which is the page they were on, not a page they have never seen.
+            OK([wc currentPageWithFraction:NULL] ==
+                   [pgv firstPageOfRowContainingPage:before],
+               "the reader stays on the row holding the page they were reading");
+
+            // Fit-width now has to fit two pages plus the gutter across the
+            // same window, so the zoom must come down. This is the whole power
+            // argument for the spread: the pixels stay bounded by the viewport.
+            CGFloat spreadZoom = [[wc valueForKey:@"_zoom"] doubleValue];
+            OK(spreadZoom < singleZoom,
+               "fit-width in the spread zooms out rather than widening the document");
+
+            // Both pages of the row are on screen, wanted, and pinned. A
+            // spread that renders only its left half is the failure this pins.
+            NSRect vis = [[sv contentView] documentVisibleRect];
+            NSRange visible = [pgv pageRangeInRect:vis];
+            OK(visible.length >= 2, "both pages of a spread are in the visible range");
+
+            PumpUntil(^{ return [(PVRenderQueue *)[wc valueForKey:@"_pageQueue"] isIdle]; }, 60.0);
+            NSUInteger firstOfRow = [pgv firstPageOfRowContainingPage:
+                                        [wc currentPageWithFraction:NULL]];
+            OK([pc hasAnyImageForPage:firstOfRow] &&
+               [pc hasAnyImageForPage:firstOfRow + 1],
+               "both pages of the spread get a bitmap");
+
+            // The title is the only page indicator this app has.
+            NSString *title = [[wc window] title];
+            OK([title rangeOfString:@"pages "].location != NSNotFound &&
+               [title rangeOfString:@"-"].location != NSNotFound,
+               "the title names both pages of the spread");
+
+            // Next and previous turn a whole spread. Stepping one page would
+            // land on a page already on screen and move nothing.
+            NSUInteger rowBefore = firstOfRow;
+            [wc goToNextPage:nil];
+            Pump(0.3);
+            OK([pgv firstPageOfRowContainingPage:[wc currentPageWithFraction:NULL]] ==
+                   rowBefore + 2,
+               "next page turns both pages at once");
+            [wc goToPreviousPage:nil];
+            Pump(0.3);
+            OK([pgv firstPageOfRowContainingPage:[wc currentPageWithFraction:NULL]] ==
+                   rowBefore,
+               "and previous comes back to the same spread");
+
+            // The menu item reports the mode rather than renaming itself.
+            NSMenuItem *item = [[[NSMenuItem alloc] initWithTitle:@"Two Pages"
+                                                          action:@selector(toggleTwoPageView:)
+                                                   keyEquivalent:@""] autorelease];
+            OK([wc validateMenuItem:item], "the spread item is enabled on a multi-page document");
+            OK([item state] == NSOnState, "and is checked while the spread is on");
+
+            // And back out. The zoom, the layout and the reading position all
+            // have to return to what they were, or a reader who tried the mode
+            // once is left with a document that never quite goes back.
+            [wc toggleTwoPageView:nil];
+            Pump(0.5);
+            OK([pgv laidOutColumns] == 1, "turning it off returns to one column");
+            OK(fabs([[wc valueForKey:@"_zoom"] doubleValue] - singleZoom) < 0.0001,
+               "and to the zoom it had before");
+            OK([wc currentPageWithFraction:NULL] == rowBefore,
+               "and to the page the reader was on");
+            OK([wc validateMenuItem:item] && [item state] == NSOffState,
+               "and the menu item is unchecked again");
+
+            PumpUntil(^{ return [(PVRenderQueue *)[wc valueForKey:@"_pageQueue"] isIdle]; }, 60.0);
+        }
+
+        printf("\n[5j] a spread zoomed past the window renders only the page you can see\n");
+        {
+            // The saving this pins is invisible in every fitted layout, which
+            // is why it survived review: at fit-width and fit-page the whole
+            // spread is inside the window, so both pages always overlap it and
+            // the cull never fires. Zoom in far enough and a row is wider than
+            // the glass -- and until the cull existed, the scheduler went on
+            // asking for a preview AND a full-resolution bitmap for the half of
+            // the pair that had no pixels on screen at all.
+            PVPageView   *pgv = [wc valueForKey:@"_pageView"];
+            PVImageCache *pc  = [wc valueForKey:@"_pageCache"];
+            NSScrollView *sv  = [wc valueForKey:@"_scrollView"];
+
+            [wc zoomFitWidth:nil];
+            if ([pgv laidOutColumns] != 2) [wc toggleTwoPageView:nil];
+            Pump(0.4);
+
+            // Zoom until one page on its own is wider than the window, which is
+            // what makes the far page of the spread reachable-but-invisible.
+            int guard = 0;
+            while (guard++ < 40 &&
+                   NSWidth([pgv rectForPage:0]) <=
+                       NSWidth([[sv contentView] documentVisibleRect]))
+                [wc zoomIn:nil];
+            Pump(0.4);
+
+            NSRect vp = [[sv contentView] documentVisibleRect];
+            OK(NSWidth([pgv rectForPage:0]) > NSWidth(vp),
+               "the spread is now wider than the window, so one page can be off screen");
+
+            NSUInteger left  = [pgv firstPageOfRowContainingPage:
+                                   [wc currentPageWithFraction:NULL]];
+            NSUInteger right = left + 1;
+            CGFloat    maxX  = NSWidth([pgv frame]) - NSWidth(vp);
+
+            // Hard left: the right-hand page has no pixels on screen.
+            [wc scrollClipTo:NSMakePoint(0, NSMinY(vp))];
+            [pc removeAll];
+            [wc setValue:[NSNumber numberWithDouble:0.0] forKey:@"_scrollSpeed"];
+            [wc setValue:[NSNumber numberWithDouble:0.0] forKey:@"_lastScrollTime"];
+            PVFullRequestCount = 0; PVPreviewRequestCount = 0;
+            PVRequestedPages = [NSMutableIndexSet indexSet];
+            PVCountRequests = YES;
+            [wc setValue:[NSNumber numberWithBool:NO] forKey:@"_haveRequestState"];
+            [wc updateVisibleContent];
+            PVCountRequests = NO;
+            NSMutableIndexSet *atLeft = PVRequestedPages;
+
+            OK(![atLeft containsIndex:right],
+               "scrolled hard left, the right-hand page is not asked for at all");
+            OK([atLeft containsIndex:left],
+               "...and the page actually on screen still is");
+
+            // Hard right: the mirror image, which rules out an off-by-one that
+            // would merely have moved the waste to the other page.
+            [wc scrollClipTo:NSMakePoint(maxX, NSMinY(vp))];
+            [pc removeAll];
+            [wc setValue:[NSNumber numberWithDouble:0.0] forKey:@"_scrollSpeed"];
+            [wc setValue:[NSNumber numberWithDouble:0.0] forKey:@"_lastScrollTime"];
+            PVRequestedPages = [NSMutableIndexSet indexSet];
+            PVCountRequests = YES;
+            [wc setValue:[NSNumber numberWithBool:NO] forKey:@"_haveRequestState"];
+            [wc updateVisibleContent];
+            PVCountRequests = NO;
+            NSMutableIndexSet *atRight = PVRequestedPages;
+
+            OK(![atRight containsIndex:left],
+               "scrolled hard right, the left-hand page is not asked for either");
+            OK([atRight containsIndex:right],
+               "...and the one now on screen is");
+
+            // The rebuild has to actually happen on a sideways move. Culling
+            // without this would drop the far page correctly on the way out and
+            // never ask for it again on the way back in, because the early-out
+            // keys on the visible page RANGE -- which does not change when you
+            // scroll across a spread.
+            [wc scrollClipTo:NSMakePoint(0, NSMinY(vp))];
+            [pc removeAll];
+            [wc updateVisibleContent];
+            PVRequestedPages = [NSMutableIndexSet indexSet];
+            PVCountRequests = YES;
+            [wc scrollClipTo:NSMakePoint(maxX, NSMinY(vp))];
+            [wc clipBoundsChanged:nil];
+            PVCountRequests = NO;
+            OK([PVRequestedPages containsIndex:right],
+               "scrolling across the spread asks for the page that came into view");
+            PVRequestedPages = nil;
+
+            // And none of this may leak into the single-page column, where a
+            // page always overlaps the window horizontally whatever x is.
+            [wc toggleTwoPageView:nil];
+            [wc zoomFitWidth:nil];
+            Pump(0.4);
+            [pc removeAll];
+            [wc setValue:[NSNumber numberWithDouble:0.0] forKey:@"_scrollSpeed"];
+            [wc setValue:[NSNumber numberWithDouble:0.0] forKey:@"_lastScrollTime"];
+            PVRequestedPages = [NSMutableIndexSet indexSet];
+            PVCountRequests = YES;
+            [wc setValue:[NSNumber numberWithBool:NO] forKey:@"_haveRequestState"];
+            [wc updateVisibleContent];
+            PVCountRequests = NO;
+            OK([PVRequestedPages count] > 0,
+               "the single-page column still asks for the page it is showing");
+            PVRequestedPages = nil;
+
+            [wc zoomFitWidth:nil];
+            [wc goToPageNumber:37];
+            PumpUntil(^{ return [(PVRenderQueue *)[wc valueForKey:@"_pageQueue"] isIdle]; }, 60.0);
+        }
+
         // Close the window the way the user would, then read back what was saved.
         [[wc window] performClose:nil];
         Pump(1.0);
@@ -5220,7 +5629,8 @@ static int RunUI(int argc, const char *argv[])
         NSUInteger page = 0; CGFloat frac = 0, zoom = 0;
         PVZoomMode mode = PVZoomModeCustom; BOOL sidebar = YES;
         BOOL found = [[PVStateStore sharedStore] stateForURL:url page:&page fraction:&frac
-                        zoomMode:&mode zoom:&zoom sidebar:&sidebar windowFrame:NULL];
+                        zoomMode:&mode zoom:&zoom sidebar:&sidebar columns:NULL
+                     windowFrame:NULL];
         printf("\n[6] position saved on close: found=%d page=%lu (expect 36, i.e. page 37)"
                " sidebar=%d zoom=%.2f\n", (int)found, (unsigned long)page, (int)sidebar, zoom);
         int bad = 0;
@@ -6660,7 +7070,7 @@ static void ScrollOnce(NSURL *url, PVPowerSource power, PVResources *before,
     // first.
     [[PVStateStore sharedStore] recordForURL:url page:0 fraction:0.0
                                     zoomMode:PVZoomModeFitWidth zoom:1.0
-                                     sidebar:NO windowFrame:nil];
+                                     sidebar:NO columns:1 windowFrame:nil];
 
     // Scoped, and this is the difference between measuring the viewer and
     // measuring the harness.

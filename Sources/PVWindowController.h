@@ -38,6 +38,11 @@
 
     PVZoomMode        _zoomMode;
     CGFloat           _zoom;
+    // Pages side by side: 1 for the ordinary column, 2 for the spread. The
+    // page view is told this number and works out the geometry; everything
+    // else here -- the wanted set, the prefetch, the failure tables, the cache
+    // -- is written in pages and is unaffected by how they are arranged.
+    NSUInteger        _columns;
     BOOL              _sidebarVisible;
     BOOL              _liveScrolling;
     // A pinch is in progress. Like a live scroll it holds off the exact render
@@ -156,6 +161,14 @@
     // enough to matter, rather than on every bounds notification.
     NSRange           _lastRequestRange;
     BOOL              _haveRequestState;
+    // Where the viewport was horizontally when that set was built.
+    //
+    // Only ever consulted in a two-page spread wide enough to scroll sideways,
+    // which is the only configuration in which the wanted set depends on x at
+    // all: in the single-page column a page always overlaps the viewport
+    // horizontally whatever the scroll position, so this changes nothing
+    // there. See -clipBoundsChanged: and PVPageOverlapsColumn().
+    CGFloat           _lastRequestX;
 
     // Bitmaps CoreGraphics has refused to rasterise, and how many times. A
     // render that fails never reaches the cache, so the wanted-set names it
@@ -239,6 +252,7 @@
 - (void)goToPageNumber:(NSInteger)oneBasedPage;
 
 - (IBAction)toggleSidebar:(id)sender;
+- (IBAction)toggleTwoPageView:(id)sender;
 - (IBAction)zoomIn:(id)sender;
 - (IBAction)zoomOut:(id)sender;
 - (IBAction)zoomActualSize:(id)sender;

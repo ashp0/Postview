@@ -4,7 +4,15 @@
 #import <Cocoa/Cocoa.h>
 
 #define PV_EDGE_GAP          14.0   // margin around the page column
-#define PV_PAGE_GAP          12.0   // vertical gap between pages
+#define PV_PAGE_GAP          12.0   // gap between pages, vertically and across
+// How many pages one row of the page column may hold.
+//
+// The two-page spread is the only multi-column layout there is, so this is a
+// bound rather than a mode: PVPageView is told a number of columns and lays
+// out rows of that many pages, and one is the ordinary single-page column.
+// Everything downstream -- the visible range, the wanted set, the prefetch --
+// is written in terms of pages and does not know which layout produced them.
+#define PV_MAX_PAGE_COLUMNS   2
 #define PV_MIN_ZOOM          0.10
 #define PV_MAX_ZOOM          6.00
 #define PV_PREVIEW_DIVISOR   3.0    // preview pass renders 1/3 linear size (9x fewer pixels)
