@@ -16,6 +16,10 @@
 #   make soak       long-uptime memory  (               subcommand `soak`)
 #   make stress     contention, sanitized (             subcommand `stress`)
 #   make power      CPU, wakeups, battery (             subcommand `power`)
+#   make fuzz       malformed documents vs the viewer (a search, not a gate)
+#   make statecontend  two Postviews quitting at once (forks; not a gate)
+#   make helperkill SIGKILL the helper, check recovery (not a gate)
+#   make helperprotocol  a helper that LIES; is the viewer hardened? (not a gate)
 #   make verify-all every gate, in order
 #   make clean
 
@@ -149,7 +153,7 @@ LDFLAGS := -arch x86_64 -mmacosx-version-min=$(MIN) -isysroot $(SDK) \
 HELPER_LDFLAGS := -arch x86_64 -mmacosx-version-min=$(MIN) -isysroot $(SDK) \
                   -framework Foundation -framework CoreGraphics -Wl,-dead_strip
 
-.PHONY: all clean distclean run dist package verify icon analyze release test uitest soak stress leakcheck verify-all band power suite sign helper
+.PHONY: all clean distclean run dist package verify icon analyze release test uitest soak stress leakcheck verify-all band power suite sign helper fuzz statecontend helperkill helperprotocol
 
 all: $(BUNDLE)
 
@@ -498,6 +502,107 @@ $(SUITE): Tests/pvsuite.m $(OBJECTS) $(BUILD)/$(HELPER) | $(BUILD)
 
 suite: $(SUITE)
 	@echo "  built    $(SUITE)"
+
+# Two probes for design claims the suite states but never exercises.
+#
+# Deliberately NOT in verify-all, and the distinction is the point. Both are
+# adversarial and one of them forks: they belong in the hands of someone reading
+# the output, not in a release gate that is supposed to fail for one reason and
+# be believed when it does. `fuzz` in particular is a search, not an assertion --
+# a clean run is evidence, not proof, and wiring a search into a gate invites
+# reading its silence as a guarantee.
+
+# Does a malformed document kill the VIEWER?
+#
+# PVPDFSource.h opens by arguing that parsing and drawing both happen in a
+# helper process precisely so that a document which faults, hangs or aborts
+# inside Quartz takes the helper with it and nothing else. The suite tests
+# corrupt state files; nothing tested a corrupt document, so the claim the whole
+# split exists to make was the one thing not checked. Feeds truncations,
+# synthesized pathologies and seeded byte-flip mutations, and asserts the viewer
+# is still there afterwards -- with open and render both bounded, so a hang
+# fails rather than passing slowly.
+FUZZROUNDS ?= 150
+FUZZSEED   ?= $(BUILD)/text.pdf
+
+fuzz: $(BUILD)/pvfuzz
+	$(mkheavy)
+	@$(BUILD)/pvfuzz $(FUZZSEED) $(BUILD)/fuzzwork $(FUZZROUNDS)
+
+$(BUILD)/pvfuzz: Tests/pvfuzz.m $(OBJECTS) $(BUILD)/$(HELPER) | $(BUILD)
+	@echo "  compile  Tests/pvfuzz.m"
+	@$(CC) $(CFLAGS) -ISources -c Tests/pvfuzz.m -o $(BUILD)/pvfuzz.o
+	@$(CC) $(LDFLAGS) $(SUITEOBJ) $(BUILD)/pvfuzz.o -o $(BUILD)/pvfuzz
+
+# Do two Postviews quitting at once lose reading positions?
+#
+# PVStateStore merges instead of overwriting so that two copies reading
+# different documents cannot clobber each other. That merge is exercised in ONE
+# process; the flock path that makes the promise true had no test. Forks real
+# processes at one state file. Separates writers that retry (nothing may be
+# lost) from writers that flush once and exit -- which is what QUITTING is, and
+# the case where -flush's 0.25 s give-up has no later flush point to fall back on.
+statecontend: $(BUILD)/pvstatecontend
+	@$(BUILD)/pvstatecontend
+
+# Kill the render helper and check the viewer comes back.
+#
+# `fuzz` asks whether a hostile document can kill the viewer; most of what it
+# exercises is Quartz's parser inside a process built to die safely. This asks
+# the half that is Postview's OWN code. -createImageForPage: has to notice the
+# helper is gone, classify that as transient rather than as a page that will
+# never draw, kill and reap the remains, and let -ensureRenderHelper: start a
+# fresh one on the next call. Misclassify it and a page briefly without a helper
+# is retired for the whole session; misreap it and a long session collects
+# zombies. Nothing in the suite killed a helper.
+#
+# Three arms: kill between renders, kill DURING renders from another thread, and
+# kill-then-release-immediately. A render that loses its helper is ALLOWED to
+# fail -- it is required to say why, and to be followed by one that works.
+KILLROUNDS ?= 40
+
+helperkill: $(BUILD)/pvhelperkill
+	$(mkheavy)
+	@$(BUILD)/pvhelperkill $(PDF) $(KILLROUNDS)
+
+$(BUILD)/pvhelperkill: Tests/pvhelperkill.m $(OBJECTS) $(BUILD)/$(HELPER) | $(BUILD)
+	@echo "  compile  Tests/pvhelperkill.m"
+	@$(CC) $(CFLAGS) -ISources -c Tests/pvhelperkill.m -o $(BUILD)/pvhelperkill.o
+	@$(CC) $(LDFLAGS) $(SUITEOBJ) $(BUILD)/pvhelperkill.o -o $(BUILD)/pvhelperkill
+
+# A helper that LIES, and whether the viewer believes it.
+#
+# The split exists because the helper is where attacker-controlled bytes are
+# interpreted -- which makes the helper the process most likely to be subverted,
+# and everything it says back untrusted input. PVPDFSource does check magic,
+# version and sequence on every reply and bounds every read with a deadline;
+# those branches were reachable only by accident until this.
+#
+# Runs in its own directory because the viewer finds its helper by looking
+# beside its own executable: the liar is installed there under the real name,
+# with the genuine helper alongside as RealRenderHelper for the copy and
+# geometry conversations it passes through untouched.
+PROTODIR := $(BUILD)/protocol
+
+helperprotocol: $(PROTODIR)/pvhelperprotocol
+	$(mkheavy)
+	@$(PROTODIR)/pvhelperprotocol $(PDF)
+
+$(PROTODIR)/pvhelperprotocol: Tests/pvhelperprotocol.m Tests/pvbadhelper.m \
+                              $(OBJECTS) $(BUILD)/$(HELPER) | $(BUILD)
+	@mkdir -p $(PROTODIR)
+	@echo "  compile  Tests/pvhelperprotocol.m"
+	@$(CC) $(CFLAGS) -ISources -c Tests/pvhelperprotocol.m -o $(PROTODIR)/pvhelperprotocol.o
+	@$(CC) $(LDFLAGS) $(SUITEOBJ) $(PROTODIR)/pvhelperprotocol.o -o $(PROTODIR)/pvhelperprotocol
+	@echo "  compile  Tests/pvbadhelper.m (installed as $(HELPER))"
+	@$(CC) $(CFLAGS) -ISources $(HELPER_LDFLAGS) Tests/pvbadhelper.m \
+	   -o $(PROTODIR)/$(HELPER)
+	@cp $(BUILD)/$(HELPER) $(PROTODIR)/RealRenderHelper
+
+$(BUILD)/pvstatecontend: Tests/pvstatecontend.m $(OBJECTS) | $(BUILD)
+	@echo "  compile  Tests/pvstatecontend.m"
+	@$(CC) $(CFLAGS) -ISources -c Tests/pvstatecontend.m -o $(BUILD)/pvstatecontend.o
+	@$(CC) $(LDFLAGS) $(SUITEOBJ) $(BUILD)/pvstatecontend.o -o $(BUILD)/pvstatecontend
 
 # Headless checks for the logic that has no visible surface. Self contained: it
 # generates its own fixtures.

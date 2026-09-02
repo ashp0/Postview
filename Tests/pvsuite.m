@@ -336,6 +336,7 @@ typedef struct {
     double   helperMB;          // every helper, summed
     double   batteryCharge;     // mAh remaining, or -1 where there is no battery
     double   batteryWatts;      // instantaneous draw, or -1
+    int      batteryExternal;   // 1 on mains, 0 on the cell, -1 where unknown
     double   renderSeconds;     // Postview's own view of the same interval
     double   renderMegapixels;
     double   fullRenders, previewRenders;
@@ -558,7 +559,7 @@ static void SampleResources(PVResources *r)
     r->childCPU    = ChildCPUSeconds(&r->childIdleWakeups);
     r->footprintMB = FootprintMB();
     r->helperMB    = HelperResidentMB();
-    ReadBattery(&r->batteryCharge, &r->batteryWatts, NULL);
+    ReadBattery(&r->batteryCharge, &r->batteryWatts, &r->batteryExternal);
 
     // Postview's own account of the same interval, so a cost in CPU can be
     // divided by the work that was actually asked for rather than by wall time.
@@ -1904,6 +1905,106 @@ static void TestArbitrary(NSString *path)
 // can carry. The cap used to be applied per axis, replacing whichever dimension
 // was out of range with the corresponding US Letter one, which for a page that
 // is oversized on ONE axis substitutes an aspect ratio the document does not
+// The aspect ratio a page can actually reach, measured rather than assumed.
+//
+// PVClampPixelSize caps the pixel PRODUCT and then floors each axis back up to
+// 1 independently, so a request whose ratio drives one axis below a single
+// pixel re-inflates the product past the ceiling. Measured directly: a
+// 1 x 1e9 request clamps to 1 x 129,526,892 -- 7.7x PVMaxRenderPixels(), and a
+// ~7.9 GB mapping if -createImageForPage: were ever handed it.
+//
+// Nothing can ask for that, and this is the test of WHY rather than a restating
+// of it. The protection is not in PVClampPixelSize at all; it is two properties
+// of PVUsablePageSize -- both axes held inside PV_MAX_PAGE_POINTS, and any axis
+// at or below 1 pt replaced outright -- which together bound the ratio a page
+// can present. -pixelSizeForPage: then scales that rect by a UNIFORM factor, so
+// a request's ratio is a page's ratio.
+//
+// Asserting `20000.0 < PVMaxRenderPixels()` would pin nothing: PV_MAX_PAGE_POINTS
+// is #defined inside PVPDFSource.m, so a literal here goes on being true no
+// matter what that constant becomes. So the ratio is read back through the real
+// API, from a document built to be as thin as a PDF can ask for. Raise the cap,
+// remove the 1 pt floor, or add a path that derives width and height
+// independently, and these fail.
+static NSString *PVWriteSliverFixture(void)
+{
+    // Deliberately past every guard, in both directions: a hair under the 1 pt
+    // floor, a hair over it, and one absurdly large and thin.
+    const char *boxes[3] = { "[0 0 25000 0.5]", "[0 0 25000 1.5]", "[0 0 1000000 2]" };
+    NSMutableString *pdf = [NSMutableString string];
+    NSUInteger offsets[6];
+    int i;
+
+    [pdf appendString:@"%PDF-1.4\n"];
+    offsets[1] = [pdf length];
+    [pdf appendString:@"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"];
+    offsets[2] = [pdf length];
+    [pdf appendString:@"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>\nendobj\n"];
+    for (i = 0; i < 3; i++) {
+        offsets[3 + i] = [pdf length];
+        [pdf appendFormat:@"%d 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox %s >>\nendobj\n",
+                          3 + i, boxes[i]];
+    }
+    NSUInteger xref = [pdf length];
+    [pdf appendString:@"xref\n0 6\n0000000000 65535 f \n"];
+    for (i = 1; i <= 5; i++)
+        [pdf appendFormat:@"%010lu 00000 n \n", (unsigned long)offsets[i]];
+    [pdf appendFormat:@"trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n%lu\n%%%%EOF\n",
+                      (unsigned long)xref];
+
+    NSString *path = @"/tmp/postview-selftest-sliver.pdf";
+    if (![pdf writeToFile:path atomically:YES encoding:NSASCIIStringEncoding error:NULL])
+        return nil;
+    return path;
+}
+
+static void TestSliverPageRatioBound(void)
+{
+    printf("\n[the aspect ratio a page can reach, and the clamp that depends on it]\n");
+    NSString *path = PVWriteSliverFixture();
+    OK(path != nil, "sliver fixture written");
+    if (!path) return;
+
+    NSError *err = nil;
+    PVPDFSource *src = [[PVPDFSource alloc] initWithURL:[NSURL fileURLWithPath:path]
+                                                  error:&err];
+    OK(src != nil, "a document of sliver pages still opens");
+    if (!src) return;
+
+    double ceiling = PVMaxRenderPixels();
+    double worst = 0;
+    NSUInteger i, n = [src pageCount];
+    for (i = 0; i < n; i++) {
+        CGSize s = [src pointSizeOfPage:i];
+        if (!(s.width > 0) || !(s.height > 0)) continue;
+        double lo = (double)(s.width < s.height ? s.width : s.height);
+        double hi = (double)(s.width > s.height ? s.width : s.height);
+        double ratio = hi / lo;
+        if (ratio > worst) worst = ratio;
+
+        // The clamp itself, at a magnification far past anything the zoom
+        // offers, for this page's real shape. This is the property that keeps
+        // -createImageForPage: from sizing an allocation it cannot afford.
+        CGSize px = PVClampPixelSize(CGSizeMake((CGFloat)((double)s.width * 4096.0),
+                                                (CGFloat)((double)s.height * 4096.0)));
+        char msg[200];
+        snprintf(msg, sizeof msg,
+                 "page %lu (%.0f x %.0f pt) stays under the pixel ceiling when "
+                 "magnified 4096x (%.0f px)", (unsigned long)i,
+                 (double)s.width, (double)s.height,
+                 (double)px.width * (double)px.height);
+        OK((double)px.width * (double)px.height <= ceiling + 1.0, msg);
+    }
+
+    char msg[200];
+    snprintf(msg, sizeof msg,
+             "the thinnest page this document can present is %.0f:1, and the "
+             "clamp needs worse than %.0f:1 to break", worst, ceiling);
+    OK(worst > 1.0 && worst < ceiling, msg);
+
+    [src release];
+}
+
 // have. The page is then drawn correctly proportioned inside a frame of the
 // wrong shape, so it appears as a thin strip in a mostly blank page with
 // nothing anywhere reporting a problem.
@@ -3385,6 +3486,7 @@ static int RunUnit(int argc, const char *argv[])
         TestStateStore();
         TestStateStoreCorruptFile();
         TestOversizedPageGeometry();
+        TestSliverPageRatioBound();
         TestRunningLocation();
         TestSleepSavesReadingPosition();
         TestRenderSuppressionPolicy();
@@ -7242,10 +7344,45 @@ static int RunPower(int argc, const char *argv[])
                "TASK_POWER_INFO reports wakeups (the energy term CPU time cannot see)");
 
             if (a.batteryCharge >= 0) {
-                printf("  battery       : %.0f mAh, drawing %.2f W right now\n",
-                       a.batteryCharge, a.batteryWatts);
-                OK(a.batteryWatts > 0.1 && a.batteryWatts < 200.0,
-                   "the battery reports a plausible instantaneous draw");
+                printf("  battery       : %.0f mAh, drawing %.2f W right now%s\n",
+                       a.batteryCharge, a.batteryWatts,
+                       a.batteryExternal == 1 ? " (on mains)" :
+                       a.batteryExternal == 0 ? " (on the cell)" : "");
+                // A cell that EXISTS is not a cell that is moving current, and
+                // this assertion conflated the two.
+                //
+                // AppleSmartBattery reports InstantAmperage 0 for a charged
+                // machine sitting on mains: nothing is going into the cell and
+                // nothing is coming out of it, so ReadBattery's mV x |mA| is a
+                // true 0.00 W. Requiring a draw above 0.1 W therefore failed on
+                // every run on such a machine -- which is the ordinary state of
+                // a plugged-in developer laptop, and of this one. Measured
+                // before changing anything: six consecutive runs on a quiet
+                // machine, 22 assertions passing and this one failing every
+                // time, at 100 mAh and 0.00 W. It is not flaky; it is wrong.
+                //
+                // That matters more than one red line, because `power` is a
+                // verify-all stage: a gate that cannot pass on mains is a gate
+                // whose failures stop being read.
+                //
+                // So the instrument is checked where there is something for it
+                // to measure and reported where there is not, which is exactly
+                // the distinction the desktop branch below already draws. The
+                // check is NOT loosened: a machine running on the cell while
+                // claiming to draw nothing is still a broken instrument, and
+                // still fails here.
+                if (a.batteryWatts > 0.1) {
+                    OK(a.batteryWatts < 200.0,
+                       "the battery reports a plausible instantaneous draw");
+                } else if (a.batteryExternal == 1) {
+                    printf("                  charged and on mains: no current in or out of\n"
+                           "                  the cell, so 0.00 W is the true reading and there\n"
+                           "                  is no draw for this run to check. CPU seconds and\n"
+                           "                  wakeups carry the measurement instead.\n");
+                } else {
+                    OK(0, "the battery reports a plausible instantaneous draw "
+                          "(on the cell, yet reporting no draw at all)");
+                }
             } else {
                 printf("  battery       : no cell to read (a desktop). Watts are\n"
                        "                  unavailable here; CPU seconds and wakeups\n"

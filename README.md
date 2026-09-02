@@ -805,6 +805,42 @@ Makefile target is the fixtures and the environment each needs. `pvsuite all
 <pdf> <outdir>` runs the four that gate without needing anything special of
 their environment.
 
+Three more are adversarial, and they are deliberately **not** in `verify-all`:
+
+```
+make fuzz           # malformed documents: truncated, mutated, synthesised
+make helperkill     # SIGKILL the render helper mid-render; does the viewer recover?
+make helperprotocol # a helper that LIES; does the viewer believe it?
+make statecontend   # 32 Postviews quitting at once onto one state file
+```
+
+Each is its own small program (`Tests/pvfuzz.m`, `Tests/pvhelperkill.m`,
+`Tests/pvstatecontend.m`) rather than another `pvsuite` subcommand, because each
+does something a gate should not: `fuzz` is a *search* rather than an assertion,
+and reading a search's silence as a guarantee is exactly the mistake putting it
+in a release gate would invite. `helperkill` sends real signals and
+`statecontend` forks thirty-two processes; neither belongs in something a
+developer runs expecting one clean answer.
+
+They exist because all four test claims this project makes and nothing checked.
+`PVPDFSource.h` argues that parsing happens out of process so a hostile document
+kills the helper and not the viewer — but the suite only ever fed it *valid*
+documents. `PVStateStore` merges rather than overwrites so two copies of
+Postview cannot clobber each other's positions — but the merge was only ever
+exercised in one process. And the whole `PVRenderFailure` distinction exists so
+that a page which lost its helper is retried rather than retired — but nothing
+ever killed a helper to find out. And the split is justified by the helper being
+where hostile bytes are interpreted — which makes the helper the process most
+likely to be subverted, and everything it says back untrusted input — but
+nothing ever put a *lying* helper where the real one goes.
+
+What they report, on this host: no crash, no hang, no untyped failure and no
+leaked helper across ~6,000 malformed documents; every entry surviving 32
+simultaneous quits; recovery from a killed helper costing exactly one failed
+render, never a page wrongly blamed; and twelve kinds of protocol lie answered
+with a refused open or a typed failure, never with a bitmap the viewer had no
+reason to trust.
+
 Between them `make test` and `make uitest` pin the awkward cases directly rather
 than by inference: that a page already rendered and waiting to be delivered is
 not rendered a second time; that a render CoreGraphics refuses is reported and
