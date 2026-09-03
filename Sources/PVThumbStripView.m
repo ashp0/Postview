@@ -100,7 +100,23 @@
     if (index >= _pageCount) return;
     NSRect r = [self rectForPage:index];
     r.size.height += PV_THUMB_LABEL_H;
-    [self setNeedsDisplayInRect:NSInsetRect(r, -6, -6)];
+
+    // The FULL WIDTH of the view, not the width of the thumbnail.
+    //
+    // -drawRect: paints the selection over NSUnionRect(box, lbl), and `lbl`
+    // spans the whole view -- so the highlight reaches both edges while
+    // -rectForPage: describes only the image box in the middle. Invalidating
+    // the box left the two margins of the old highlight on screen: scrolling
+    // the sidebar smeared a column of blue fragments down each side, one per
+    // page that had been current on the way past, and they stayed until
+    // something else happened to dirty that strip.
+    //
+    // Derived from the drawing rather than guessed at: this rect and the one
+    // NSRectFill covers must be the same shape, and the only way to keep them
+    // that way is for both to start from the same place.
+    r.origin.x   = NSMinX([self bounds]);
+    r.size.width = NSWidth([self bounds]);
+    [self setNeedsDisplayInRect:NSInsetRect(r, 0, -6)];
 }
 
 - (void)drawRect:(NSRect)dirtyRect

@@ -2710,6 +2710,26 @@ static double PVTransientBackoff(unsigned attempts)
 // 10.10 and the deployment target is 10.9; the cell has carried it since 10.0
 // and is what the newer method forwards to, so this is the same setting under
 // its older name.
+// Ask the control how wide it needs to be, once its segments are populated.
+//
+// A frame computed as segments x width is the CONTENT width and leaves the
+// bezel out, so the trailing edge of the last segment was drawn outside the
+// frame and clipped -- visible as a flattened right-hand side on both controls.
+// Only the control knows how much bezel there is, and it only knows once it has
+// the images it has to draw, which is why this runs after they are set and not
+// in the constructor.
+static void PVSizeTitleBarControl(NSSegmentedControl *c)
+{
+    [c sizeToFit];
+    NSRect f = [c frame];
+    // A floor under the height, not a value for it: sizeToFit is authoritative
+    // about the bezel, and the title bar is 22 points, so anything it asks for
+    // is accepted and only a degenerate answer is corrected.
+    if (!(f.size.height >= 8.0)) f.size.height = PV_TITLEBAR_ITEM_H;
+    f.origin = NSZeroPoint;
+    [c setFrame:f];
+}
+
 - (NSSegmentedControl *)newTitleBarSegmentsWithCount:(NSInteger)count
 {
     NSSegmentedControl *c = [[NSSegmentedControl alloc] initWithFrame:
@@ -2733,6 +2753,7 @@ static double PVTransientBackoff(unsigned attempts)
     [b setTarget:self];
     [b setAction:@selector(toggleSidebar:)];
     [b setToolTip:@"Show or hide page thumbnails"];
+    PVSizeTitleBarControl(b);
     return b;
 }
 
@@ -2751,6 +2772,7 @@ static double PVTransientBackoff(unsigned attempts)
     [seg setTarget:self];
     [seg setAction:@selector(zoomSegmentChanged:)];
     [seg setToolTip:@"Zoom out or in"];
+    PVSizeTitleBarControl(seg);
     return seg;
 }
 
@@ -2810,6 +2832,34 @@ static double PVTransientBackoff(unsigned attempts)
     // relative to either when the window is resized, so neither should these.
     [_titleBarSidebar setAutoresizingMask:(NSViewMaxXMargin | NSViewMinYMargin)];
     [_titleBarZoom    setAutoresizingMask:(NSViewMaxXMargin | NSViewMinYMargin)];
+}
+
+// Full screen has no title bar, so there is nowhere for these to be.
+//
+// Left visible they do not merely look wrong, they SMEAR. With the title bar
+// gone the controls sit directly over the document, and the clip view under
+// them copies on scroll -- so every scroll blits their pixels along with the
+// page and leaves another copy behind. The screenshot that found this had
+// fifteen of them down the left edge of the window.
+//
+// Hidden rather than removed, so that coming back out of full screen is one
+// message and not a re-install: the views stay where they are in the chrome
+// and keep their target, and nothing has to be rebuilt.
+- (void)windowWillEnterFullScreen:(NSNotification *)note
+{
+    (void)note;
+    [_titleBarSidebar setHidden:YES];
+    [_titleBarZoom    setHidden:YES];
+}
+
+- (void)windowDidExitFullScreen:(NSNotification *)note
+{
+    (void)note;
+    [_titleBarSidebar setHidden:NO];
+    [_titleBarZoom    setHidden:NO];
+    // The frame changed twice on the way out and the title bar's height is
+    // measured from it, so the position is recomputed rather than trusted.
+    [self layoutTitleBarControls];
 }
 
 // Taken off the window at teardown, for the reason -teardownReferences gives
