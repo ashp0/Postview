@@ -116,6 +116,32 @@ static void Pump(double seconds)
     [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:seconds]];
 }
 
+// Is an animated scroll running in this page view?
+//
+// Through the accessor rather than through -valueForKey: on the timer, because
+// the question the tests ask is "is one running", and a timer ivar that has
+// been invalidated but not yet cleared would answer that wrongly.
+static BOOL ic_isAnimating(PVPageView *v) { return [v isScrollAnimating]; }
+
+// A mouse event at a point in WINDOW coordinates, for driving the pan.
+//
+// The window is real and on screen in this suite, so -mouseDown: and friends
+// can be sent directly: what they read out of the event is its location in the
+// window, which they convert themselves.
+static NSEvent *ic_mouseEvent(NSEventType type, NSPoint windowPoint,
+                              PVWindowController *wc)
+{
+    return [NSEvent mouseEventWithType:type
+                              location:windowPoint
+                         modifierFlags:0
+                             timestamp:0
+                          windowNumber:[[wc window] windowNumber]
+                               context:nil
+                           eventNumber:0
+                            clickCount:1
+                              pressure:1.0];
+}
+
 // Pump until the condition holds, or the deadline passes. Rendering runs at
 // background QoS by design, so a fixed sleep has to be sized for the slowest
 // plausible machine and then costs that long on every machine. Waiting on the
@@ -1195,6 +1221,96 @@ static void TestLayout(PVPDFSource *src)
     OK(NSEqualRects([v rectForRowContainingPage:3], [v rectForPage:3]),
        "a row is the page itself when there is one column");
 
+    // ---- the cover layout ------------------------------------------------
+    //
+    // The same spread with the pairing shifted by one page: page one alone,
+    // then 2-3, 4-5. Every property asserted of the spread above is asserted
+    // again here rather than assumed to survive the shift, because the shift
+    // is exactly what breaks arithmetic that assumed every row was full --
+    // and the row table, the binary search and the saved reading position all
+    // ran on that assumption until this layout existed.
+    [v setColumns:2];
+    [v setCover:YES];
+    [v setZoom:1.0 backingScale:1.0 containerWidth:900];
+    OK([v cover] && [v laidOutCover],
+       "the cover flag is what it was set to, and the layout published it");
+
+    OK(NSEqualRects([v rectForRowContainingPage:0], [v rectForPage:0]),
+       "the cover page has its row to itself");
+    OK([v firstPageOfRowContainingPage:0] == 0,
+       "the cover page is the first page of its own row");
+    // The whole feature in one assertion: page one is not beside page two. A
+    // spread that had merely been relabelled would pass everything else here.
+    OK(fabs(NSMinY([v rectForPage:0]) - NSMinY([v rectForPage:1])) > 0.001,
+       "the cover page does not share a row with page two");
+    // A title page is a right-hand page. Half a gutter right of the centre
+    // line, which is where the recto of an evenly matched pair sits.
+    OK(fabs(NSMinX([v rectForPage:0]) -
+            floor(NSWidth([v frame]) / 2.0 + PV_PAGE_GAP / 2.0 + 0.5)) < 0.001,
+       "the cover page sits in the right-hand half, where a recto belongs");
+    OK(NSMaxX([v rectForPage:0]) <= NSWidth([v frame]) + 0.001,
+       "and the document is wide enough for it there");
+
+    BOOL coverPairs = YES, coverRowStart = YES, coverRowsApart = YES;
+    for (NSUInteger i = 1; i + 1 < n; i += 2) {
+        NSRect a = [v rectForPage:i], b = [v rectForPage:i + 1];
+        if (fabs(NSMinY(a) - NSMinY(b)) > 0.001) coverPairs = NO;
+        if (fabs(NSMinX(b) - (NSMaxX(a) + PV_PAGE_GAP)) > 0.001) coverPairs = NO;
+        if ([v firstPageOfRowContainingPage:i]     != i) coverRowStart = NO;
+        if ([v firstPageOfRowContainingPage:i + 1] != i) coverRowStart = NO;
+        if (i + 2 < n && NSMinY([v rectForPage:i + 2]) < NSMaxY(a)) coverRowsApart = NO;
+    }
+    OK(coverPairs,     "pages after the cover pair up 2-3, 4-5 and share a top edge");
+    OK(coverRowStart,  "both pages of a cover-layout pair name the same row");
+    OK(coverRowsApart, "rows never overlap the row above them in the cover layout");
+
+    // The search again, exhaustively, and this is where an off-by-one in the
+    // pairing shows up as a range that names a page which is not on screen:
+    // `first row + columns - 1` is a page in the NEXT row once row zero is
+    // short, so the wanted set would ask the render queue for it at every
+    // scroll position that shows the cover.
+    BOOL coverSearch = YES;
+    for (NSUInteger i = 0; i < n; i++) {
+        NSRect r = [v rectForRowContainingPage:i];
+        NSRange got = [v pageRangeInRect:NSMakeRect(0, NSMinY(r) + 1, 900, 10)];
+        NSUInteger first = [v firstPageOfRowContainingPage:i];
+        NSUInteger want  = (first == 0) ? 1 : ((first + 1 < n) ? 2 : 1);
+        if (got.location != first || got.length != want) coverSearch = NO;
+    }
+    OK(coverSearch, "a thin rect inside a cover-layout row resolves to exactly that row");
+
+    NSRange coverAll = [v pageRangeInRect:[v frame]];
+    OK(coverAll.location == 0 && coverAll.length == n,
+       "whole-document rect still covers every page in the cover layout");
+    NSRange coverPast = [v pageRangeInRect:NSMakeRect(0, NSHeight([v frame]) + 500, 900, 50)];
+    OK(coverPast.location < n && coverPast.location + coverPast.length <= n,
+       "rect past the end of the cover layout stays in range");
+
+    BOOL coverRoundTrip = YES;
+    for (NSUInteger i = 0; i < n; i += 7) {
+        CGFloat frac = 0.37;
+        NSRect r = [v rectForRowContainingPage:i];
+        CGFloat y = NSMinY(r) + frac * NSHeight(r);
+        CGFloat outFrac = 0;
+        NSUInteger back = [v pageAtTopOfRect:NSMakeRect(0, y, 900, 600) fraction:&outFrac];
+        if (back != [v firstPageOfRowContainingPage:i]) coverRoundTrip = NO;
+        if (fabs(outFrac - frac) > 0.02) coverRoundTrip = NO;
+    }
+    OK(coverRoundTrip, "page+fraction survives a round trip through the cover layout");
+
+    // The cover is a property of the SPREAD. Asked for in a single column it
+    // is not an error and not a third layout -- it is nothing at all, and the
+    // geometry has to be the single column's exactly.
+    [v setColumns:1];
+    [v setZoom:1.0 backingScale:1.0 containerWidth:900];
+    OK(NSHeight([v frame]) == singleHeight &&
+       NSEqualRects([v rectForPage:0], singlePage0),
+       "a cover asked for in one column changes nothing about the layout");
+
+    [v setCover:NO];
+    [v setColumns:1];
+    [v setZoom:1.0 backingScale:1.0 containerWidth:900];
+
     // ---- the count asked for, against the count laid out ----------------
     //
     // -setColumns: records an intent; the row table is not rebuilt until the
@@ -1693,7 +1809,7 @@ static void TestStateStoreCorruptFile(void)
     NSUInteger columns = 99;
     BOOL found = [s stateForURL:junk page:&page fraction:&frac zoomMode:&mode
                            zoom:&zoom sidebar:&sidebar columns:&columns
-                    windowFrame:&frame];
+                          cover:NULL windowFrame:&frame];
     OK(found, "the wrong-typed entry is still found, not discarded wholesale");
     OK(page == 0,                      "a non-numeric page reads back as 0");
     OK(frac >= 0 && frac <= 1,         "a non-numeric fraction is clamped into range");
@@ -1703,17 +1819,53 @@ static void TestStateStoreCorruptFile(void)
     OK(frame == nil,                   "a non-string window frame reads back as nil");
     OK(columns == 1,                   "a non-numeric column count falls back to one page across");
 
+    // The count and the cover flag are read out of the same entry and have to
+    // agree with each other, and a hand-edited file is the one place they can
+    // be made to disagree. `columns: 99` is reported as one column -- the same
+    // clamp the line above asserts -- so the cover must be reported as absent,
+    // because a single column with a cover is a shape no menu item produces
+    // and no check mark describes.
+    //
+    // The reader used to test the RAW 99 against "is this a spread" and hand
+    // back both: one column, with a cover. The controller re-clamps and would
+    // have caught it, but a reader that has to be corrected by its caller has
+    // not normalised anything, and the next caller might not know to.
+    {
+        NSString *hostilePath =
+            [NSTemporaryDirectory() stringByAppendingPathComponent:
+                 @"postview-cover-clamp.plist"];
+        NSURL *doc = [NSURL fileURLWithPath:@"/tmp/postview-cover-clamp.pdf"];
+        NSDictionary *file = [NSDictionary dictionaryWithObject:
+            [NSDictionary dictionaryWithObjectsAndKeys:
+                [NSNumber numberWithInt:99],  @"columns",
+                [NSNumber numberWithBool:YES], @"cover",
+                [NSNumber numberWithInt:4],   @"page",
+                nil]
+            forKey:[doc path]];
+        OK([file writeToFile:hostilePath atomically:YES],
+           "a file claiming 99 columns with a cover is written");
+        PVStateStore *clamped = [[PVStateStore alloc] initWithPath:hostilePath];
+        NSUInteger cols = 99; BOOL cov = YES;
+        OK([clamped stateForURL:doc page:NULL fraction:NULL zoomMode:NULL zoom:NULL
+                        sidebar:NULL columns:&cols cover:&cov windowFrame:NULL],
+           "and it reads back");
+        OK(cols == 1, "an absurd column count is reported as one page across");
+        OK(!cov, "and the cover it claimed goes with it, rather than being kept alone");
+        [clamped release];
+        [[NSFileManager defaultManager] removeItemAtPath:hostilePath error:NULL];
+    }
+
     // A value that is not a dictionary must not be reachable at all: -prune
     // reaches into every value it holds and would have gone down with it.
     OK(![s stateForURL:[NSURL fileURLWithPath:@"/tmp/postview-corrupt-c.pdf"]
                   page:NULL fraction:NULL zoomMode:NULL zoom:NULL sidebar:NULL
-               columns:NULL windowFrame:NULL],
+               columns:NULL cover:NULL windowFrame:NULL],
        "an entry that is not a dictionary is dropped on load");
 
     // The good entry must be untouched by any of that.
     page = 0; frac = 0; zoom = 0; mode = PVZoomModeCustom; sidebar = NO; frame = nil;
     OK([s stateForURL:good page:&page fraction:&frac zoomMode:&mode
-                 zoom:&zoom sidebar:&sidebar columns:NULL windowFrame:&frame],
+                 zoom:&zoom sidebar:&sidebar columns:NULL cover:NULL windowFrame:&frame],
        "the sound entry survives");
     OK(page == 11 && fabs(zoom - 1.25) < 0.0001 && mode == PVZoomModeFitPage &&
        sidebar == YES && [frame length] > 0, "the sound entry round-trips unchanged");
@@ -1721,7 +1873,8 @@ static void TestStateStoreCorruptFile(void)
     // Writing after loading a hostile file must not carry the junk back out,
     // and -prune must be able to walk what is left.
     [s recordForURL:good page:3 fraction:0.1 zoomMode:PVZoomModeActual
-               zoom:1.0 sidebar:NO columns:1 windowFrame:@"0 0 10 10 0 0 100 100"];
+               zoom:1.0 sidebar:NO columns:1 cover:NO
+        windowFrame:@"0 0 10 10 0 0 100 100"];
     [s flush];
     OK(YES, "flush after loading a hostile file completes");
     [s release];
@@ -1732,7 +1885,7 @@ static void TestStateStoreCorruptFile(void)
     PVStateStore *s2 = [[PVStateStore alloc] initWithPath:path];
     OK(s2 != nil, "a store loads from a file that is not a plist at all");
     OK(![s2 stateForURL:good page:NULL fraction:NULL zoomMode:NULL
-                   zoom:NULL sidebar:NULL columns:NULL windowFrame:NULL],
+                   zoom:NULL sidebar:NULL columns:NULL cover:NULL windowFrame:NULL],
        "an unreadable file yields an empty store rather than a crash");
     [s2 release];
     [[NSFileManager defaultManager] removeItemAtPath:path error:NULL];
@@ -1744,7 +1897,7 @@ static void TestStateStore(void)
     NSURL *url = [NSURL fileURLWithPath:@"/tmp/postview-selftest-doc.pdf"];
     PVStateStore *s = [PVStateStore sharedStore];
     [s recordForURL:url page:42 fraction:0.25 zoomMode:PVZoomModeFitPage
-               zoom:1.75 sidebar:YES columns:2
+               zoom:1.75 sidebar:YES columns:2 cover:NO
         windowFrame:@"100 100 800 600 0 0 1440 900"];
     [s flush];
 
@@ -1753,7 +1906,7 @@ static void TestStateStore(void)
     NSUInteger columns = 0;
     BOOL found = [s stateForURL:url page:&page fraction:&frac zoomMode:&mode
                            zoom:&zoom sidebar:&sidebar columns:&columns
-                    windowFrame:&frame];
+                          cover:NULL windowFrame:&frame];
     OK(found, "state was recorded");
     OK(page == 42, "page number round-trips");
     OK(fabs(frac - 0.25) < 0.0001, "scroll fraction round-trips");
@@ -1776,8 +1929,39 @@ static void TestStateStore(void)
     NSUInteger p2 = 7;
     BOOL missing = [s stateForURL:[NSURL fileURLWithPath:@"/tmp/never-opened-xyz.pdf"]
                              page:&p2 fraction:NULL zoomMode:NULL zoom:NULL
-                          sidebar:NULL columns:NULL windowFrame:NULL];
+                          sidebar:NULL columns:NULL cover:NULL windowFrame:NULL];
     OK(!missing, "unknown document reports no saved state");
+
+    // The cover layout, and the two ways it must not come back.
+    //
+    // A document last read as a book reopens as one -- that is the whole point
+    // of storing it. But the flag is only meaningful beside a spread, and a
+    // store that handed back a cover in a single column would put the window
+    // in a shape no menu item can produce and no check mark describes, which
+    // the reader can then neither see nor turn off.
+    BOOL cover = NO;
+    [s recordForURL:url page:8 fraction:0.5 zoomMode:PVZoomModeFitWidth
+               zoom:1.0 sidebar:NO columns:2 cover:YES windowFrame:nil];
+    OK([s stateForURL:url page:NULL fraction:NULL zoomMode:NULL zoom:NULL
+              sidebar:NULL columns:NULL cover:&cover windowFrame:NULL] && cover,
+       "the cover layout round-trips");
+
+    cover = YES;
+    [s recordForURL:url page:8 fraction:0.5 zoomMode:PVZoomModeFitWidth
+               zoom:1.0 sidebar:NO columns:1 cover:YES windowFrame:nil];
+    OK([s stateForURL:url page:NULL fraction:NULL zoomMode:NULL zoom:NULL
+              sidebar:NULL columns:NULL cover:&cover windowFrame:NULL] && !cover,
+       "a cover recorded against one column is not handed back");
+
+    // A file written before the layout existed has no key at all, and NO is
+    // what every one of those documents was actually last seen in -- the same
+    // argument the column count's default of 1 rests on.
+    cover = YES;
+    [s recordForURL:url page:8 fraction:0.5 zoomMode:PVZoomModeFitWidth
+               zoom:1.0 sidebar:NO columns:2 cover:NO windowFrame:nil];
+    OK([s stateForURL:url page:NULL fraction:NULL zoomMode:NULL zoom:NULL
+              sidebar:NULL columns:NULL cover:&cover windowFrame:NULL] && !cover,
+       "and a document recorded without one reads back without one");
 }
 
 // Locates the black square and reports which quadrant of the rendered image it
@@ -2877,6 +3061,187 @@ static void TestArrowScrollStep(void)
     OK(ordered, "an arrow press is smaller than a Page Down at every window size");
 }
 
+// The pairing rule, as arithmetic, over every shape a document can have.
+//
+// This is the rule three call sites used to state for themselves, and the one
+// the cover layout moves. The properties below are what the row table, the
+// binary search over it and every saved reading position are built on, so they
+// are asserted exhaustively rather than sampled: the failures they catch are
+// off-by-ones, and an off-by-one is invisible on the page you happen to check.
+static void TestRowPairing(void)
+{
+    printf("\nRow pairing (single, spread, cover)\n");
+
+    OK(PVPagesInFirstRow(1, NO)  == 1 && PVPagesInFirstRow(1, YES) == 1,
+       "a single column has no cover to be the exception to");
+    OK(PVPagesInFirstRow(2, NO)  == 2, "an ordinary spread starts with a full row");
+    OK(PVPagesInFirstRow(2, YES) == 1, "the cover layout starts with one page");
+    OK(PVPagesInFirstRow(0, NO)  == 1, "a zero column count is normalised to one");
+    OK(PVRowCountForPages(0, 2, YES) == 0, "no pages is no rows");
+
+    // The counts, stated for the shapes a reader would check by hand.
+    OK(PVRowCountForPages(1,  2, YES) == 1, "one page in the cover layout is one row");
+    OK(PVRowCountForPages(2,  2, YES) == 2, "two pages are the cover and a row of one");
+    OK(PVRowCountForPages(3,  2, YES) == 2, "three pages are the cover and a full pair");
+    OK(PVRowCountForPages(4,  2, YES) == 3, "four pages need a third row");
+    OK(PVRowCountForPages(4,  2, NO)  == 2, "...where an ordinary spread needs two");
+    OK(PVFirstPageOfRow(0, 2, YES) == 0 && PVFirstPageOfRow(1, 2, YES) == 1 &&
+       PVFirstPageOfRow(2, 2, YES) == 3 && PVFirstPageOfRow(3, 2, YES) == 5,
+       "the cover layout pairs 2-3, 4-5, 6-7 after the page that stands alone");
+
+    // Exhaustive, over both spreads and every document length up to a hundred
+    // pages. Three properties, and between them they are the whole contract:
+    //
+    //   inverse    -- the row a page is in begins at a page in that row, and
+    //                 the page that begins a row is in it. A pairing that
+    //                 fails this puts the reader on a page they did not ask
+    //                 for on every restore.
+    //   partition  -- every page is in exactly one row, and the rows in order
+    //                 name the pages in order with none skipped and none
+    //                 counted twice. This is what the drawing loop walks.
+    //   monotonic  -- rows begin at strictly increasing pages. The visible-row
+    //                 search is a binary search, and a binary search over a
+    //                 predicate that is not monotonic can step past the row it
+    //                 is standing in.
+    int c;
+    BOOL inverse = YES, partition = YES, monotonic = YES, counts = YES;
+    for (c = 0; c < 2; c++) {
+        BOOL cover = c ? YES : NO;
+        NSUInteger pages;
+        for (pages = 1; pages <= 100; pages++) {
+            NSUInteger rows = PVRowCountForPages(pages, 2, cover), r, p, seen = 0;
+            NSUInteger previousStart = 0;
+            for (r = 0; r < rows; r++) {
+                NSUInteger start = PVFirstPageOfRow(r, 2, cover);
+                NSUInteger held  = PVPagesInRow(r, pages, 2, cover);
+                if (held < 1 || held > 2) counts = NO;
+                if (start + held > pages)  counts = NO;
+                if (r > 0 && start <= previousStart) monotonic = NO;
+                if (start != seen) partition = NO;   // no gap, no overlap
+                previousStart = start;
+                seen += held;
+                for (p = start; p < start + held; p++) {
+                    if (PVRowContainingPage(p, 2, cover) != r) inverse = NO;
+                    if (PVFirstPageOfRowContainingPage(p, 2, cover) != start) inverse = NO;
+                }
+            }
+            if (seen != pages) partition = NO;       // every page, exactly once
+            // A row past the end holds nothing, which is what makes the
+            // drawing loops safe against a stale row count.
+            if (PVPagesInRow(rows, pages, 2, cover) != 0) counts = NO;
+        }
+    }
+    // Stepping by ROW, which is what Next and Previous do and what their menu
+    // validation has to agree with. Written as the walk it actually is --
+    // row by row from the first page to the last -- because the arithmetic it
+    // replaced ("this row's first page, plus a row's worth") is right only
+    // while every row is the same size, and the cover layout is where it is
+    // not. It skipped the 2-3 spread turning forward off the cover, and
+    // disabled Next on the cover of a two-page document while the row it
+    // refused to turn to was sitting right there.
+    BOOL stepping = YES;
+    for (c = 0; c < 2; c++) {
+        BOOL cover = c ? YES : NO;
+        NSUInteger pages;
+        for (pages = 1; pages <= 20; pages++) {
+            NSUInteger rows = PVRowCountForPages(pages, 2, cover), r, visited = 0;
+            for (r = 0; r < rows; r++) {
+                // Every page of this row must agree about which row is next,
+                // because the reader may be on either half of a spread.
+                NSUInteger start = PVFirstPageOfRow(r, 2, cover), p;
+                NSUInteger held  = PVPagesInRow(r, pages, 2, cover);
+                for (p = start; p < start + held; p++) {
+                    NSUInteger here = PVRowContainingPage(p, 2, cover);
+                    if (here != r) stepping = NO;
+                    NSUInteger next = PVFirstPageOfRow(here + 1, 2, cover);
+                    BOOL hasNext = (next < pages);
+                    if (hasNext != (r + 1 < rows)) stepping = NO;
+                    if (hasNext && PVRowContainingPage(next, 2, cover) != r + 1)
+                        stepping = NO;
+                    if ((here > 0) !=
+                        (PVFirstPageOfRow(here, 2, cover) > 0)) stepping = NO;
+                }
+                visited++;
+            }
+            if (visited != rows) stepping = NO;
+        }
+    }
+    OK(stepping, "stepping a row forward reaches the next row, and stops at the last");
+    // The case that made this a bug rather than a tidy-up.
+    OK(PVFirstPageOfRow(PVRowContainingPage(0, 2, YES) + 1, 2, YES) == 1,
+       "Next from the cover of a two-page document turns to page two, not past it");
+    OK(PVRowCountForPages(2, 2, YES) == 2,
+       "...because that document has a second row for it to turn to");
+
+    OK(inverse,   "a page's row begins at a page in that row, for every page in 1..100");
+    OK(partition, "the rows partition the document: no page skipped, none twice");
+    OK(monotonic, "rows begin at strictly increasing pages, which the search requires");
+    OK(counts,    "every row holds 1 or 2 pages and none of them runs past the end");
+
+    // The single column is the identity, cover or not: this is what lets every
+    // caller pass the flag through without first checking the column count.
+    BOOL identity = YES;
+    NSUInteger p;
+    for (p = 0; p < 100; p++) {
+        if (PVRowContainingPage(p, 1, YES) != p) identity = NO;
+        if (PVFirstPageOfRowContainingPage(p, 1, YES) != p) identity = NO;
+        if (PVFirstPageOfRowContainingPage(p, 1, NO)  != p) identity = NO;
+    }
+    OK(identity, "one column pairs a page with itself, whatever the cover flag says");
+
+    // A row index nothing could have produced saturates rather than wrapping.
+    // Wrapping would answer with a small page index, which is both in range
+    // and wrong -- the failure that survives every bounds check downstream.
+    OK(PVFirstPageOfRow(NSUIntegerMax, 2, NO) == NSUIntegerMax,
+       "an absurd row index saturates instead of wrapping to a valid page");
+    OK(PVPagesInRow(NSUIntegerMax, 100, 2, NO) == 0,
+       "and holds no pages, so a loop over it does nothing");
+}
+
+// Whether an arrow press is animated, and the curve it follows.
+//
+// The policy is one line and the reason it is tested is section 4.2's: a later
+// change that folded Unknown in with AC would turn 60 Hz of timer on for a
+// machine whose power source could not be read, which is the branch that has
+// to stay conservative.
+static void TestSmoothScrollPolicy(void)
+{
+    printf("\nAnimated arrow scrolling\n");
+
+    OK(PVSmoothScrollForPower(PVPowerAC),      "mains power animates the arrow key");
+    OK(!PVSmoothScrollForPower(PVPowerBattery), "battery jumps, as it always did");
+    OK(!PVSmoothScrollForPower(PVPowerUnknown),
+       "an unreadable power source jumps -- unknown is battery, never AC");
+
+    OK(PVSmoothScrollEase(0.0) == 0.0, "the curve starts where the document is");
+    OK(PVSmoothScrollEase(1.0) == 1.0, "and ends exactly on the destination");
+    OK(PVSmoothScrollEase(2.0) == 1.0, "a late frame lands on it rather than past it");
+    OK(PVSmoothScrollEase(-1.0) == 0.0, "and an early one does not go backwards");
+    OK(PVSmoothScrollEase((double)NAN) == 1.0,
+       "a clock that read back as nonsense ends the animation, not a NaN offset");
+
+    int i; BOOL rising = YES, ahead = YES;
+    double previous = -1.0;
+    for (i = 0; i <= 100; i++) {
+        double t = i / 100.0, e = PVSmoothScrollEase(t);
+        if (e < previous - 1e-12) rising = NO;
+        if (e < t - 1e-12)        ahead  = NO;
+        previous = e;
+    }
+    OK(rising, "the curve never goes backwards, so the document never does either");
+    OK(ahead,  "ease-out: it leaves at speed and arrives gently");
+
+    // The animation has to be shorter than the reader's key repeat, or a held
+    // arrow would be a queue of animations rather than one continuous scroll.
+    // The fastest repeat OS X offers is about 15 ms; the slowest useful one is
+    // about 250 ms. This checks the end that matters -- that one press has
+    // finished well before a reader at an ordinary rate produces the next.
+    OK(PV_SMOOTH_SCROLL_SECONDS < 0.25,
+       "one animated press finishes inside an ordinary key-repeat interval");
+    OK(PV_SMOOTH_SCROLL_SECONDS * PV_SMOOTH_SCROLL_HZ >= 4.0,
+       "and is long enough to be more than a handful of frames");
+}
+
 static void TestScenarioReplay(void)
 {
     printf("\nScenario replay (profiler workloads)\n");
@@ -3501,6 +3866,8 @@ static int RunUnit(int argc, const char *argv[])
         TestInFlightFullCap(src, url);
         TestTwoLaneFullCap(src, url);
         TestArrowScrollStep();
+        TestRowPairing();
+        TestSmoothScrollPolicy();
         TestScenarioReplay();
         if (argc > 2) TestRotation([NSString stringWithUTF8String:argv[2]]);
         if (argc > 3) TestArbitrary([NSString stringWithUTF8String:argv[3]]);
@@ -3779,6 +4146,7 @@ static int RunUI(int argc, const char *argv[])
                                             zoom:1.0
                                          sidebar:NO
                                          columns:1
+                                           cover:NO
                                      windowFrame:nil];
 
         NSError *err = nil;
@@ -5267,6 +5635,361 @@ static int RunUI(int argc, const char *argv[])
             Pump(0.05);
         }
 
+        printf("\n[5g10] the animated arrow press travels exactly as far as the jump\n");
+        {
+            // The animation is allowed to change WHEN the document arrives and
+            // nothing else. If it changed how far a press travels, the same
+            // keystrokes would move a reader a different distance on mains
+            // than on battery -- and the showdown's fairness gate, which is
+            // measured in pages moved per keystroke, would be comparing two
+            // different workloads while reporting one number.
+            PVPageView   *pv   = [wc valueForKey:@"_pageView"];
+            NSScrollView *sv   = [wc valueForKey:@"_scrollView"];
+            NSClipView   *clip = [sv contentView];
+
+            [wc goToPageNumber:8];
+            Pump(0.05);
+
+            NSString *down = [NSString stringWithFormat:@"%C",
+                                  (unichar)NSDownArrowFunctionKey];
+            NSEvent *downEvent =
+                [NSEvent keyEventWithType:NSKeyDown location:NSZeroPoint
+                            modifierFlags:0 timestamp:0
+                             windowNumber:[[wc window] windowNumber] context:nil
+                               characters:down charactersIgnoringModifiers:down
+                                isARepeat:NO keyCode:125];
+
+            CGFloat expected = PVArrowScrollForViewportHeight(
+                                   NSHeight([clip documentVisibleRect]));
+
+            // Battery first: unchanged behaviour, and the baseline the animated
+            // case has to match. The document is where it is going before the
+            // key handler has returned.
+            PVSetPowerSourceOverride(PVPowerBattery, YES);
+            CGFloat before = NSMinY([clip documentVisibleRect]);
+            [pv keyDown:downEvent];
+            OK(!ic_isAnimating(pv), "on battery an arrow press starts no animation");
+            OK(fabs((NSMinY([clip documentVisibleRect]) - before) - expected) < 1.0,
+               "and lands immediately, exactly as it always did");
+
+            // Mains: the same press, arriving over time.
+            PVSetPowerSourceOverride(PVPowerAC, YES);
+            before = NSMinY([clip documentVisibleRect]);
+            [pv keyDown:downEvent];
+            OK(ic_isAnimating(pv), "on mains the same press starts an animation");
+            OK(NSMinY([clip documentVisibleRect]) - before < expected - 1.0,
+               "which has not arrived yet when the key handler returns");
+
+            PumpUntil(^{ return (BOOL)!ic_isAnimating(pv); },
+                      PV_SMOOTH_SCROLL_SECONDS * 20.0);
+            OK(!ic_isAnimating(pv), "the animation ends on its own");
+            OK(fabs((NSMinY([clip documentVisibleRect]) - before) - expected) < 1.0,
+               "and lands on exactly the offset the jump would have reached");
+
+            // Ten presses with no pumping in between: every one of them
+            // arrives inside the previous animation, which is what a held key
+            // does. The travel must still be ten steps, because each press
+            // adds to the DESTINATION rather than to wherever the document has
+            // got to -- adding to the latter loses the unfinished part of
+            // every press and covers a distance that depends on the machine's
+            // frame rate.
+            CGFloat start = NSMinY([clip documentVisibleRect]);
+            int kp;
+            for (kp = 0; kp < 10; kp++) [pv keyDown:downEvent];
+            PumpUntil(^{ return (BOOL)!ic_isAnimating(pv); },
+                      PV_SMOOTH_SCROLL_SECONDS * 40.0);
+            OK(fabs((NSMinY([clip documentVisibleRect]) - start) - 10.0 * expected) < 2.0,
+               "ten presses held down travel ten steps, not some fraction of them");
+
+            // A key that is not the arrow is still a jump on mains. Page Down
+            // is a screenful on purpose and animating it would be a wait.
+            NSString *pgdn = [NSString stringWithFormat:@"%C",
+                                  (unichar)NSPageDownFunctionKey];
+            NSEvent *pgdnEvent =
+                [NSEvent keyEventWithType:NSKeyDown location:NSZeroPoint
+                            modifierFlags:0 timestamp:0
+                             windowNumber:[[wc window] windowNumber] context:nil
+                               characters:pgdn charactersIgnoringModifiers:pgdn
+                                isARepeat:NO keyCode:121];
+            [pv keyDown:pgdnEvent];
+            OK(!ic_isAnimating(pv), "Page Down is a jump on mains as well as on battery");
+
+            // Anything else moving the document overrules an animation in
+            // flight rather than fighting it: the wheel and the trackpad reach
+            // the clip view without passing through this class at all, so the
+            // check has to be against where the view actually is.
+            [pv keyDown:downEvent];
+            OK(ic_isAnimating(pv), "an animation is running again");
+            [clip scrollToPoint:NSMakePoint(0, NSMinY([clip documentVisibleRect]) + 300)];
+            [sv reflectScrolledClipView:clip];
+            CGFloat hijacked = NSMinY([clip documentVisibleRect]);
+            PumpUntil(^{ return (BOOL)!ic_isAnimating(pv); },
+                      PV_SMOOTH_SCROLL_SECONDS * 20.0);
+            OK(!ic_isAnimating(pv), "a scroll from anywhere else ends the animation");
+            OK(NSMinY([clip documentVisibleRect]) >= hijacked - 1.0,
+               "and does not drag the document back to where it was going");
+
+            PVSetPowerSourceOverride(PVPowerBattery, YES);
+            [wc goToPageNumber:8];
+            Pump(0.05);
+        }
+
+        printf("\n[5g11] click and drag pans the document under the hand\n");
+        {
+            // No text selection in this program, so a press on the page is
+            // unambiguous and the whole document area is the hand tool.
+            PVPageView   *pv   = [wc valueForKey:@"_pageView"];
+            NSScrollView *sv   = [wc valueForKey:@"_scrollView"];
+            NSClipView   *clip = [sv contentView];
+
+            [wc goToPageNumber:8];
+            Pump(0.05);
+
+            NSPoint mid = [clip convertPoint:
+                              NSMakePoint(NSMidX([clip bounds]), NSMidY([clip bounds]))
+                                      toView:nil];
+            CGFloat before = NSMinY([clip documentVisibleRect]);
+
+            [pv mouseDown:ic_mouseEvent(NSLeftMouseDown, mid, wc)];
+            OK(fabs(NSMinY([clip documentVisibleRect]) - before) < 0.001,
+               "a press on its own moves nothing");
+
+            // Inside the deadband: a hand resting on a mouse moves a point or
+            // two while pressing, and that must not nudge the document.
+            [pv mouseDragged:ic_mouseEvent(NSLeftMouseDragged,
+                                           NSMakePoint(mid.x, mid.y + 1), wc)];
+            OK(fabs(NSMinY([clip documentVisibleRect]) - before) < 0.001,
+               "and neither does a drag inside the deadband");
+
+            // Drag the hand UP the screen. The window is not flipped, so `up`
+            // is a larger y in window coordinates; the content follows the
+            // hand, which carries the reader forward through the document.
+            const CGFloat kDrag = 120.0;
+            [pv mouseDragged:ic_mouseEvent(NSLeftMouseDragged,
+                                           NSMakePoint(mid.x, mid.y + kDrag), wc)];
+            CGFloat afterUp = NSMinY([clip documentVisibleRect]);
+            OK(afterUp > before + 1.0,
+               "dragging up carries the reader forward through the document");
+            OK(fabs((afterUp - before) - kDrag) < 1.5,
+               "and by exactly the distance the hand travelled");
+
+            // Measured from the anchor, not accumulated: dragging back to
+            // where it started returns the document to where it started, with
+            // none of the intervening frames having drifted it.
+            [pv mouseDragged:ic_mouseEvent(NSLeftMouseDragged,
+                                           NSMakePoint(mid.x, mid.y + kDrag / 2), wc)];
+            [pv mouseDragged:ic_mouseEvent(NSLeftMouseDragged, mid, wc)];
+            OK(fabs(NSMinY([clip documentVisibleRect]) - before) < 1.0,
+               "dragging back to the anchor returns to where the hand took hold");
+
+            [pv mouseDragged:ic_mouseEvent(NSLeftMouseDragged,
+                                           NSMakePoint(mid.x, mid.y - kDrag), wc)];
+            OK(NSMinY([clip documentVisibleRect]) < before - 1.0,
+               "and dragging down carries the reader back up the document");
+
+            [pv mouseUp:ic_mouseEvent(NSLeftMouseUp, mid, wc)];
+
+            // A press overrules an animation, the same way any other scroll
+            // does -- the reader has taken hold of the document.
+            PVSetPowerSourceOverride(PVPowerAC, YES);
+            NSString *down = [NSString stringWithFormat:@"%C",
+                                  (unichar)NSDownArrowFunctionKey];
+            [pv keyDown:[NSEvent keyEventWithType:NSKeyDown location:NSZeroPoint
+                                    modifierFlags:0 timestamp:0
+                                     windowNumber:[[wc window] windowNumber] context:nil
+                                       characters:down charactersIgnoringModifiers:down
+                                        isARepeat:NO keyCode:125]];
+            OK(ic_isAnimating(pv), "an animation is running");
+            [pv mouseDown:ic_mouseEvent(NSLeftMouseDown, mid, wc)];
+            OK(!ic_isAnimating(pv), "taking hold of the document stops it");
+            [pv mouseUp:ic_mouseEvent(NSLeftMouseUp, mid, wc)];
+            PVSetPowerSourceOverride(PVPowerBattery, YES);
+
+            [wc goToPageNumber:8];
+            Pump(0.05);
+        }
+
+        printf("\n[5g12] a press while a pan is still open does not orphan the cursor\n");
+        {
+            // -mouseDragged: pushes the closed hand and -endPan pops it, and
+            // the pair has to balance however the gesture ends. A mouse-up is
+            // not guaranteed to arrive: a modal panel put up mid-drag, a sheet
+            // opened from a notification, or the process stopped and resumed
+            // each swallow the release, and the next press is then the second
+            // -mouseDown: in a row.
+            //
+            // Clearing the flags without popping leaves the closed hand on the
+            // cursor stack for the rest of the session -- over a document
+            // nobody is dragging, and one deeper every time it happens. The
+            // stack has no depth query, so it is measured the only way it can
+            // be: pop until the closed hand is no longer on top.
+            PVPageView *pv   = [wc valueForKey:@"_pageView"];
+            NSClipView *clip = [[wc valueForKey:@"_scrollView"] contentView];
+            NSPoint mid = [clip convertPoint:
+                              NSMakePoint(NSMidX([clip bounds]), NSMidY([clip bounds]))
+                                      toView:nil];
+            [wc goToPageNumber:8];
+            Pump(0.05);
+
+            [pv mouseDown:ic_mouseEvent(NSLeftMouseDown, mid, wc)];
+            [pv mouseDragged:ic_mouseEvent(NSLeftMouseDragged,
+                                           NSMakePoint(mid.x, mid.y + 80), wc)];
+            [pv mouseDown:ic_mouseEvent(NSLeftMouseDown, mid, wc)];   // the lost mouse-up
+            [pv mouseDragged:ic_mouseEvent(NSLeftMouseDragged,
+                                           NSMakePoint(mid.x, mid.y + 80), wc)];
+            [pv mouseUp:ic_mouseEvent(NSLeftMouseUp, mid, wc)];
+
+            int orphaned = 0;
+            while (orphaned < 8 && [NSCursor currentCursor] == [NSCursor closedHandCursor]) {
+                [NSCursor pop];
+                orphaned++;
+            }
+            OK(orphaned == 0, "a press that interrupts a pan pops the cursor that pan pushed");
+
+            // The same balance when the view is taken out of its window with
+            // the hand still down, which is the path a document closed
+            // mid-drag actually takes.
+            [pv mouseDown:ic_mouseEvent(NSLeftMouseDown, mid, wc)];
+            [pv mouseDragged:ic_mouseEvent(NSLeftMouseDragged,
+                                           NSMakePoint(mid.x, mid.y + 80), wc)];
+            [pv viewWillMoveToWindow:nil];
+            orphaned = 0;
+            while (orphaned < 8 && [NSCursor currentCursor] == [NSCursor closedHandCursor]) {
+                [NSCursor pop];
+                orphaned++;
+            }
+            OK(orphaned == 0, "and so does a view leaving its window mid-drag");
+            [pv mouseUp:ic_mouseEvent(NSLeftMouseUp, mid, wc)];
+        }
+
+        printf("\n[5g13] a relayout mid-animation keeps the position it preserved\n");
+        {
+            // _scrollTo is an absolute offset in the geometry the press was
+            // made in. A relayout replaces that geometry, and
+            // -relayoutKeepingPage:fraction: then puts the reader back on the
+            // page they were on -- so an animation still driving toward the
+            // old number carries them straight off it again.
+            //
+            // The tick's own guard cannot see this. It compares where the
+            // document is against where it last put it, and a resize that
+            // leaves the offset alone -- a purely vertical one, where the top
+            // of the document does not move -- passes that check while making
+            // the destination meaningless. So the cancel is stated where the
+            // geometry actually changes, in -setZoom:backingScale:containerWidth:.
+            PVPageView *pv = [wc valueForKey:@"_pageView"];
+            PVSetPowerSourceOverride(PVPowerAC, YES);
+            [wc goToPageNumber:20];
+            Pump(0.1);
+
+            NSString *down = [NSString stringWithFormat:@"%C",
+                                  (unichar)NSDownArrowFunctionKey];
+            NSEvent *downEvent =
+                [NSEvent keyEventWithType:NSKeyDown location:NSZeroPoint
+                            modifierFlags:0 timestamp:0
+                             windowNumber:[[wc window] windowNumber] context:nil
+                               characters:down charactersIgnoringModifiers:down
+                                isARepeat:NO keyCode:125];
+            [pv keyDown:downEvent];
+            OK(ic_isAnimating(pv), "an animation is running when the window is resized");
+
+            CGFloat before = 0;
+            NSUInteger page = [wc currentPageWithFraction:&before];
+            NSRect frame = [[wc window] frame];
+            [[wc window] setFrame:NSMakeRect(frame.origin.x, frame.origin.y,
+                                             frame.size.width, frame.size.height - 40)
+                          display:YES];
+            OK(!ic_isAnimating(pv), "the relayout ends it rather than racing it");
+
+            PumpUntil(^{ return (BOOL)!ic_isAnimating(pv); },
+                      PV_SMOOTH_SCROLL_SECONDS * 20.0);
+            CGFloat after = 0;
+            NSUInteger page2 = [wc currentPageWithFraction:&after];
+            OK(page2 == page && fabs(after - before) < 0.06,
+               "and the reading position the resize preserved is the one left on screen");
+
+            [[wc window] setFrame:frame display:YES];
+            Pump(0.2);
+
+            // The other half, and the one no relayout covers: choosing a page
+            // is a placement too. Go to Page and a thumbnail click move the
+            // document without touching the geometry, so the only thing that
+            // could stop an animation there is the tick noticing -- and it
+            // cannot notice a jump that happens to land where the animation
+            // had got to. Ended at the call rather than at the next frame.
+            [wc goToPageNumber:20];
+            Pump(0.1);
+            [pv keyDown:downEvent];
+            OK(ic_isAnimating(pv), "an animation is running when a page is chosen");
+            [wc goToPageNumber:31];
+            OK(!ic_isAnimating(pv), "choosing a page ends it at once, not at the next frame");
+            CGFloat chosen = NSMinY([[[wc valueForKey:@"_scrollView"] contentView]
+                                        documentVisibleRect]);
+            Pump(0.4);
+            OK(fabs(NSMinY([[[wc valueForKey:@"_scrollView"] contentView]
+                               documentVisibleRect]) - chosen) < 1.0,
+               "and the page chosen is the page still on screen a moment later");
+
+            PVSetPowerSourceOverride(PVPowerBattery, YES);
+            [wc goToPageNumber:8];
+            Pump(0.05);
+        }
+
+        printf("\n[5g14] a press arriving between two frames is not dropped\n");
+        {
+            // The sixtieth of a second between two animation frames is a real
+            // window, and the wheel and the trackpad reach the clip view
+            // without passing through PVPageView at all -- so a press landing
+            // inside it finds an animation that is still running but no longer
+            // driving the document.
+            //
+            // It has to re-base on where the document actually is, and it has
+            // to SAY it has: the next frame checks the offset against the one
+            // the animation last wrote, and against a number from before the
+            // wheel it concludes that somebody else is scrolling and cancels.
+            // The keystroke then moves nothing at all -- measured at 0 pt
+            // against a 92.6 pt step. Taking charge again and recording where
+            // from are the same act, so they happen together.
+            PVPageView   *pv   = [wc valueForKey:@"_pageView"];
+            NSScrollView *sv   = [wc valueForKey:@"_scrollView"];
+            NSClipView   *clip = [sv contentView];
+            PVSetPowerSourceOverride(PVPowerAC, YES);
+            [wc goToPageNumber:20];
+            Pump(0.1);
+
+            NSString *down = [NSString stringWithFormat:@"%C",
+                                  (unichar)NSDownArrowFunctionKey];
+            NSEvent *downEvent =
+                [NSEvent keyEventWithType:NSKeyDown location:NSZeroPoint
+                            modifierFlags:0 timestamp:0
+                             windowNumber:[[wc window] windowNumber] context:nil
+                               characters:down charactersIgnoringModifiers:down
+                                isARepeat:NO keyCode:125];
+            CGFloat step = PVArrowScrollForViewportHeight(
+                               NSHeight([clip documentVisibleRect]));
+
+            [pv keyDown:downEvent];
+            OK(ic_isAnimating(pv), "an animation is running");
+
+            // The wheel, arriving with no frame in between: no Pump here, so
+            // the tick has not had a chance to notice.
+            [clip scrollToPoint:NSMakePoint(NSMinX([clip documentVisibleRect]),
+                                            NSMinY([clip documentVisibleRect]) + 300.0)];
+            [sv reflectScrolledClipView:clip];
+            CGFloat hijacked = NSMinY([clip documentVisibleRect]);
+
+            [pv keyDown:downEvent];
+            PumpUntil(^{ return (BOOL)!ic_isAnimating(pv); },
+                      PV_SMOOTH_SCROLL_SECONDS * 20.0);
+            CGFloat moved = NSMinY([clip documentVisibleRect]) - hijacked;
+            OK(fabs(moved - step) < 1.5,
+               "the press moves one step from where the document actually is");
+            OK(moved > 1.0, "...rather than being swallowed entirely");
+
+            PVSetPowerSourceOverride(PVPowerBattery, YES);
+            [wc goToPageNumber:8];
+            Pump(0.05);
+        }
+
         printf("\n[5g8] a programmatic scroll records where it actually landed\n");
         {
             // _lastScrollY is the controller's memory of where the viewport was,
@@ -5614,6 +6337,103 @@ static int RunUI(int argc, const char *argv[])
             PumpUntil(^{ return [(PVRenderQueue *)[wc valueForKey:@"_pageQueue"] isIdle]; }, 60.0);
         }
 
+        printf("\n[5i2] the cover layout, through the real controller\n");
+        {
+            // The unit suite asserts the pairing and the geometry. This
+            // asserts what only the controller can be wrong about: that the
+            // third layout reaches the view, that the two spread menu items
+            // behave as one choice rather than two independent switches, that
+            // the title names the pair that is actually on screen, and that
+            // paging steps by a row whose size changes at the cover.
+            PVPageView *pgv = [wc valueForKey:@"_pageView"];
+
+            [wc zoomFitWidth:nil];
+            [wc goToPageNumber:1];
+            Pump(0.5);
+
+            [wc toggleCoverPageView:nil];
+            Pump(0.5);
+            OK([pgv laidOutColumns] == 2 && [pgv laidOutCover],
+               "the menu action reaches the view's laid-out geometry");
+            PumpUntil(^{ return [(PVRenderQueue *)[wc valueForKey:@"_pageQueue"] isIdle]; }, 60.0);
+            Snap([wc window], [out stringByAppendingPathComponent:@"06-coverpage.png"]);
+            OK([[wc valueForKey:@"_cover"] boolValue],
+               "and the controller agrees with it");
+
+            // Page one is alone, so the title names one page and not two. This
+            // is the assertion that the window's only page indicator went
+            // through the pairing rule rather than doing the arithmetic
+            // itself: `shown - (shown % 2)` pairs page 1 with page 2 here, and
+            // would have titled the window with a page that is not on screen.
+            OK([[[wc window] title] rangeOfString:@"page 1 of"].location != NSNotFound,
+               "the title names the cover page alone");
+
+            // One press of Next turns onto the first real spread, which is
+            // pages 2 and 3 -- a step of one page, where every later step is
+            // two. This is the row size changing at the cover, seen from the
+            // Go menu.
+            [wc goToNextPage:nil];
+            Pump(0.3);
+            OK([wc currentPageWithFraction:NULL] == 1,
+               "Next from the cover turns onto the 2-3 spread");
+            OK([[[wc window] title] rangeOfString:@"pages 2-3 of"].location != NSNotFound,
+               "and the title names both of them");
+            [wc goToNextPage:nil];
+            Pump(0.3);
+            OK([wc currentPageWithFraction:NULL] == 3,
+               "and the next turn is a whole spread, 4-5");
+            OK([[[wc window] title] rangeOfString:@"pages 4-5 of"].location != NSNotFound,
+               "titled as such");
+            [wc goToPreviousPage:nil];
+            [wc goToPreviousPage:nil];
+            Pump(0.3);
+            OK([wc currentPageWithFraction:NULL] == 0,
+               "and coming back the other way lands on the cover again");
+
+            // The two spread items are one choice. At most one is ever ticked,
+            // and each turns its own layout off rather than cycling.
+            NSMenuItem *two = [[[NSMenuItem alloc] initWithTitle:@"Two Pages"
+                                    action:@selector(toggleTwoPageView:)
+                             keyEquivalent:@""] autorelease];
+            NSMenuItem *bk  = [[[NSMenuItem alloc] initWithTitle:@"Two Pages with Cover Page"
+                                    action:@selector(toggleCoverPageView:)
+                             keyEquivalent:@""] autorelease];
+            OK([wc validateMenuItem:two] && [wc validateMenuItem:bk],
+               "both spread items are enabled on a multi-page document");
+            OK([bk state] == NSOnState && [two state] == NSOffState,
+               "the cover item is checked and the plain spread is not");
+
+            // Switching to the plain spread from the cover layout, and the
+            // pairing has to move with it: page 1 acquires page 0 as its
+            // neighbour rather than page 2.
+            [wc goToPageNumber:2];
+            Pump(0.3);
+            [wc toggleTwoPageView:nil];
+            Pump(0.5);
+            OK([pgv laidOutColumns] == 2 && ![pgv laidOutCover],
+               "the plain spread item switches the layout rather than turning it off");
+            OK([wc validateMenuItem:two] && [two state] == NSOnState &&
+               [wc validateMenuItem:bk]  && [bk state]  == NSOffState,
+               "and the check mark moves with it");
+            OK([pgv firstPageOfRowContainingPage:1] == 0,
+               "page two pairs with page one again");
+
+            // Each item turns its own layout off, back to the single column.
+            [wc toggleTwoPageView:nil];
+            Pump(0.5);
+            OK([pgv laidOutColumns] == 1, "the plain spread item turns itself off");
+            [wc toggleCoverPageView:nil];
+            Pump(0.5);
+            OK([pgv laidOutColumns] == 2 && [pgv laidOutCover],
+               "the cover item turns the cover layout on from one column");
+            [wc toggleCoverPageView:nil];
+            Pump(0.5);
+            OK([pgv laidOutColumns] == 1 && ![pgv laidOutCover],
+               "and turns it off again");
+
+            PumpUntil(^{ return [(PVRenderQueue *)[wc valueForKey:@"_pageQueue"] isIdle]; }, 60.0);
+        }
+
         printf("\n[5j] a spread zoomed past the window renders only the page you can see\n");
         {
             // The saving this pins is invisible in every fitted layout, which
@@ -5732,7 +6552,7 @@ static int RunUI(int argc, const char *argv[])
         PVZoomMode mode = PVZoomModeCustom; BOOL sidebar = YES;
         BOOL found = [[PVStateStore sharedStore] stateForURL:url page:&page fraction:&frac
                         zoomMode:&mode zoom:&zoom sidebar:&sidebar columns:NULL
-                     windowFrame:NULL];
+                           cover:NULL windowFrame:NULL];
         printf("\n[6] position saved on close: found=%d page=%lu (expect 36, i.e. page 37)"
                " sidebar=%d zoom=%.2f\n", (int)found, (unsigned long)page, (int)sidebar, zoom);
         int bad = 0;
@@ -7172,7 +7992,7 @@ static void ScrollOnce(NSURL *url, PVPowerSource power, PVResources *before,
     // first.
     [[PVStateStore sharedStore] recordForURL:url page:0 fraction:0.0
                                     zoomMode:PVZoomModeFitWidth zoom:1.0
-                                     sidebar:NO columns:1 windowFrame:nil];
+                                     sidebar:NO columns:1 cover:NO windowFrame:nil];
 
     // Scoped, and this is the difference between measuring the viewer and
     // measuring the harness.

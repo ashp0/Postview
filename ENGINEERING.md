@@ -155,6 +155,7 @@ behaves exactly as battery.
 | full prefetch | `PV_FULL_PREFETCH_PAGES` (1) | 2, clamped to what the tier's cache holds |
 | dwell safety factor | 1.50 | 1.25 |
 | full renders while moving | no — the blanket motion gate | per-page cost question |
+| arrow key | jumps | animated (§12.2) |
 
 **Battery is byte-for-byte today's behaviour**, asserted per tier by
 `pvsuite unit`. Unknown is battery, never AC — asserted, so a later refactor
@@ -386,8 +387,24 @@ Checked by reverting the change and re-running:
 
 - ~~**The showdown has not been run on the Mavericks machine.**~~ Run
   2026-08-31; it returned no verdict on two fairness checks, both since fixed.
-  **Run it again** — this is still the most valuable outstanding item, because
-  no run has yet been allowed to name a winner. See §9.2 and §9.5.
+  ~~**Run it again**~~ — run again 2026-09-02, and it returned no verdict on
+  **nine**. See §9.2, §9.5 and §13. Three things now block a verdict, and none
+  of them is the app:
+  - **The showdown measures the viewer process only**, so it counts about 3% of
+    Postview's CPU and none of the helper's memory or wakeups. §13.2. Fix this
+    first; it is the one that makes every column mean something different from
+    what it says.
+  - **Preview starts every trial on page 2**, which disqualifies all of them.
+    §13.2. Needs the Mavericks machine to diagnose.
+  - **Energy Impact is not reported by a Mac Pro**, and a Mac Pro has no
+    battery. Every battery claim in this project is unmeasured, and measuring
+    one needs a portable. §13.2.
+- **Keyboard scrolling costs 1.8× Preview's CPU per page travelled.** §13.1.
+  The one workload where this program is measurably behind, and §13.3 has the
+  only lead: the preview arm has no motion branch, only the dwell test, which
+  at scrolling speeds admits every request. Whether that is cheap depends on
+  which of §2's two regimes the document is in, and nobody has measured it.
+  Measure before changing anything.
 - ~~**`make band` has never run on the Mac Pro.**~~ Run 2026-08-31. §9.3.
 - **Banding (stage 2) is not built, and §9.3 is now the argument against
   building it.** Measured on the target: one band at K=2 costs 0.680 of a whole
@@ -512,6 +529,11 @@ The recorded +63% was partly bought by travelling half as far. Per page
 travelled the recorded run is Postview 0.54 s against Preview 0.67 s, so a
 *projected* honest margin is nearer +20%. That number is arithmetic on a run
 made under the old behaviour and is not a measurement; the next run replaces it.
+
+> **The next run replaced it, and it was wrong — §13.1.** The 2026-09-02 run
+> travels 12 pages against Preview's 13, so the fix worked; the margin did not
+> merely shrink, it inverted. Per page travelled, Postview 0.116 s against
+> Preview 0.065 s. **Do not cite the +20%.**
 
 **`wheel` — the instrument.** Postview travelled 0 pages, Preview 1, and the
 ratio test read that as an infinite disparity. It is not one. Both apps scroll
@@ -1031,8 +1053,9 @@ full-resolution render was being thrown away.
 ### 11.5 Details that are decisions
 
 - **Pairing is (0,1), (2,3), …** — the plain "Two Pages" of the platform's own
-  viewer. No cover-page-alone variant: it doubles the state space to serve a
-  convention this program has no way to detect.
+  viewer. ~~No cover-page-alone variant: it doubles the state space to serve a
+  convention this program has no way to detect.~~ **Reversed, 2026-09-02; see
+  §11.6, which answers both halves of that sentence.**
 - **Facing pages are aligned at their tops**, and the row is as tall as the
   taller of the two. Centring them instead would be prettier on mixed page
   sizes and would cost the monotonicity §11.1 is built on.
@@ -1059,3 +1082,442 @@ full-resolution render was being thrown away.
   one page render per flick. A horizontal dwell model would be new machinery
   for a case nobody has measured, and §7 is where it belongs until someone
   does.
+
+### 11.6 The cover page
+
+**⌘4 lays the document out as a book: page one alone, then 2-3, 4-5.** §11.5
+said this would not be built. The objection had two halves and both are
+answered, which is why it is built rather than relitigated.
+
+**"It doubles the state space."** It would have, against the code as it stood.
+The pairing rule was arithmetic — row `r` holds pages from `r*k` — and it was
+written out at each of the three places that needed it: the layout pass, the
+row query, and the window title. A rule that lives in three places cannot be
+changed in one, and a fourth caller would have made four.
+
+It is now one rule, in `PVCommon`, as six pure functions: `PVPagesInFirstRow`,
+`PVRowCountForPages`, `PVFirstPageOfRow`, `PVRowContainingPage`,
+`PVFirstPageOfRowContainingPage` and `PVPagesInRow`. Everything that needs it
+asks — the layout pass, the row queries, the window title, and the row stepping
+behind ⌘↓ and ⌘↑, which was the fourth copy waiting to happen and is where the
+arithmetic had already gone wrong (see below). The cover is an argument to them,
+not a branch inside them, and the row table, the binary search over it, the
+visible range, the prefetch, the pins and the failure tables are byte for byte
+the code that already served the spread — §11.1's "it is not a second layout"
+now covers three layouts instead of two.
+
+What the state space actually grew by is one boolean, and it is bounded at both
+ends by normalisation rather than by callers remembering: a cover in a single
+column is not a shape the program can hold. `-setColumns:1` publishes
+`laidOutCover == NO` whatever was asked for, the state store refuses to hand one
+back, and `applyColumns:cover:` clears it. Asserted, because "normalised
+everywhere" is the kind of claim that is true of three of the four places.
+
+**"A convention this program has no way to detect."** That objection was against
+*detecting* a cover page, and it is still correct — nothing in a PDF says which
+of its pages is a title page, and a heuristic over page sizes would be wrong on
+the documents that matter most. This does not detect anything. **The reader says
+so**, with a menu item and a check mark, and it is remembered per document
+beside the page, the zoom and the column count. The program never guesses.
+
+**The gutter is the centre line, and the cover page is the page to the right of
+it.** A title page is a recto. Centring it instead would put page one over the
+gutter and every page after it half a page to one side, so the document would
+appear to slide sideways as the reader turned off the first row. The cover's
+left edge is `totalWidth/2 + PV_PAGE_GAP/2` — for an evenly matched pair that is
+*exactly* where the centring in §11.5 already puts the right-hand page, with the
+page width cancelling out of the algebra. Pages of unequal width are centred as
+a unit and so carry their gutter off the centre line by half the difference; the
+cover does not follow it there, because the whole document is the thing being
+aligned and the centre line is the only part of that which does not depend on
+page two.
+
+Fit-width therefore fits the *pair* on the cover row as on every other row, so
+the cover page is drawn at half the window's width. That is the same page scale
+as the rest of the document, which is the point of a book layout — and the same
+pixel argument as §11.3: the viewport bounds the pixels, not the page count.
+
+**A trailing short row is still centred, not put in its verso slot.** In a book
+the last page of an even-length cover layout is a left-hand page, and this draws
+it in the middle instead. That is not an oversight peculiar to the cover: the
+plain spread has centred the lone last page of an odd-length document since it
+was written (§11.5, "rows are centred as a unit"), and the cover row is the
+deliberate exception because it is *first* — every row after it shifts relative
+to where it sits, and a trailing row has nothing after it to be consistent with.
+One rule with one exception, rather than two rules.
+
+**The row step was the fourth copy of the rule, and it was already wrong.**
+`goToNextPage:` computed the next row as "this row's first page, plus a row's
+worth of pages", which is the layout's own answer only while every row is the
+same size. In the cover layout it skipped over the left half of the 2-3 spread,
+and — worse, because it is silent — the Go menu disabled **Next** on the cover
+of a two-page document, since `0 + 2` is not less than `2` while the row it was
+refusing to turn to was sitting right there. It steps by row through
+`PVFirstPageOfRow` now, and `TestRowPairing` walks every document length from 1
+to 20 pages in both layouts asserting that a row step reaches the next row and
+stops at the last one.
+
+**The three short rows.** A spread had one short row and it was always the last.
+There are three now — the cover, the last row, and a two-page document where
+they are the same row — so `PVPagesInRow` is asked for the count rather than
+deriving it from the page index. The version that subtracted the first page of a
+row from the page count was a correct reading of "how many pages are left" only
+while every row before it was full; in the cover layout it said two for a row
+holding one, and the range built from it named a page that is not on screen at
+every scroll position that shows the cover. That is a full-resolution
+rasterisation of an invisible page, per rebuild, which is the exact cost §11.4
+exists to avoid.
+
+**What the tests hold.** `TestRowPairing` walks both spreads over every document
+length from 1 to 100 pages and asserts three properties over every page of each:
+the row a page is in begins at a page in that row (the round trip every restored
+reading position depends on), the rows partition the document with no page
+skipped or counted twice (what the drawing loop walks), and rows begin at
+strictly increasing pages (what makes the binary search over them legitimate —
+§11.1). `[5i2]` drives the real controller: the title names one page on the
+cover and two after it, Next turns onto the 2-3 spread by one page and thereafter
+by two, and the two menu items behave as one choice rather than two independent
+switches.
+
+---
+
+## 12. Scrolling with the hand, and with the arrow key
+
+Two additions on 2026-09-02, and they are the same kind of thing from opposite
+directions: one gives the reader a way to move the document that did not exist,
+and one changes how the document arrives when they use the key that did.
+
+### 12.1 Click and drag pans the document
+
+There is no text selection in this program, so a press on the page means nothing
+and there is no tool palette to choose what it should mean. The whole document
+area is therefore the hand, with no mode: a press that does not move is still a
+press, and one that does is a pan.
+
+**The content follows the hand.** Drag upwards and the page rises with the
+pointer, uncovering what is below it — the same direction of travel as pushing
+the wheel away or swiping up on the trackpad, and the same as every other hand
+tool. Both axes, because a spread zoomed past the width of the window has
+somewhere to go sideways and the horizontal scroll should not be the one thing
+that has to be found with the scroller.
+
+**The anchor is in window coordinates, and that is the whole of the difficulty.**
+A clip view's bounds origin *is* the scroll offset, so a window point converted
+into the clip view moves as the document scrolls. Measured there, the delta
+contains the travel that has already been applied, the subtraction feeds its own
+output back in, and the document runs away from the pointer at compounding
+speed. The window does not move during a drag, so the difference between two
+points in it is the distance the hand has actually travelled and nothing else.
+`[5g11]` pins this the way it shows up: drag out and back to the anchor, and the
+document has to be where it started.
+
+Each frame is computed from the anchor rather than accumulated from the last
+one, so a clamp at the end of the document is undone simply by dragging back
+instead of being lost. A 3 pt deadband keeps a click a click — a hand resting on
+a mouse moves a point or two while pressing the button.
+
+`-acceptsFirstMouse:` returns NO. The first click on a background window is how
+a reader chooses which document they are reading, and panning it as well would
+move the page under someone who was only activating the window.
+
+**The closed hand is a push onto a global stack, and the pair has to balance
+however the gesture ends.** `-endPan` is the one place it is popped, for
+released, cancelled, and window-taken-away alike — but the audit of 2026-09-02
+found the one path that reset the flags without going through it. A second
+`-mouseDown:` arriving with no mouse-up in between cleared `_panMoved` directly,
+orphaning the push: the closed hand stayed up over a document nobody was
+dragging, for the rest of the session, one deeper every time it happened. Not a
+hypothetical sequence — a modal panel put up mid-drag, a sheet opened from a
+notification, and a process stopped and resumed under a debugger each swallow
+the release, and the next press is then the second `-mouseDown:` in a row.
+`-mouseDown:` ends any pan still open before starting another; `[5g12]` measures
+the stack the only way the API allows, by popping until the closed hand is no
+longer on top, and asserts the count is zero.
+
+It costs nothing this program was not already paying: a drag is a scroll, the
+motion gate and the dwell model read it exactly as they read a trackpad swipe,
+and `-scrollWheel:` is still not overridden — which is the precondition for
+responsive scrolling (§ PVPageView) and would have been the tempting place to
+put this.
+
+### 12.2 The arrow key is animated on mains power, and jumps on battery
+
+`PVArrowScrollForViewportHeight` is untouched. **An animated press lands on
+exactly the offset a jumped one would**, so the showdown's travel fairness check
+— measured in pages moved per keystroke — reads the same number under both
+policies. That is the invariant, and it is not free: it is what the retarget in
+`-scrollByPoints:animated:` exists for. A second press arriving mid-animation
+adds its step to the *destination*, not to wherever the document has got to.
+Adding it to the latter silently discards the unfinished part of every press, so
+a held key would cover a distance that depends on the machine's frame rate — and
+the same keystrokes would then move a reader a different distance on mains than
+on battery while the showdown reported one number for both. `[5g10]` sends ten
+presses with no run loop in between and requires ten steps of travel.
+
+**Why it is off on battery.** One press used to be one `-scrollToPoint:` and one
+bounds notification. An animated press is a timer at 60 Hz for 140 ms — about
+eight frames, each a redraw and another trip through `-clipBoundsChanged:` — so
+roughly eight times the wakeups and eight times the blitting for one keystroke.
+Idle wakeups are a metric this project measures precisely because they are what
+a processor cannot sleep through, and §1 ranks not doing work above doing it
+cheaply. This is work that buys nothing but smoothness, so it is bought only
+where smoothness is free. `PVSmoothScrollForPower` is the policy, stated as a
+function of the power source alone so it can be walked without unplugging
+anything; Unknown takes the battery branch, asserted, for §4.2's reason.
+
+It is **not** a saving in renders, and should not be described as one. The
+motion gate reads an animated scroll as motion either way — a 96 pt step over
+140 ms is ~690 pt/s, and the same step arriving as one event at the key repeat
+rate is ~2900 pt/s — so both are well above `PV_MIN_SCROLL_SPEED` and both
+suppress full-resolution rendering while the document moves. What the animation
+adds is the frames in between, and those are pure cost.
+
+**Only the arrow keys.** Space, Page Up and Page Down are a screenful on
+purpose; 140 ms of a whole viewport sliding past is a longer wait for the page
+you asked for, not a smoother one. Home and End are jumps by definition.
+
+**Anything else that moves the document wins.** Each frame compares the clip
+view's offset against the offset the animation last *wrote*; if they differ,
+something else has scrolled and the animation abandons itself rather than
+dragging the view back. That covers the wheel, the trackpad, the scroller and
+the controller's own restores in one test, without this class having to know
+about any of them — which matters, because the first of those reaches the clip
+view without passing through `PVPageView` at all and must go on doing so.
+
+**But that test is evidence, not a signal, and on its own it was not enough.**
+It answers "has the document moved since I last moved it", which is a different
+question from "is this animation still the right thing to be doing", and the
+audit of 2026-09-02 found two ways the two answers come apart:
+
+- *A jump that lands where the animation already is.* Go to Page and a
+  thumbnail click place the document without changing its geometry, so the only
+  thing that could stop an animation there is the frame comparison — and a jump
+  landing within `PV_SMOOTH_SCROLL_EPSILON` of where the animation had got to
+  passes it. The animation then finishes, carrying the reader off the page they
+  chose. `-scrollClipTo:` is the controller's one write of the offset and both
+  those paths go through it, so it now cancels outright: a chosen position is
+  not something an earlier keystroke gets to finish overriding.
+- *A relayout under a live animation.* `_scrollTo` is an absolute offset in the
+  geometry the press was made in. A resize replaces that geometry and
+  `-relayoutKeepingPage:fraction:` restores the reading position — and a purely
+  vertical resize does not move the offset, so the frame comparison sees
+  nothing and the animation goes on to a destination that no longer means
+  anything. Reproduced: resizing the window while the Down arrow was held moved
+  the reader off the position the relayout had just preserved. The cancel is
+  stated in `-setZoom:backingScale:containerWidth:`, past its early-out — the
+  one place the geometry actually changes, so no caller has to know that one of
+  these invalidates the other.
+
+Both are asserted in `[5g13]`. The frame comparison stays: it is still the only
+thing that can see the wheel and the trackpad, which reach the clip view
+without passing through this class at all.
+
+**And the comparison had a third failure, in the other direction: a keystroke
+it swallowed.** The sixtieth of a second between two frames is a real window,
+and a press landing inside it finds an animation that is still running but no
+longer driving the document. The press correctly re-bases on where the document
+now is — but `_scrollLastSet`, the offset the next frame checks against, was
+only written when a timer was *created*. So the next frame compared the
+document's position against a number from before the wheel, concluded that
+somebody else was scrolling, and cancelled: the press moved nothing at all.
+Measured at 0 pt against a 92.6 pt step. Taking charge of the document again
+and recording where from are the same act, so they now happen together —
+`if (!stillOurs) _scrollLastSet = now`, where `stillOurs` is the same test the
+frame makes. `[5g14]`.
+
+Three defects in one mechanism is the argument against the mechanism, and it is
+worth stating what would replace it: the destination is an absolute offset, and
+the rest of this program deliberately speaks in page-and-fraction *because*
+that survives a relayout. Holding `_scrollTo` that way would make two of the
+three impossible rather than handled. It is not done here because the property
+that matters most is exact — 40 held presses travel 3505.0 pt under both
+policies, the same number to the point — and a round trip through page and
+fraction is the one thing that would put a rounding error into it.
+
+**The timer retains the view**, and through it the cache and the parsed document
+behind it, so a live one is not merely a wakeup left running. It is invalidated
+when the animation lands, when the view leaves its window, and by
+`-cancelScrollAnimation`, which `-teardownReferences` calls for the same reason
+it cancels the controller's own two timers there.
+
+`accessibilityDisplayShouldReduceMotion` is honoured where it exists. It is
+10.12 and later, so it is asked for by selector and its absence on Mavericks
+means the same as it being off.
+
+**It is an `NSTimer` and nothing else — §10.2 still holds.** "Animation" is
+exactly the word that ought to make anyone who has read §10 nervous, so it is
+worth saying plainly: this adds no `CVDisplayLink`, no `CALayer`, no
+`wantsLayer`, and no OpenGL. Every one of that section's greps still returns
+nothing, which is the evidence the wake-from-sleep argument rests on. The frames
+are `-[NSClipView scrollToPoint:]` calls from a run-loop timer, which is the
+same call the arrow key already made — once instead of eight times.
+
+---
+
+## 13. The Mavericks run, 2026-09-02
+
+`build/Showdown Mavericks/Postview-Showdown-20260902-082544.{txt,tsv}`. Seven
+scenarios, five runs each, `Computer Graphics.pdf`, 1200×800, Postview pinned to
+`-PVPowerState battery`, Darwin 13.4.0.
+
+**It named no winner, and this time nine fairness checks failed rather than
+two.** The formal position is §9.8's: no verdict. What follows is what the
+recorded rows do and do not support.
+
+### 13.1 The arrow-key fix worked, and it cost the `scroll` win
+
+§9.2 replaced a flat 60 pt arrow step with one eighth of the viewport, because
+200 presses had moved Postview 6 pages against Preview's 13. **That is fixed:
+12 against 13, and the gate now records `scroll` as "travel not checkable"
+rather than as a disparity.**
+
+§9.2 also predicted the CPU margin would shrink to about +20% in Postview's
+favour and said to take that as the fix working. It did not shrink. It
+inverted:
+
+| | Postview | Preview | margin |
+|---|---|---|---|
+| `scroll` CPU | 1.39 s | 0.84 s | −40% |
+| pages travelled | 12 | 13 | |
+| **CPU per page** | **0.116 s** | **0.065 s** | **−44%** |
+
+*Margins in this file's convention: the gap over the larger of the two, which is
+what the report prints. As a ratio, Postview uses 1.8× Preview's CPU per page.*
+
+The +20% was arithmetic on a run made under the old behaviour, and it is now
+*falsified*, not merely superseded. Keyboard scrolling is the one workload where
+this program is measurably worse than Preview per page read, and §13.3 is the
+only lead the recorded data offers.
+
+**Read it against §13.2 before acting on it.** Those are viewer-process CPU
+figures, so Postview's real cost per page is larger again by whatever its helper
+spent — which makes this the one loss in the file that the accounting error
+understates rather than flatters.
+
+`swipe` and `wheel` lose on CPU by similar margins at equal travel (−54%,
+−57%), which is consistent: all three are the fast-scroll path.
+
+### 13.2 What the run measured, and the three reasons it cannot be read
+
+**Energy was not measured at all.** `energy_mean` is `0.00` and `energy_peak` is
+`0` in all 70 rows. §9.7 taught the analysis to print
+`(not reported by this machine -- not scored)` instead of scoring it as a tie,
+and it does — correctly. **So this run says nothing about battery**, and nor can
+any run on that machine: a Mac Pro has no battery to drain and does not report
+Energy Impact. Every battery claim this project makes has to be measured on a
+portable, and none has been.
+
+**Every trial was disqualified by the start-page check, in all seven scenarios.**
+Preview started on page 2 in 35 of 35 trials; Postview on page 1 in 35 of 35.
+`assert_fresh_start` reports this as "It restored a saved reading position" —
+and the data contradicts that reading. The file is freshly copied for every
+trial, and a restored position would land on a *different* page each time, not
+on exactly 2 in every scenario and every run. Whatever Preview's title means by
+page 2 at the top of a freshly opened document, the harness's assumption about
+it is wrong, and **until that is diagnosed no showdown can produce a verdict.**
+*Not diagnosable from the development host:* it needs Preview on the Mavericks
+machine and the exact window title it puts up.
+
+**A fifth instrument fault: the showdown does not measure the render helper.**
+`cpu_seconds_for`, `sample_process` and `power_sample_for` each read a single
+pid — the viewer. Rasterisation has been in a child process since the helper
+landed, and `ps -o time` reports a process's own `utime + stime`, never a
+child's, reaped or not (checked directly: a parent that spawned and reaped a
+child which burned two seconds of CPU reports `0:00.01`).
+
+The size of the hole is measured, on the development host, by `make power`
+[E6] over one whole run:
+
+| | CPU |
+|---|---|
+| viewer | 3.520 s |
+| helpers | 108.069 s |
+| **share the showdown counts** | **3.2%** |
+
+which agrees with §6.1's "99.7% of the CPU a render costs is spent in the child
+process". So **every `Postview` CPU figure in the report is a few per cent of
+what Postview cost**, while Preview's figure is that instrument's whole answer
+for Preview. The wins are overstated and the losses understated by an unknown
+factor, and the same applies to the memory and idle-wakeup columns — the report
+already says the bitmaps' physical pages are charged to the helper, and peak
+memory is where the biggest losses already are.
+
+This is not an argument that Postview is worse than the run says. It is that the
+CPU columns are not a comparison, and should not be read as one until the
+accounting covers both apps' whole process trees. Preview has helper processes
+of its own; fixing one side alone would replace a known bias with a new one.
+
+### 13.3 Where the scheduler could still pay, and what is not yet evidence
+
+The one lead the recorded rows offer for §13.1. Over `scroll`'s 12 pages:
+
+| | count | withheld |
+|---|---|---|
+| full renders | 7 | 51 requests, all by the motion gate |
+| preview renders | 15 | **none** |
+| dwell throttle | | **0 requests, of either kind** |
+
+**Everything withheld on `scroll` was withheld by the blanket motion gate, and
+that gate covers only full-resolution bitmaps.** The preview arm has no motion
+branch: it is asked the per-page dwell question and nothing else, and at these
+speeds that question always answers yes — `PVStatMotionSuppressed`'s own comment
+says why, and it is correct arithmetic. At ~3000 pt/s a page is visible for
+about 0.76 s, comfortably above `PV_MIN_VISIBLE_SECONDS`, so a preview that
+takes a few tens of milliseconds is genuinely worth rendering. The reader gets
+something on every page they scroll past, which is the whole job of the preview
+path.
+
+So the question is not whether the gate is working — it is whether **15 previews
+is cheap**, and that is a question §2 has already split in two:
+
+- **Pixel-bound content (vector).** A preview really is ~1/9 of a page, and 15
+  of them are under two page-equivalents against 7 full renders. Nothing to
+  find here.
+- **Content-stream-bound content (text).** A preview re-walks the *entire*
+  content stream for 1/9 the pixels. §3 kept a separate cost estimate for
+  previews precisely because their rate "is nothing like a full page's" —
+  mixing the two moved a crossover by a factor of six. On such a document 15
+  previews could plausibly cost more than the 7 full renders beside them.
+
+`Computer Graphics.pdf` is presumably the first kind, and the arbiter's own
+`read` workload is the second. **Nobody has measured which regime `scroll` is
+in, and the showdown could not have shown it either way** — that work is in the
+helper (§13.2).
+
+**Candidate, not a change:** put the preview arm behind a speed test of its own,
+using the preview cost estimate `PVCostModel` already keeps. It is §1's first
+lever applied to the one arm that currently has no motion branch. It is also
+directly against responsiveness — a suppressed preview is a page with nothing on
+it, which is the failure the preview path exists to prevent — so it needs
+`make power` and `make band` on the target to decide, and a per-document answer
+rather than a constant. **Nothing here is measured yet, and none of it may be
+cited as a saving.**
+
+What is *not* a lead, so that nobody spends a week on it: banding (§9.3 retired
+it for text), a performance mode (§4.4), and reducing the cache — the Huge
+tier's budget is why peak memory loses, and stepping off the knee costs CPU and
+energy to save bytes nobody is short of (§4.1, §4.4).
+
+### 13.4 What the run supports
+
+`launch` (+58% on CPU, +54% on the time to a usable window) and `idle` (+97% on
+CPU) at zero travel in both apps, and `page` (+82%) at 35 pages against
+Preview's 80 — where Postview used 0.019 s of viewer CPU per page against
+Preview's 0.045 s. Those hold to the extent §13.2's accounting allows, which is:
+for the viewer process only. `launch` and `idle` are the two where that is least
+of a caveat, because a document that is open and not moving is asking its helper
+for nothing.
+
+The rasterisation counters, which are Postview's own and unaffected by §13.2,
+are the clearest result in the file. Against the reference run made before the
+scheduler work, on the same machine:
+
+| scenario | renders then | renders now | Mpx then | Mpx now |
+|---|---|---|---|---|
+| `read` | 51 | **10** | 380.7 | **64.4** |
+| `page` | 90 | **8** | 666.7 | **49.3** |
+| `scroll` | 126 | **7** | 962.2 | **46.9** |
+
+That is the motion gate and the dwell throttle doing exactly what §1 ranks
+first. It is a measurement of Postview against its own past, not against
+Preview, and it is the one number in this run that needs no caveat.

@@ -42,12 +42,14 @@ does not quietly take the association away from Preview on its own.
 | | |
 |---|---|
 | Scroll | trackpad, wheel, space / shift-space, Page Up / Page Down, arrows |
+| | click and drag anywhere on the page to pan it, both ways |
 | Zoom | pinch on the trackpad, **⌘+** / **⌘−**, **⌘0** actual size, **⌘1** fit width, **⌘2** fit page |
 | | two-finger double tap toggles fit-width and actual size |
 | Go to page number | **⌥⌘G** |
 | Next / previous page | **⌘↓** / **⌘↑** |
 | First / last page | **⌘Home** / **⌘End** |
 | Two pages side by side | **⌘3** |
+| Two pages with a cover page | **⌘4** |
 | Show or hide thumbnails | **⌥⌘2**, or the toolbar button |
 | Full screen | **⌃⌘F** |
 | Open another PDF | drop it anywhere on the window, or **⌘O** |
@@ -75,6 +77,33 @@ Zoom in far enough that the pair no longer fits the window and you can scroll
 sideways onto one page of it. Postview then renders only the page you are
 actually looking at, and stops asking for the other one until you scroll back
 — including when it prefetches the next spread. §11.4.
+
+**Two pages with a cover page** (**⌘4**) is the same spread laid out the way a
+book actually opens: page one stands alone as a title page, and everything after
+it pairs 2-3, 4-5. The lone first page sits in the right-hand half of the window,
+where a right-hand page belongs, so the document does not appear to slide
+sideways as you turn past it. Everything the plain spread does, this does —
+fit-width fits the pair, ⌘↓ turns the whole spread, the title names both pages
+— and like the plain spread it is remembered per document. The two are one
+choice: whichever is on, the other item switches to it and its own item turns it
+off. Postview does not guess which documents have a title page; you tell it.
+
+**Click and drag** anywhere on a page to move the document under the pointer, in
+both directions at once. Postview has no text selection, so a press on the page
+means nothing else, and there is no tool to switch to first: drag up and the page
+goes up with your hand, carrying you forward through the document. It is the
+easiest way to move about a page you have zoomed in on, where the part you want
+is as likely to be sideways as down.
+
+**On mains power, the arrow keys scroll smoothly instead of jumping.** The
+distance is identical either way — a press moves exactly as far as it always did
+— it simply arrives over about a seventh of a second rather than all at once. On
+battery the arrow key jumps, as it always has, because animating it means waking
+the processor sixty times a second for the length of every press to buy nothing
+but smoothness. That is a real cost on a laptop and none at all on a machine
+plugged into a wall, so Postview reads the power source and does not ask you
+about it. Space, Page Up and Page Down are a screenful on purpose and stay
+instant on both. §12.
 
 Opening the app from its icon gives you an empty window that waits: drop a PDF
 anywhere on it, pick one of the documents you had open recently, or press ⌘O.
@@ -578,17 +607,23 @@ either. What does help, whatever the mechanism, is that the harness no longer
 score the run if the answer is wrong. That is the part to keep.
 
 The architectural claims in this README do not rest on that harness. They are
-asserted by `make verify-all` — a static-analysis pass, 319 unit checks, 140 UI
+asserted by `make verify-all` — a static-analysis pass, 427 unit checks, 256 UI
 checks that drive a real window controller, a 150-cycle soak, a stress suite
 under ASan/UBSan and TSan, and a leak census — all of which run on any Mac and
 none of which involve Preview.
 
-The *comparative* claims do rest on it. The showdown ran on the Mavericks
-machine on 2026-08-31 and **refused to name a winner**: two fairness checks
-failed, one a real defect in Postview's arrow-key scrolling and one a limit of
-the travel instrument itself. Both are fixed and neither has been re-measured,
-so the honest statement remains that the comparative claims are unmeasured.
-`ENGINEERING.md` §9 is the full account.
+The *comparative* claims do rest on it, and they are still unmeasured. The
+showdown has now run on the Mavericks machine twice, on 2026-08-31 and again on
+2026-09-02, and **refused to name a winner both times** — two fairness checks
+failed the first time and nine the second. The first pair are fixed: one was a
+real defect in Postview's arrow-key scrolling, and fixing it turned that
+scenario from a win into a measured loss, which is what an honest instrument is
+for. The second run's failures are all in the harness rather than the app: it
+counts only the viewer process, so it sees about 3% of Postview's CPU and none
+of its render helpers'; Preview opens every trial on page 2, which disqualifies
+all of them; and the arbiter is a Mac Pro, which has no battery and does not
+report Energy Impact, so **nothing in this project has ever measured battery
+life.** `ENGINEERING.md` §9 and §13 are the full account.
 
 ---
 

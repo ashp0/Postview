@@ -82,10 +82,18 @@ typedef struct {
     // sets the count -- which is exactly the kind of guarantee that holds
     // until someone adds a call between the two.
     NSUInteger     _laidOutColumns;
-    // The column count changed and the geometry has not caught up yet. The
-    // early-out in -setZoom:... compares zoom, scale and width, none of which
-    // move when only the number of columns does -- so without this, turning
-    // the spread on while the window sat still was a layout that never ran.
+    // The cover layout: the first page alone, the rest paired 2-3, 4-5, the
+    // way a book opens on a title page. Requested and laid-out halves, held
+    // apart for exactly the reason the column count is -- every query indexes
+    // the row table, so it must use the pairing the table was built with and
+    // not the one that has been asked for.
+    BOOL           _cover;
+    BOOL           _laidOutCover;
+    // The column count or the cover flag changed and the geometry has not
+    // caught up yet. The early-out in -setZoom:... compares zoom, scale and
+    // width, none of which move when only the shape of a row does -- so
+    // without this, turning the spread on while the window sat still was a
+    // layout that never ran.
     BOOL           _layoutDirty;
     NSUInteger     _pageCount;
     CGFloat        _zoom;
@@ -96,6 +104,39 @@ typedef struct {
     // A pinch is in progress. Tracked because the two systems this has to run
     // on disagree about how a gesture ends; see -magnifyWithEvent:.
     BOOL           _magnifying;
+
+    // The animated arrow-key scroll, when one is running. See
+    // -scrollByPoints:animated: for what each field is for and why the
+    // destination is tracked separately from where the document currently is.
+    //
+    // The timer RETAINS this view, and through it the cache and the document
+    // behind it, so it is not merely a wakeup left running: it is the whole
+    // document graph held resident by a scroll nobody is watching. Invalidated
+    // when the animation lands, when the view leaves its window, and by
+    // -cancelScrollAnimation, which the controller calls on teardown for the
+    // same reason it cancels its own two timers there.
+    NSTimer       *_scrollTimer;
+    CGFloat        _scrollFrom;      // where the animation started, in points
+    CGFloat        _scrollTo;        // where it is going: the sum of every
+                                     // press so far, not where the view is now
+    CGFloat        _scrollLastSet;   // the position this view last wrote, so a
+                                     // scroll from anywhere else can be seen
+    double         _scrollStart;     // PVMonotonicSeconds() at the first frame
+
+    // Drag-to-pan. The mouse-down point in WINDOW coordinates and the scroll
+    // offset at that moment.
+    //
+    // The window, because it is the only frame of reference in the drag that
+    // does not move while the drag moves it. This view scrolls under the
+    // pointer, and a clip view's bounds origin IS the scroll offset -- so a
+    // delta measured in either one already contains the travel that has been
+    // applied, and feeding it back in makes the document run away from the
+    // pointer. See -mouseDragged:.
+    BOOL           _panning;
+    BOOL           _panMoved;        // the hand has left the deadband
+    NSPoint        _panAnchor;       // mouse-down, in window coordinates
+    NSPoint        _panOrigin;       // documentVisibleRect origin at mouse-down
+
     __unsafe_unretained id <PVPageViewDelegate> _delegate;
 }
 - (id)initWithSource:(PVPDFSource *)source cache:(PVImageCache *)cache;
@@ -110,6 +151,18 @@ typedef struct {
 // the intent, so that one relayout serves both changes.
 - (void)setColumns:(NSUInteger)columns;
 - (NSUInteger)columns;
+
+// The cover layout: page one on its own, the rest in pairs. Takes effect at
+// the next -setZoom:backingScale:containerWidth: exactly as -setColumns: does,
+// and has no effect at all in a single column -- there is no pairing there for
+// a cover page to be the exception to, and PVPagesInFirstRow normalises that
+// rather than leaving each caller to remember it.
+- (void)setCover:(BOOL)cover;
+- (BOOL)cover;
+// The cover flag the geometry on screen was built with. The companion to
+// -laidOutColumns, and like it the only one a row or range answer may be
+// derived from.
+- (BOOL)laidOutCover;
 // The column count the geometry currently on screen was built with. Equal to
 // -columns except between a -setColumns: and the layout that answers it, and
 // it is this one -- never -columns -- that every row and range answer is
@@ -134,4 +187,18 @@ typedef struct {
 - (NSUInteger)pageAtTopOfRect:(NSRect)rect fraction:(CGFloat *)outFraction;
 - (void)setNeedsDisplayForPage:(NSUInteger)index;
 - (BOOL)isLaidOut;
+
+// Stop any animated scroll that is running and leave the document exactly
+// where the animation had got to.
+//
+// Idempotent, and safe to call when nothing is animating. The controller calls
+// it on teardown -- an NSTimer retains its target, so a live one here holds
+// the whole document graph past the point the controller has finished with it
+// -- and it is called internally by every other way of moving the document, so
+// that a wheel, a drag or a jump is never fought by a scroll that was already
+// on its way somewhere else.
+- (void)cancelScrollAnimation;
+// Whether one is running. For the tests, which have to be able to tell an
+// animation that was declined from one that finished in the same instant.
+- (BOOL)isScrollAnimating;
 @end

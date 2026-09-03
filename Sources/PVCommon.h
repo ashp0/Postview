@@ -13,6 +13,58 @@
 // Everything downstream -- the visible range, the wanted set, the prefetch --
 // is written in terms of pages and does not know which layout produced them.
 #define PV_MAX_PAGE_COLUMNS   2
+
+// ---------------------------------------------------------------------------
+// The pairing rule: which pages share a row.
+//
+// Until the cover layout there was one rule and it was arithmetic anyone could
+// do in their head -- row r holds pages r*k onwards -- so it was written out at
+// each of the three places that needed it. A cover page moves that rule, and
+// three copies of a rule is three chances for two of them to disagree about
+// which page you are looking at. It is one rule now, stated here, and the three
+// callers ask rather than repeat.
+//
+// `cover` is the traditional book layout: the first page stands alone the way a
+// title page does, and every page after it pairs 2-3, 4-5. It is a shift of the
+// pairing by one page and not a second layout -- the rows are built, measured,
+// searched and drawn by exactly the code that builds the ordinary spread.
+//
+// Meaningless in a single column, and normalised rather than rejected: with one
+// page per row there is no pairing to offset, so `cover` is ignored when
+// `columns` is 1 and every function below agrees on that without the caller
+// having to check. Same for a zero column count, which is clamped to one.
+//
+// Pure, total, and dependent on nothing but their arguments, so the layout can
+// be asserted without a window -- the same reason PVArrowScrollForViewportHeight
+// was split out of -keyDown:.
+
+// Pages in the first row: 1 in the cover layout, `columns` otherwise.
+NSUInteger PVPagesInFirstRow(NSUInteger columns, BOOL cover);
+
+// How many rows `pages` pages occupy. Zero pages is zero rows.
+NSUInteger PVRowCountForPages(NSUInteger pages, NSUInteger columns, BOOL cover);
+
+// The first page of row `row`. Not bounds-checked against a page count -- the
+// caller knows how many rows it built -- but monotonic in `row`, which is the
+// property the binary search over rows depends on.
+NSUInteger PVFirstPageOfRow(NSUInteger row, NSUInteger columns, BOOL cover);
+
+// Which row page `page` is in. The exact inverse of PVFirstPageOfRow over every
+// page a document has, which is asserted rather than assumed.
+NSUInteger PVRowContainingPage(NSUInteger page, NSUInteger columns, BOOL cover);
+
+// The first page of the row `page` shares. `page` itself in a single column,
+// and in a spread the left-hand page of its pair.
+NSUInteger PVFirstPageOfRowContainingPage(NSUInteger page, NSUInteger columns,
+                                          BOOL cover);
+
+// How many pages row `row` actually holds, given a document of `pages` pages.
+// Short rows are the first one in the cover layout and the last one of a
+// document that runs out mid-row; every other row holds `columns`. Zero for a
+// row past the end, which is what makes the drawing loops safe.
+NSUInteger PVPagesInRow(NSUInteger row, NSUInteger pages, NSUInteger columns,
+                        BOOL cover);
+
 #define PV_MIN_ZOOM          0.10
 #define PV_MAX_ZOOM          6.00
 #define PV_PREVIEW_DIVISOR   3.0    // preview pass renders 1/3 linear size (9x fewer pixels)
@@ -39,6 +91,38 @@
 #define PV_ARROW_VIEWPORT_FRACTION  8.0
 #define PV_ARROW_SCROLL_MIN        40.0
 #define PV_ARROW_SCROLL_MAX       160.0
+
+// ---------------------------------------------------------------------------
+// Animated arrow-key scrolling.
+//
+// The arrow key moves the same distance either way -- PVArrowScrollForViewport-
+// Height is untouched, and an animated press lands exactly where a jumped one
+// would. What changes is only whether the eye is given the intervening frames,
+// so the showdown's travel fairness gate reads the same number under both.
+//
+// It is off on battery, and that is not caution: it is arithmetic. One press
+// used to be one -[NSClipView scrollToPoint:] and one bounds notification. An
+// animated press is a timer waking the processor PV_SMOOTH_SCROLL_HZ times a
+// second for PV_SMOOTH_SCROLL_SECONDS, and each of those frames is a redraw and
+// another trip through -clipBoundsChanged:. That is roughly eight times the
+// wakeups and eight times the blitting for one keystroke, and idle wakeups are
+// a metric this project measures precisely because they are what a processor
+// cannot sleep through. Section 1 ranks not doing work above doing it cheaply;
+// this is work that buys nothing but smoothness, so it is bought only where
+// smoothness is free.
+//
+// The duration is short on purpose. It has to be under the key-repeat interval
+// a reader holding the key down actually produces (~33 ms at the default rate,
+// so several presses land inside one animation) for the retarget path to keep
+// the document moving continuously rather than in eight-frame twitches -- and
+// it has to be short enough that the page has stopped by the time the reader
+// has decided to look at it. 140 ms is about two frames longer than the eye
+// needs to follow the movement and well short of feeling like a delay.
+#define PV_SMOOTH_SCROLL_SECONDS   0.14
+#define PV_SMOOTH_SCROLL_HZ        60.0
+// A remaining distance below this is not worth another frame: half a point
+// cannot be seen, and finishing early is one less wakeup.
+#define PV_SMOOTH_SCROLL_EPSILON   0.5
 
 // A page that will be on screen for less time than this, during a scroll, is
 // not worth rasterising: the bitmap cannot be finished and delivered before
@@ -327,6 +411,16 @@ CGSize PVClampPixelSize(CGSize px);
 // floor rather than a NaN that would propagate into -scrollToPoint:.
 CGFloat PVArrowScrollForViewportHeight(CGFloat viewportHeight);
 
+// Where an eased scroll is, `t` of the way through it. Ease-out: the document
+// leaves at speed and arrives gently, which is the shape that reads as the
+// page settling rather than as the page being dragged.
+//
+// Clamped at both ends, so a frame that arrives late -- the run loop was busy,
+// the machine slept -- lands exactly on the destination instead of overshooting
+// it. Split out and pure so the curve is assertable: it must start at 0, end at
+// 1, and never go backwards.
+double PVSmoothScrollEase(double t);
+
 // ---------------------------------------------------------------------------
 // Power source.
 //
@@ -368,6 +462,17 @@ PVPowerSource PVPowerSourceFromString(NSString *s);
 // plugged in would cost more than the policy it informs can save. Main thread
 // only.
 PVPowerSource PVCurrentPowerSource(void);
+
+// Whether an arrow press is animated, given where the machine draws its power.
+//
+// AC only. Battery and Unknown both jump, and Unknown is not folded into AC for
+// the reason section 4.2 gives for every other knob: a machine that declines to
+// say where its power comes from must not have the expensive behaviour turned
+// on by an unreadable answer. Stated as a function of the power source alone so
+// the policy can be walked without unplugging anything, the way
+// PVRenderPolicyFor is -- and so that -PVPowerState reaches it for free, which
+// is what lets the showdown measure the branch it means to measure.
+BOOL PVSmoothScrollForPower(PVPowerSource power);
 
 // Test seam: pin the answer and bypass both the cache and IOKit.
 //

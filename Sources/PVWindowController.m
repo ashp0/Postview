@@ -181,12 +181,12 @@ static BOOL PVPageOverlapsColumn(NSRect page, NSRect viewport)
     NSUInteger page = 0, columns = 1;
     CGFloat fraction = 0, zoom = 1.0;
     PVZoomMode mode = PVZoomModeFitWidth;
-    BOOL sidebar = NO;
+    BOOL sidebar = NO, cover = NO;
     NSString *frameString = nil;
 
     if ([[PVStateStore sharedStore] stateForURL:_url page:&page fraction:&fraction
                                        zoomMode:&mode zoom:&zoom sidebar:&sidebar
-                                        columns:&columns
+                                        columns:&columns cover:&cover
                                     windowFrame:&frameString]) {
         NSUInteger pc = [_source pageCount];
         if (pc == 0) return;
@@ -199,6 +199,11 @@ static BOOL PVPageOverlapsColumn(NSRect page, NSRect viewport)
         // already bounded the value; this is the second half of the same
         // clamp, because the ivar is what the rest of the class trusts.
         if (columns >= 1 && columns <= PV_MAX_PAGE_COLUMNS) _columns = columns;
+        // Second half of the same clamp, and in the same order the store
+        // applies it: the cover is only meaningful once the count is known,
+        // so it is read against the count that was just accepted rather than
+        // against the one that was asked for.
+        _cover = (cover && _columns > 1) ? YES : NO;
         if (zoom >= PV_MIN_ZOOM && zoom <= PV_MAX_ZOOM) _zoom = zoom;
         if ([frameString length] > 0) {
             [window setFrameFromString:frameString];
@@ -253,6 +258,13 @@ static BOOL PVPageOverlapsColumn(NSRect page, NSRect viewport)
     [_scrollView setBackgroundColor:[NSColor colorWithCalibratedWhite:0.42 alpha:1.0]];
     [_scrollView setAutoresizingMask:(NSViewWidthSizable | NSViewHeightSizable)];
     [_scrollView setPostsFrameChangedNotifications:YES];
+    // The open hand over the document, because the document can be dragged.
+    // -setDocumentCursor: rather than cursor rects in the page view: the
+    // document view is the size of the whole PDF and scrolls under the window,
+    // so a rect set on it has to be re-established every time the view moves,
+    // and this is the API that already does that. The closed hand during the
+    // drag is pushed and popped by the page view.
+    [_scrollView setDocumentCursor:[NSCursor openHandCursor]];
 
     _pageView = [[PVPageView alloc] initWithSource:_source cache:_pageCache];
     if (!_pageView) return NO;
@@ -303,6 +315,11 @@ static BOOL PVPageOverlapsColumn(NSRect page, NSRect viewport)
     // the whole controller graph behind it. Both timers, for one reason.
     [self cancelSettle];
     [self cancelRetry];
+    // The page view runs a timer of its own for the animated arrow scroll, and
+    // it retains the page view exactly as these two retain the controller. A
+    // document closed mid-scroll would otherwise hold its bitmap cache and its
+    // parsed PDF resident for as long as the run loop lived.
+    [_pageView cancelScrollAnimation];
 
     [_pageQueue  setDelegate:nil];
     [_thumbQueue setDelegate:nil];
@@ -461,6 +478,7 @@ static BOOL PVPageOverlapsColumn(NSRect page, NSRect viewport)
     // view early-outs on an unchanged count, and -setZoom: below is what
     // actually rebuilds the frames either way.
     [_pageView setColumns:_columns];
+    [_pageView setCover:_cover];
     [_pageView setZoom:z
           backingScale:[self backingScale]
         containerWidth:[self viewportSize].width];
@@ -493,6 +511,19 @@ static BOOL PVPageOverlapsColumn(NSRect page, NSRect viewport)
 {
     NSClipView *clip = [_scrollView contentView];
     if (!clip) return;
+    // A deliberate placement of the document overrules an animated scroll that
+    // is still on its way somewhere else, and says so rather than relying on
+    // the animation noticing.
+    //
+    // The tick does notice, most of the time: it compares where the document
+    // is against where it last put it. But that is evidence, not a signal, and
+    // it is absent in precisely the case this method exists for -- a jump that
+    // lands within half a point of where the animation had got to leaves the
+    // animation running, and it then carries the reader off the page they
+    // asked for. Both callers here are the reader choosing a position (Go to
+    // Page, a thumbnail, the anchor a pinch has to hold still), and a chosen
+    // position is not something an earlier keystroke gets to finish overriding.
+    [_pageView cancelScrollAnimation];
     [clip scrollToPoint:NSMakePoint(floor(p.x + 0.5), floor(p.y + 0.5))];
     [_scrollView reflectScrolledClipView:clip];
     _lastScrollY = NSMinY([clip documentVisibleRect]);
@@ -1427,13 +1458,25 @@ static double PVTransientBackoff(unsigned attempts)
     // number stops changing on every second turn, which reads as a window that
     // has stopped following the document.
     //
-    // Taken from the page view's laid-out count rather than from _columns, for
-    // the same reason the view's own queries are: this describes what is on
-    // screen, and what is on screen is what has been laid out. The last page of
-    // an odd-length document is a row of one and is titled as one.
+    // Taken from the page view's laid-out shape rather than from _columns and
+    // _cover, for the same reason the view's own queries are: this describes
+    // what is on screen, and what is on screen is what has been laid out. A
+    // row of one page -- the cover, or the last page of a document that runs
+    // out mid-row -- is titled as one.
+    //
+    // And asked of the pairing rule rather than worked out here. The title
+    // used to do the arithmetic itself, `shown - (shown % k)`, which is the
+    // layout's own answer only while every row holds k pages. Under the cover
+    // layout it names the wrong pair for every page in the document, so the
+    // window would have been titled with two pages that are not the two on
+    // screen. One rule, asked for rather than restated; see
+    // PVFirstPageOfRowContainingPage.
     NSUInteger k     = _pageView ? [_pageView laidOutColumns] : 1;
-    NSUInteger first = shown - (shown % k);
-    NSUInteger last  = first + k - 1;
+    BOOL       cover = _pageView ? [_pageView laidOutCover] : NO;
+    NSUInteger row   = PVRowContainingPage(shown, k, cover);
+    NSUInteger first = PVFirstPageOfRow(row, k, cover);
+    NSUInteger count = PVPagesInRow(row, pages, k, cover);
+    NSUInteger last  = first + (count ? count - 1 : 0);
     if (last >= pages) last = pages - 1;
     if (last > first)
         return [NSString stringWithFormat:@"%@ (pages %lu-%lu of %lu)",
@@ -2327,23 +2370,36 @@ static double PVTransientBackoff(unsigned attempts)
     if (_sidebarVisible) [self hideSidebar]; else [self showSidebar];
 }
 
-// One page across, or two side by side.
+// One page across, two side by side, or two side by side with the first one
+// standing alone the way a title page does.
+//
+// Three layouts and two of them are the same layout: the cover is a shift of
+// the pairing by one page, not a third code path. See PVPagesInFirstRow.
 //
 // The reading position is taken before the change and restored after it, the
 // way every zoom already is, so the page you were on is the page you are on --
 // it simply acquires a neighbour. In a spread that page becomes the left-hand
 // half of its own row when its index is even and the right-hand half when it
-// is odd, which is the same pairing on the way back out, so turning the mode
-// on and off again returns you exactly where you were.
-- (void)applyColumns:(NSUInteger)columns
+// is odd -- and the other way round once the cover shifts the pairing. Either
+// way it is the same pairing on the way back out, so turning a mode on and off
+// again returns you exactly where you were.
+- (void)applyColumns:(NSUInteger)columns cover:(BOOL)cover
 {
     if (columns < 1) columns = 1;
     if (columns > PV_MAX_PAGE_COLUMNS) columns = PV_MAX_PAGE_COLUMNS;
-    if (columns == _columns) return;
+    // A single column has no pairing for a cover page to be the exception to,
+    // so it cannot be in the cover layout. Normalised here as well as in
+    // PVPagesInFirstRow, because this is what gets written to the state file:
+    // a document recorded as one column WITH a cover would reopen in a shape
+    // no menu can produce and no check mark describes.
+    if (columns < 2) cover = NO;
+    cover = cover ? YES : NO;
+    if (columns == _columns && cover == _cover) return;
 
     CGFloat f = 0;
     NSUInteger p = [self currentPageWithFraction:&f];
     _columns = columns;
+    _cover   = cover;
     _haveRequestState = NO;
     // The title has to be rewritten even though the page under the reader has
     // not changed, because what changed is how many pages are beside it:
@@ -2363,9 +2419,26 @@ static double PVTransientBackoff(unsigned attempts)
     [self updateVisibleContent];
 }
 
+// The two spread layouts, each a toggle against the single-page column.
+//
+// Symmetric on purpose: whichever of the two you are in, its own menu item
+// turns it off and the other one switches to it. Anything else needs the
+// reader to know which mode they are in before they can predict what a
+// keystroke does, and the check mark is the only thing that tells them.
+//
+// -applyColumns:cover: does nothing when neither value moves, so pressing the
+// item for the layout you are already in and pressing it again to leave are
+// the same call with different arguments rather than two paths.
 - (IBAction)toggleTwoPageView:(id)sender
 {
-    [self applyColumns:(_columns > 1) ? 1 : PV_MAX_PAGE_COLUMNS];
+    BOOL on = (_columns > 1 && !_cover);
+    [self applyColumns:on ? 1 : PV_MAX_PAGE_COLUMNS cover:NO];
+}
+
+- (IBAction)toggleCoverPageView:(id)sender
+{
+    BOOL on = (_columns > 1 && _cover);
+    [self applyColumns:on ? 1 : PV_MAX_PAGE_COLUMNS cover:!on];
 }
 
 - (void)applyZoomMode:(PVZoomMode)mode zoom:(CGFloat)zoom
@@ -2454,9 +2527,9 @@ static double PVTransientBackoff(unsigned attempts)
     }];
 }
 
-// How many pages a row holds on screen right now. The view's laid-out count
-// when there is a view, and the requested one before the first layout, which
-// is the only moment the two can differ and no row exists to contradict.
+// The shape the geometry on screen was built with. The view's, when there is
+// one; the requested one before the first layout, which is the only moment the
+// two can differ and no row exists to contradict.
 - (NSUInteger)pagesPerRow
 {
     if (_pageView) {
@@ -2464,6 +2537,11 @@ static double PVTransientBackoff(unsigned attempts)
         if (k >= 1) return k;
     }
     return (_columns > 0) ? _columns : 1;
+}
+
+- (BOOL)rowsHaveCover
+{
+    return _pageView ? [_pageView laidOutCover] : (_cover && _columns > 1);
 }
 
 // Next and previous move by a ROW, so in the spread they turn both pages at
@@ -2486,19 +2564,50 @@ static double PVTransientBackoff(unsigned attempts)
     return [_pageView firstPageOfRowContainingPage:p];
 }
 
+// The first page of the row `delta` rows away, or NSNotFound when there is no
+// such row.
+//
+// Asked of the pairing rule rather than computed as "this row's first page,
+// plus a row's worth of pages", which is the same answer only while every row
+// is the same size. It is not in the cover layout, and the arithmetic was
+// wrong at both ends of it: turning forward from a lone cover page skipped
+// over the left half of the 2-3 spread, and the Go menu disabled Next on the
+// cover of a two-page document because 0 + 2 is not less than 2 -- while the
+// row it refused to turn to was sitting right there.
+- (NSUInteger)firstPageOfRowOffsetBy:(NSInteger)delta
+{
+    NSUInteger pages = [_source pageCount];
+    if (pages == 0) return NSNotFound;
+    NSUInteger k     = [self pagesPerRow];
+    BOOL       cover = [self rowsHaveCover];
+    NSUInteger row   = PVRowContainingPage([self currentPageWithFraction:NULL],
+                                           k, cover);
+    if (delta < 0) {
+        NSUInteger back = (NSUInteger)(-delta);
+        if (row < back) return NSNotFound;
+        row -= back;
+    } else {
+        row += (NSUInteger)delta;
+    }
+    NSUInteger first = PVFirstPageOfRow(row, k, cover);
+    return (first < pages) ? first : NSNotFound;
+}
+
 - (IBAction)goToNextPage:(id)sender
 {
-    NSUInteger k = [self pagesPerRow];
-    [self goToPageNumber:(NSInteger)([self firstPageOfCurrentRow] + k) + 1];
+    NSUInteger next = [self firstPageOfRowOffsetBy:1];
+    // No row after this one, so there is nowhere to turn to. The menu item is
+    // already disabled there; a keystroke can still reach an action whose
+    // validation says no, so this is the same answer stated twice on purpose.
+    if (next == NSNotFound) return;
+    [self goToPageNumber:(NSInteger)next + 1];
 }
 - (IBAction)goToPreviousPage:(id)sender
 {
-    NSUInteger first = [self firstPageOfCurrentRow];
-    NSUInteger k = [self pagesPerRow];
-    // Already on the first row: -goToPageNumber: clamps, so this lands at the
-    // top of the document, which is what the single-page column has always
-    // done from page one.
-    [self goToPageNumber:(first > k) ? (NSInteger)(first - k) + 1 : 1];
+    NSUInteger previous = [self firstPageOfRowOffsetBy:-1];
+    // Already on the first row: land at the top of the document, which is what
+    // the single-page column has always done from page one.
+    [self goToPageNumber:(previous == NSNotFound) ? 1 : (NSInteger)previous + 1];
 }
 - (IBAction)goToFirstPage:(id)sender { [self goToPageNumber:1]; }
 - (IBAction)goToLastPage:(id)sender  { [self goToPageNumber:(NSInteger)[_source pageCount]]; }
@@ -2513,18 +2622,28 @@ static double PVTransientBackoff(unsigned attempts)
     if (action == @selector(toggleTwoPageView:)) {
         // A checkmark rather than a change of wording. "Show Thumbnails"
         // becomes "Hide Thumbnails" because the sidebar is a thing that is
-        // there or is not; this is one of two ways of laying the same document
-        // out, and the state of a view mode is what a check mark is for.
-        [item setState:(_columns > 1) ? NSOnState : NSOffState];
+        // there or is not; this is one of three ways of laying the same
+        // document out, and the state of a view mode is what a check mark is
+        // for. The two spread items are mutually exclusive, so at most one of
+        // them is ever ticked and the pair reads as a choice.
+        [item setState:(_columns > 1 && !_cover) ? NSOnState : NSOffState];
         // Nothing to lay out two of. Left enabled but unchecked rather than
         // hidden, so the menu does not change shape between documents.
         return [_source pageCount] > 1;
     }
-    if (action == @selector(goToNextPage:)) {
-        return [self firstPageOfCurrentRow] + [self pagesPerRow] < [_source pageCount];
+    if (action == @selector(toggleCoverPageView:)) {
+        [item setState:(_columns > 1 && _cover) ? NSOnState : NSOffState];
+        // Two pages, not one: a document of a single page IS its cover, and
+        // there is no second page for the layout to hold back. Three would be
+        // the first count at which the cover changes any pairing at all -- with
+        // two pages it only moves them apart -- but the honest condition is
+        // that a spread exists to modify, which is the same one ⌘3 uses.
+        return [_source pageCount] > 1;
     }
+    if (action == @selector(goToNextPage:))
+        return [self firstPageOfRowOffsetBy:1] != NSNotFound;
     if (action == @selector(goToPreviousPage:))
-        return [self firstPageOfCurrentRow] > 0;
+        return [self firstPageOfRowOffsetBy:-1] != NSNotFound;
     if (action == @selector(zoomIn:))  return _zoom < PV_MAX_ZOOM - 0.001;
     if (action == @selector(zoomOut:)) return _zoom > PV_MIN_ZOOM + 0.001;
     return YES;
@@ -2684,6 +2803,7 @@ static NSView *PVToolbarBox(NSControl *control)
                                         zoom:_zoom
                                      sidebar:_sidebarVisible
                                      columns:_columns
+                                       cover:_cover
                                  windowFrame:[[self window] stringWithSavedFrame]];
 }
 

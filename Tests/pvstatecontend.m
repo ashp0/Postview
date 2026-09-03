@@ -55,6 +55,7 @@ static void ChildBody(NSString *path, int child, int docs, BOOL persist)
                        zoom:1.0
                     sidebar:NO
                     columns:1
+                      cover:NO
                 windowFrame:@"{{0,0},{800,600}}"];
         }
         if (persist) {
@@ -72,7 +73,7 @@ static void ChildBody(NSString *path, int child, int docs, BOOL persist)
                         BOOL sb; NSUInteger cols; NSString *fm = nil;
                         if ([check stateForURL:DocURL(child, i) page:&pg fraction:&fr
                                       zoomMode:&md zoom:&zm sidebar:&sb
-                                       columns:&cols windowFrame:&fm]) have++;
+                                       columns:&cols cover:NULL windowFrame:&fm]) have++;
                     }
                     [check release];
                 }
@@ -99,7 +100,8 @@ static int CountLanded(NSString *path, int children, int docs)
                 NSUInteger pg; CGFloat fr, zm; PVZoomMode md;
                 BOOL sb; NSUInteger cols; NSString *fm = nil;
                 if ([s stateForURL:DocURL(c, i) page:&pg fraction:&fr zoomMode:&md
-                              zoom:&zm sidebar:&sb columns:&cols windowFrame:&fm]) {
+                              zoom:&zm sidebar:&sb columns:&cols cover:NULL
+                           windowFrame:&fm]) {
                     found++;
                     // The value must be the one that child wrote, not a
                     // half-merged blend of two writers.

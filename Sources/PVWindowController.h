@@ -43,6 +43,13 @@
     // else here -- the wanted set, the prefetch, the failure tables, the cache
     // -- is written in pages and is unaffected by how they are arranged.
     NSUInteger        _columns;
+    // The cover layout: page one alone, the rest paired. Only meaningful
+    // alongside a column count above one, and held as a separate flag rather
+    // than as a third column count because it is not one: it does not change
+    // how many pages fit across the window, it changes only which pages share
+    // a row. Everything sized from the column count -- the fit-width zoom, the
+    // wanted set, the prefetch -- is correct under it unchanged.
+    BOOL              _cover;
     BOOL              _sidebarVisible;
     BOOL              _liveScrolling;
     // A pinch is in progress. Like a live scroll it holds off the exact render
@@ -253,6 +260,7 @@
 
 - (IBAction)toggleSidebar:(id)sender;
 - (IBAction)toggleTwoPageView:(id)sender;
+- (IBAction)toggleCoverPageView:(id)sender;
 - (IBAction)zoomIn:(id)sender;
 - (IBAction)zoomOut:(id)sender;
 - (IBAction)zoomActualSize:(id)sender;

@@ -40,6 +40,13 @@
 // column, 2 for the spread. A file written by a build that predates the
 // spread has no such key, and reads back as 1 -- the layout every one of
 // those documents was actually last seen in.
+//
+// `cover` is the book layout: the first page alone, the rest paired. It is
+// stored beside the count rather than folded into it -- there is no column
+// count that means "two, offset by one" -- and it is normalised against the
+// count at both ends, so a single column never comes back with a cover.
+// Missing reads back as NO, which is what every file written before the
+// layout existed correctly describes.
 - (void)recordForURL:(NSURL *)url
                 page:(NSUInteger)page
             fraction:(CGFloat)fraction
@@ -47,6 +54,7 @@
                 zoom:(CGFloat)zoom
              sidebar:(BOOL)sidebarVisible
              columns:(NSUInteger)columns
+               cover:(BOOL)cover
          windowFrame:(NSString *)frameString;
 
 - (BOOL)stateForURL:(NSURL *)url
@@ -56,6 +64,7 @@
                zoom:(CGFloat *)outZoom
             sidebar:(BOOL *)outSidebar
             columns:(NSUInteger *)outColumns
+              cover:(BOOL *)outCover
         windowFrame:(NSString **)outFrame;
 
 - (void)flush;

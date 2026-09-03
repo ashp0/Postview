@@ -201,6 +201,7 @@ static NSString *PVString(NSDictionary *d, NSString *key)
                 zoom:(CGFloat)zoom
              sidebar:(BOOL)sidebarVisible
              columns:(NSUInteger)columns
+               cover:(BOOL)cover
          windowFrame:(NSString *)frameString
 {
     NSString *key = [self keyForURL:url];
@@ -221,6 +222,12 @@ static NSString *PVString(NSDictionary *d, NSString *key)
     if (columns > PV_MAX_PAGE_COLUMNS) columns = PV_MAX_PAGE_COLUMNS;
     [d setObject:[NSNumber numberWithUnsignedLongLong:(unsigned long long)columns]
           forKey:@"columns"];
+    // Normalised against the column count for the same reason the count itself
+    // is clamped: the reader will not return a cover in a single column, so a
+    // writer that stored one would differ from what is read back on every
+    // save, and the comparison below would rewrite the file forever.
+    if (columns < 2) cover = NO;
+    [d setObject:[NSNumber numberWithBool:cover ? YES : NO] forKey:@"cover"];
     if (frameString) [d setObject:frameString forKey:@"windowFrame"];
 
     // Nothing has moved since the last time this document was recorded, so
@@ -252,6 +259,7 @@ static NSString *PVString(NSDictionary *d, NSString *key)
                zoom:(CGFloat *)outZoom
             sidebar:(BOOL *)outSidebar
             columns:(NSUInteger *)outColumns
+              cover:(BOOL *)outCover
         windowFrame:(NSString **)outFrame
 {
     NSString *key = [self keyForURL:url];
@@ -290,6 +298,25 @@ static NSString *PVString(NSDictionary *d, NSString *key)
         double c = PVNumber(d, @"columns", 1);
         if (!(c >= 1) || c > PV_MAX_PAGE_COLUMNS) c = 1;
         *outColumns = (NSUInteger)c;
+    }
+    if (outCover) {
+        // Absent means no cover, which is what every file written before the
+        // layout existed truthfully describes -- and, as with the column
+        // count, the answer is only meaningful alongside a spread. Read out of
+        // the same dictionary as the count and normalised against it here, so
+        // a hand-edited file cannot produce a shape the menu has no item for.
+        //
+        // Against the count as the READER will report it, clamp and all, and
+        // not against the raw number in the file. Those differ for exactly the
+        // file this normalisation exists to survive: `columns: 99` is reported
+        // as one column, and testing the raw 99 against `>= 2` handed back a
+        // single column WITH a cover -- a pair no menu item produces and no
+        // check mark describes. The controller re-clamps and would have caught
+        // it, but a reader that has to be corrected by its caller is not a
+        // reader that has normalised anything.
+        double c = PVNumber(d, @"columns", 1);
+        if (!(c >= 1) || c > PV_MAX_PAGE_COLUMNS) c = 1;
+        *outCover = (PVNumber(d, @"cover", 0) != 0) && (c >= 2);
     }
     if (outMode) {
         double m = PVNumber(d, @"zoomMode", PVZoomModeFitWidth);

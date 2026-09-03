@@ -77,6 +77,12 @@ static NSString *PVFnKey(unichar c)
     // checked rather than retitled, and -validateMenuItem: sets that.
     PVAdd(viewMenu, @"Two Pages", @selector(toggleTwoPageView:), @"3",
           NSCommandKeyMask);
+    // The same spread with the first page held back, the way a book opens on a
+    // title page. Cmd-4 because it is the next key in the row and it sits
+    // beside the layout it is a variant of; the two items are mutually
+    // exclusive and at most one of them is ever ticked.
+    PVAdd(viewMenu, @"Two Pages with Cover Page", @selector(toggleCoverPageView:),
+          @"4", NSCommandKeyMask);
     [viewMenu addItem:[NSMenuItem separatorItem]];
     PVAdd(viewMenu, @"Zoom In", @selector(zoomIn:), @"+", NSCommandKeyMask);
     PVAdd(viewMenu, @"Zoom Out", @selector(zoomOut:), @"-", NSCommandKeyMask);

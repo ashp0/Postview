@@ -979,6 +979,97 @@ CGFloat PVArrowScrollForViewportHeight(CGFloat viewportHeight)
     return step;
 }
 
+BOOL PVSmoothScrollForPower(PVPowerSource power)
+{
+    return (power == PVPowerAC);
+}
+
+double PVSmoothScrollEase(double t)
+{
+    // A frame whose clock read back as nonsense is treated as the end of the
+    // animation rather than as a position: landing on the destination is the
+    // one answer that is never wrong, and it costs no further wakeups.
+    if (!isfinite(t) || t >= 1.0) return 1.0;
+    if (t <= 0.0) return 0.0;
+    // Quadratic ease-out. One multiply, monotonic by construction, and it
+    // leaves at twice the average speed -- which is what makes a 140 ms scroll
+    // read as the document moving rather than as a delay before it moves.
+    double inv = 1.0 - t;
+    return 1.0 - inv * inv;
+}
+
+// ---------------------------------------------------------------------------
+// The pairing rule. See PVCommon.h for why it is one rule in one place.
+//
+// Every function starts from the same two normalisations, so a caller cannot
+// reach one of them with a shape another would have rejected: a column count
+// below one is one, and `cover` in a single column is no cover at all, because
+// there is no pairing there for a cover page to be the exception to.
+static NSUInteger PVNormalisedColumns(NSUInteger columns)
+{
+    if (columns < 1) return 1;
+    if (columns > PV_MAX_PAGE_COLUMNS) return PV_MAX_PAGE_COLUMNS;
+    return columns;
+}
+
+NSUInteger PVPagesInFirstRow(NSUInteger columns, BOOL cover)
+{
+    NSUInteger k = PVNormalisedColumns(columns);
+    return (cover && k > 1) ? 1 : k;
+}
+
+NSUInteger PVRowCountForPages(NSUInteger pages, NSUInteger columns, BOOL cover)
+{
+    if (pages == 0) return 0;
+    NSUInteger k     = PVNormalisedColumns(columns);
+    NSUInteger first = PVPagesInFirstRow(k, cover);
+    if (pages <= first) return 1;
+    // Divided rather than multiplied, so nothing here can overflow whatever
+    // page count it is handed.
+    NSUInteger rest = pages - first;
+    return 1 + (rest + k - 1) / k;
+}
+
+NSUInteger PVFirstPageOfRow(NSUInteger row, NSUInteger columns, BOOL cover)
+{
+    if (row == 0) return 0;
+    NSUInteger k     = PVNormalisedColumns(columns);
+    NSUInteger first = PVPagesInFirstRow(k, cover);
+    // Saturate rather than wrap. A row index past anything a document could
+    // have is a caller's error either way, but wrapping would answer with a
+    // small page index and break the monotonicity the row search relies on;
+    // saturating keeps the answer ordered and out of range, which every caller
+    // already bounds against a page count.
+    if ((row - 1) > (NSUIntegerMax - first) / k) return NSUIntegerMax;
+    return first + (row - 1) * k;
+}
+
+NSUInteger PVRowContainingPage(NSUInteger page, NSUInteger columns, BOOL cover)
+{
+    NSUInteger k     = PVNormalisedColumns(columns);
+    NSUInteger first = PVPagesInFirstRow(k, cover);
+    if (page < first) return 0;
+    return 1 + (page - first) / k;
+}
+
+NSUInteger PVFirstPageOfRowContainingPage(NSUInteger page, NSUInteger columns,
+                                          BOOL cover)
+{
+    return PVFirstPageOfRow(PVRowContainingPage(page, columns, cover),
+                            columns, cover);
+}
+
+NSUInteger PVPagesInRow(NSUInteger row, NSUInteger pages, NSUInteger columns,
+                        BOOL cover)
+{
+    NSUInteger k     = PVNormalisedColumns(columns);
+    NSUInteger start = PVFirstPageOfRow(row, k, cover);
+    if (start >= pages) return 0;
+    NSUInteger want = (row == 0) ? PVPagesInFirstRow(k, cover) : k;
+    NSUInteger left = pages - start;
+    return (left < want) ? left : want;
+}
+
 size_t PVImageBytes(CGImageRef img)
 {
     if (!img) return 0;
