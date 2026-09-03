@@ -1,5 +1,7 @@
 #import "PVRenderCore.h"
+#include "PVRenderProtocol.h"   /* PV_MAX_PDF_PAGES, which sizes the memo table */
 #include <math.h>
+#include <string.h>
 
 static BOOL PVFiniteScalarCore(CGFloat value)
 {
@@ -110,6 +112,149 @@ CGAffineTransform PVPageDrawingTransform(CGRect box, int rotation,
     return t;
 }
 
+/* /F, PDF 1.7 table 8.16: bit 2 Hidden, bit 6 NoView. Both mean do not paint
+ * this on screen, and a viewer that ignores them draws what the document asked
+ * it to keep out of sight. */
+enum { PVAnnotFlagHidden = (1 << 1), PVAnnotFlagNoView = (1 << 5) };
+
+static BOOL PVAnnotationIsDrawable(CGPDFDictionaryRef annot)
+{
+    if (!annot) return NO;
+
+    /* A popup is the window belonging to another annotation's note, drawn only
+     * while that note is open and never as part of the page. */
+    const char *subtype = NULL;
+    if (CGPDFDictionaryGetName(annot, "Subtype", &subtype) && subtype &&
+        strcmp(subtype, "Popup") == 0)
+        return NO;
+
+    CGPDFInteger flags = 0;
+    if (CGPDFDictionaryGetInteger(annot, "F", &flags) &&
+        (flags & (PVAnnotFlagHidden | PVAnnotFlagNoView)))
+        return NO;
+
+    /* No /AP is no appearance stream. Link annotations are the common case and
+     * they draw nothing, which is why this is not simply "has annotations". */
+    CGPDFDictionaryRef ap = NULL;
+    if (!CGPDFDictionaryGetDictionary(annot, "AP", &ap) || !ap) return NO;
+
+    /* /N is the appearance stream, or -- for a multi-state annotation such as a
+     * checkbox -- a dictionary of them keyed by /AS. Either has something. */
+    CGPDFObjectRef normal = NULL;
+    if (!CGPDFDictionaryGetObject(ap, "N", &normal) || !normal) return NO;
+
+    CGPDFObjectType type = CGPDFObjectGetType(normal);
+    return (type == kCGPDFObjectTypeStream || type == kCGPDFObjectTypeDictionary);
+}
+
+/* Counters for PV_HELPER_DIAGNOSTICS. Plain statics because the helper serves
+ * one command at a time on one thread, and because the viewer never compiles
+ * this path at all -- PVAnnotationRender is in the helper's object list alone.
+ * Nothing branches on them: a diagnostic that changed behaviour would be a
+ * second code path to reason about, and this file is on the render hot path. */
+static PVAnnotationStats gAnnotStats;
+
+PVAnnotationStats PVAnnotationStatsSnapshot(void)
+{
+    return gAnnotStats;
+}
+
+BOOL PVPageHasDrawableAnnotations(CGPDFPageRef page)
+{
+    if (!page) return NO;
+    CGPDFDictionaryRef dict = CGPDFPageGetDictionary(page);
+    if (!dict) return NO;
+
+    CGPDFArrayRef annots = NULL;
+    if (!CGPDFDictionaryGetArray(dict, "Annots", &annots) || !annots) return NO;
+
+    gAnnotStats.probed++;
+
+    /* The length comes out of the document, so this loop used to be bounded by
+     * nothing at all. Past the cap the page is answered YES unread, which is
+     * the safe direction: a wrong YES costs a slower render, a wrong NO draws
+     * the page blank. See PV_MAX_ANNOTS_SCAN. */
+    size_t count = CGPDFArrayGetCount(annots), i;
+    if (count > PV_MAX_ANNOTS_SCAN) {
+        gAnnotStats.capped++;
+        return YES;
+    }
+
+    for (i = 0; i < count; i++) {
+        CGPDFDictionaryRef annot = NULL;
+        if (CGPDFArrayGetDictionary(annots, i, &annot) &&
+            PVAnnotationIsDrawable(annot))
+            return YES;
+    }
+    return NO;
+}
+
+/* --- The memo table ------------------------------------------------------- */
+/*
+ * Two bits per page, sized at compile time from the same constant the protocol
+ * refuses a longer document with, so nothing the helper is allowed to open can
+ * outgrow it. 25000 bytes of BSS: untouched in a process that never opens an
+ * annotated document, and never allocated, resized or freed.
+ */
+#define PV_ANNOT_MEMO_BYTES ((size_t)((PV_MAX_PDF_PAGES + 3) / 4))
+
+enum { PVAnnotUnknown = 0, PVAnnotClean = 1, PVAnnotNeedsPDFKit = 2 };
+
+static unsigned char gAnnotMemo[PV_ANNOT_MEMO_BYTES];
+static size_t        gAnnotMemoPages;
+
+void PVAnnotationMemoReset(size_t pageCount)
+{
+    if (pageCount > (size_t)PV_MAX_PDF_PAGES) pageCount = (size_t)PV_MAX_PDF_PAGES;
+    gAnnotMemoPages = pageCount;
+    /* Only the prefix in use: a hundred-page document does not pay to clear the
+     * hundred thousand the table could hold. */
+    memset(gAnnotMemo, 0, (pageCount + 3) / 4);
+    memset(&gAnnotStats, 0, sizeof gAnnotStats);
+}
+
+static unsigned PVAnnotMemoGet(size_t page)
+{
+    return (unsigned)((gAnnotMemo[page >> 2] >> ((page & 3u) * 2u)) & 3u);
+}
+
+static void PVAnnotMemoSet(size_t page, unsigned value)
+{
+    unsigned char *slot = &gAnnotMemo[page >> 2];
+    unsigned shift = (unsigned)((page & 3u) * 2u);
+    *slot = (unsigned char)((*slot & ~(3u << shift)) | ((value & 3u) << shift));
+}
+
+BOOL PVPageNeedsAnnotationDraw(CGPDFPageRef page, size_t zeroBasedPage)
+{
+    /* A page outside the table is answered correctly, just not remembered. The
+     * protocol makes that unreachable for a document this helper opened; it is
+     * here so the bound is enforced by arithmetic rather than by trusting a
+     * caller two processes away to have checked. */
+    if (zeroBasedPage >= gAnnotMemoPages)
+        return PVPageHasDrawableAnnotations(page);
+
+    unsigned cached = PVAnnotMemoGet(zeroBasedPage);
+    if (cached != PVAnnotUnknown) {
+        gAnnotStats.memoHits++;
+        return (cached == PVAnnotNeedsPDFKit) ? YES : NO;
+    }
+
+    BOOL needs = PVPageHasDrawableAnnotations(page);
+    PVAnnotMemoSet(zeroBasedPage, needs ? PVAnnotNeedsPDFKit : PVAnnotClean);
+    return needs;
+}
+
+/* Set once, before any render, by the helper's main(). Not synchronised for
+ * that reason: it is written before the first command is read and only read
+ * afterwards. */
+static PVAnnotationDrawHook gAnnotationDrawHook = NULL;
+
+void PVSetAnnotationDrawHook(PVAnnotationDrawHook hook)
+{
+    gAnnotationDrawHook = hook;
+}
+
 PVRenderCoreResult PVRenderPDFPageToBuffer(CGPDFDocumentRef document,
                             NSUInteger zeroBasedPage,
                             CGSize naturalSize,
@@ -162,7 +307,28 @@ PVRenderCoreResult PVRenderPDFPageToBuffer(CGPDFDocumentRef document,
         if (PVFiniteTransformCore(transform)) {
             CGContextConcatCTM(context, transform);
             CGContextClipToRect(context, box);
-            CGContextDrawPDFPage(context, page);
+
+            /* PDFKit draws the content stream AND the annotations, so this
+             * replaces the Quartz draw rather than adding to it -- drawing both
+             * would paint the content twice and compose transparency wrongly.
+             * A NO from the hook means PDFKit was unavailable and nothing was
+             * drawn, so the page still gets its content the ordinary way.
+             *
+             * Spelled out rather than folded into one condition because the
+             * three outcomes are now counted separately, and `needed` differing
+             * from `drawn` is the only signal that a page went out silently
+             * without its annotations. */
+            BOOL drewWithPDFKit = NO;
+            if (gAnnotationDrawHook != NULL &&
+                PVPageNeedsAnnotationDraw(page, (size_t)zeroBasedPage)) {
+                gAnnotStats.needed++;
+                drewWithPDFKit = gAnnotationDrawHook((size_t)zeroBasedPage + 1,
+                                                     box, context);
+                if (drewWithPDFKit) gAnnotStats.drawn++;
+                else                gAnnotStats.declined++;
+            }
+            if (!drewWithPDFKit) CGContextDrawPDFPage(context, page);
+
             result = PVRenderCoreOK;
         }
     } @catch (id exception) {

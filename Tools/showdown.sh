@@ -334,22 +334,67 @@ wait_for_quiet_machine() {
     printf '%s\n' "$idle"; return 1
 }
 
-# Exact CPU seconds from the kernel counter; `ps -o time` is [[HH:]MM:]SS.ss
-cpu_seconds_for() {
-    /bin/ps -o time= -p "$1" 2>/dev/null | /usr/bin/awk '
-        NR==1 { gsub(/^[ \t]+/,"",$0); n=split($1,f,":"); s=0
-                for (i=1;i<=n;i++) s=s*60+f[i]; printf "%.2f", s }'
+# Every pid in the process tree rooted at $1, $1 included, space separated.
+#
+# This exists because the app under test is not one process. Rasterisation moved
+# into a child when the render helper landed, and `ps -o time` reports a
+# process's own utime+stime and never a child's, reaped or not. Reading the
+# viewer's pid alone therefore counted about 3% of what Postview cost while
+# reporting the whole of Preview for Preview -- so the CPU columns were not a
+# comparison at all. ENGINEERING.md 13.2 measured the hole: 3.520 s viewer
+# against 108.069 s of helpers over one run.
+#
+# Applied to both apps or to neither. Preview has children of its own, and
+# fixing one side alone would swap a known bias for a new and unmeasured one.
+#
+# Known limit, worth stating where a reader will meet it: an XPC service is a
+# child of launchd rather than of the app that uses it, so it falls outside this
+# tree for BOTH apps. What this closes is the helper Postview spawns itself with
+# posix_spawn, which is where its rasterisation actually lives.
+tree_pids_for() {
+    /bin/ps -axo pid=,ppid= 2>/dev/null | /usr/bin/awk -v root="$1" '
+        { pid[n] = $1; par[$1] = $2; n++ }
+        END {
+            keep[root] = 1
+            # A few hundred rows and a depth of two or three. Sweeping the table
+            # a fixed number of times is simpler than building an adjacency list
+            # and cannot spin forever on a parent cycle that should not exist.
+            for (pass = 0; pass < 8; pass++)
+                for (i = 0; i < n; i++)
+                    if ((par[pid[i]] in keep) && keep[par[pid[i]]] == 1) keep[pid[i]] = 1
+            for (p in keep) if (keep[p] == 1) printf "%s ", p
+        }'
 }
 
-# Energy Impact and cumulative idle wakeups for one pid, as "power idlew".
-# Both come from the same top invocation so they describe the same instant.
+# Exact CPU seconds from the kernel counter, summed over the tree.
+# `ps -o time` is [[HH:]MM:]SS.ss. Empty -- not zero -- when nothing is alive,
+# so a dead app is distinguishable from an idle one.
+cpu_seconds_for() {
+    _tp_args=""
+    for _tp in $(tree_pids_for "$1"); do _tp_args="$_tp_args -p $_tp"; done
+    [ -n "$_tp_args" ] || return 0
+    /bin/ps -o time= $_tp_args 2>/dev/null | /usr/bin/awk '
+        { gsub(/^[ \t]+/,"",$0); n=split($1,f,":"); s=0
+          for (i=1;i<=n;i++) s=s*60+f[i]; total += s; rows++ }
+        END { if (rows > 0) printf "%.2f", total }'
+}
+
+# Energy Impact and cumulative idle wakeups for the tree, as "power idlew",
+# both summed. One top invocation, so every pid describes the same instant.
 # A machine or OS that declines to report either yields "-", which the analysis
 # treats as missing rather than as zero.
 power_sample_for() {
-    /usr/bin/top -l 1 -n 1 -pid "$1" -stats pid,power,idlew 2>/dev/null | /usr/bin/awk -v p="$1" '
-        $1 == p { pw=$2; iw=$3
-                  if (pw ~ /^[0-9.]+$/ && iw ~ /^[0-9]+$/) { print pw, iw; found=1; exit } }
-        END { if (!found) print "-", "-" }'
+    _tp_args=""; _tp_n=0
+    for _tp in $(tree_pids_for "$1"); do
+        _tp_args="$_tp_args -pid $_tp"; _tp_n=$((_tp_n+1))
+    done
+    [ "$_tp_n" -gt 0 ] || { printf '%s %s\n' "-" "-"; return 0; }
+    # -n must admit every pid asked for; it caps rows, and it used to be 1
+    # because there was only ever one pid.
+    /usr/bin/top -l 1 -n "$_tp_n" $_tp_args -stats pid,power,idlew 2>/dev/null | /usr/bin/awk '
+        $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9.]+$/ && $3 ~ /^[0-9]+$/ {
+            pw += $2; iw += $3; found = 1 }
+        END { if (found) printf "%.2f %d\n", pw, iw; else print "-", "-" }'
 }
 
 document_window_ready() {
@@ -376,6 +421,43 @@ wait_for_document_window() {
         /bin/sleep 0.1; t=$((t+1))
     done
     return 1
+}
+
+# Equalise the ZOOM, not merely the window size.
+#
+# The window has been equalised since the first version; the zoom never was, and
+# the two apps do not default to the same one. Postview opens at fit-WIDTH,
+# which for this document's 432x648 page in a 1200x800 window is about 2.4
+# screenfuls per page. Preview opens at fit-PAGE, which is one. So one Page Down
+# moved Preview a whole page and Postview about four tenths of one, and 80
+# keystrokes travelled 80 pages against 27 -- measured 2026-09-03. The fairness
+# gate caught it and refused a verdict in every keyboard scenario, correctly:
+# nothing was being dropped and nothing was slow, the two apps were simply
+# showing the page at different sizes and therefore doing different work.
+#
+# Fit-page is the common ground because it is the only one both apps have a
+# command for -- Preview has no fit-width. Key codes rather than characters so
+# the layout cannot reinterpret them: 19 = "2" (Postview), 25 = "9" (Preview).
+set_fit_page() {
+    case "$1" in
+        Postview) _fp_key=19 ;;
+        Preview)  _fp_key=25 ;;
+        *)        return 0 ;;
+    esac
+    /usr/bin/osascript - "$1" "$_fp_key" <<'AS' >/dev/null 2>&1
+on run argv
+    set appName to item 1 of argv
+    set kc to (item 2 of argv) as integer
+    tell application "System Events"
+        tell process appName
+            set frontmost to true
+            delay 0.3
+            key code kc using command down
+        end tell
+    end tell
+end run
+AS
+    /bin/sleep 0.8
 }
 
 set_window_size() {
@@ -660,7 +742,14 @@ quit_app() {
 samples=0; rss_peak=0; rss_sum=0; pw_sum=0; pw_peak=0; pw_n=0
 reset_samples() { samples=0; rss_peak=0; rss_sum=0; pw_sum=0; pw_peak=0; pw_n=0; }
 sample_process() {
-    r=$(/bin/ps -o rss= -p "$1" 2>/dev/null | /usr/bin/awk 'NR==1 { print $1 }')
+    # Summed over the tree, for the reason in tree_pids_for(). Resident pages
+    # shared between parent and child are counted twice by this, which is the
+    # same overstatement both apps get and still far closer than charging the
+    # viewer alone for bitmaps the helper is holding.
+    _tp_args=""
+    for _tp in $(tree_pids_for "$1"); do _tp_args="$_tp_args -p $_tp"; done
+    r=$([ -n "$_tp_args" ] && /bin/ps -o rss= $_tp_args 2>/dev/null | /usr/bin/awk '
+        { total += $1; rows++ } END { if (rows > 0) print total }')
     case "$r" in ''|*[!0-9]*) ;; *)
         samples=$((samples+1)); rss_sum=$((rss_sum+r))
         [ "$r" -gt "$rss_peak" ] && rss_peak=$r ;;
@@ -830,6 +919,10 @@ run_trial() {
     [ -n "$winsize" ] || winsize="unknown"
     /bin/sleep 1                        # let the resize settle before measuring
 
+    # Same window AND same zoom, or the keystroke counts are not the same
+    # workload. See set_fit_page().
+    set_fit_page "$process"
+
     # Before the clock starts, and before any input is sent: the position an app
     # opens at decides which pages it rasterises, and the cost of a page varies
     # by up to 59x with its content. Checked every trial rather than trusted to
@@ -987,6 +1080,34 @@ selftest() {
 
     v=$(cpu_seconds_for 999999)
     ok "$([ -z "$v" ] && echo 1 || echo 0)" "cpu_seconds_for() is empty for a dead pid, not garbage"
+
+    # --- the tree, which is the whole of ENGINEERING.md 13.2's fifth fault ---
+    v=$(tree_pids_for $$ | /usr/bin/tr ' ' '\n' | /usr/bin/grep -c "^$$$")
+    ok "$([ "$v" = "1" ] && echo 1 || echo 0)" "tree_pids_for() includes the root itself"
+
+    /bin/sh -c 'sleep 4' &
+    _kid=$!
+    v=$(tree_pids_for $$ | /usr/bin/tr ' ' '\n' | /usr/bin/grep -c "^$_kid$")
+    ok "$([ "$v" = "1" ] && echo 1 || echo 0)" "tree_pids_for() finds a spawned child"
+    kill "$_kid" 2>/dev/null; wait "$_kid" 2>/dev/null
+
+    # The fault itself: a child's CPU is never the parent's, so the viewer-only
+    # reading missed the render helper -- 97% of what Postview spends. Burn CPU
+    # in a live child and check the reading grows by it.
+    /bin/sh -c 'i=0; while [ $i -lt 100000000 ]; do i=$((i+1)); done' &
+    _burner=$!
+    sleep 2
+    _own=$(/bin/ps -o time= -p $$ 2>/dev/null | /usr/bin/awk '
+        NR==1 { gsub(/^[ \t]+/,"",$0); n=split($1,f,":"); s=0
+                for (i=1;i<=n;i++) s=s*60+f[i]; printf "%.2f", s }')
+    _tree=$(cpu_seconds_for $$)
+    kill "$_burner" 2>/dev/null; wait "$_burner" 2>/dev/null
+    ok "$(/usr/bin/awk -v o="$_own" -v t="$_tree" 'BEGIN { print (t > o + 0.5) ? 1 : 0 }')" \
+       "cpu_seconds_for() counts a live child's CPU, not just the viewer's"
+
+    _r0=0; _rss_probe() { samples=0; rss_sum=0; rss_peak=0; sample_process "$1"; _r0=$rss_peak; }
+    _rss_probe $$
+    ok "$([ "$_r0" -gt 0 ] && echo 1 || echo 0)" "sample_process() sums resident memory over the tree"
 
     set -- $(power_sample_for $$)
     ok "$([ "$#" -eq 2 ] && echo 1 || echo 0)" "power_sample_for() returns two fields"

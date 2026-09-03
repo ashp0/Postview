@@ -9,7 +9,7 @@
 //
 //  One binary, one subcommand per suite:
 //
-//    pvsuite unit   <pdf> [rotation.pdf] [real.pdf]   make test
+//    pvsuite unit   <pdf> [rotation.pdf] [annot.pdf] [real.pdf]   make test
 //    pvsuite ui     <pdf> <outdir>                    make uitest
 //    pvsuite soak   <pdf> [cycles]                    make soak / make leakcheck
 //    pvsuite stress <pdf> [scale]                     make stress
@@ -2217,6 +2217,38 @@ static const char *DarkQuadrant(CGImageRef img)
     return (cx < 0.5) ? "bottom-left" : "bottom-right";
 }
 
+// Defined far below, next to the rendering checks that were written first.
+static double InkFraction(CGImageRef img);
+
+// Content carried by annotations, which CGContextDrawPDFPage does not draw.
+//
+// Through PVPDFSource, so this exercises the whole pipeline -- the helper
+// process, PVPageHasDrawableAnnotations, and the dlopen'd PDFKit path -- rather
+// than the predicate on its own. The fixture's page draws nothing and its
+// annotation paints a black square over exactly a quarter of it, so the answer
+// is 25% if annotations are drawn and 0% if they are not.
+static void TestAnnotations(NSString *path)
+{
+    printf("\n[annotation content — a page whose ink is all in /Annots]\n");
+    NSError *err = nil;
+    PVPDFSource *src = [[PVPDFSource alloc] initWithURL:[NSURL fileURLWithPath:path]
+                                                  error:&err];
+    if (!src) { OK(NO, "annotation fixture opened"); return; }
+    OK([src pageCount] == 1, "annotation fixture has 1 page");
+
+    CGImageRef im = [src createImageForPage:0 pixelSize:CGSizeMake(200, 200)];
+    if (!im) { OK(NO, "annotated page rendered"); [src release]; return; }
+
+    double ink = InkFraction(im);
+    char msg[160];
+    snprintf(msg, sizeof msg,
+             "the annotation is drawn (ink %.1f%%, blank before this fix)", ink * 100.0);
+    OK(ink > 0.20 && ink < 0.30, msg);
+
+    CGImageRelease(im);
+    [src release];
+}
+
 static void TestRotation(NSString *path)
 {
     printf("\n[page rotation — /Rotate 0, 90, 180, 270]\n");
@@ -4055,7 +4087,7 @@ static void TestCostAwareEviction(void)
 static int RunUnit(int argc, const char *argv[])
 {
     @autoreleasepool {
-        if (argc < 2) { fprintf(stderr, "usage: pvsuite unit <test.pdf> [rotation.pdf] [real.pdf]\n"); return 2; }
+        if (argc < 2) { fprintf(stderr, "usage: pvsuite unit <test.pdf> [rotation.pdf] [annot.pdf] [real.pdf]\n"); return 2; }
         [NSApplication sharedApplication];   // AppKit needs this before views exist
 
         NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:argv[1]]];
@@ -4095,7 +4127,10 @@ static int RunUnit(int argc, const char *argv[])
         TestSmoothScrollPolicy();
         TestScenarioReplay();
         if (argc > 2) TestRotation([NSString stringWithUTF8String:argv[2]]);
-        if (argc > 3) TestArbitrary([NSString stringWithUTF8String:argv[3]]);
+        if (argc > 3) TestAnnotations([NSString stringWithUTF8String:argv[3]]);
+        // Last, because REALPDF is optional: an empty expansion must not shift
+        // a fixture that is always generated into somebody else's slot.
+        if (argc > 4) TestArbitrary([NSString stringWithUTF8String:argv[4]]);
 
         printf("\n%d passed, %d failed\n", gPass, gFail);
         // The fixture source, handed back. A leak in the harness is small, but

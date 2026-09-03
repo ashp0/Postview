@@ -21,6 +21,7 @@
 #import <Foundation/Foundation.h>
 #import "PVRenderProtocol.h"
 #import "PVRenderCore.h"
+#import "PVAnnotationRender.h"
 #include <sys/mman.h>
 #include <sys/mount.h>        // fstatfs, for the copier's headroom check
 #include <sys/socket.h>       // recvmsg, SCM_RIGHTS
@@ -32,6 +33,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
+#include <stdio.h>            // fprintf, for the diagnostics line below
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
@@ -371,6 +373,32 @@ static BOOL PVSendGeometry(CGPDFDocumentRef document, size_t pageCount)
     return YES;
 }
 
+// What the annotation path did, on the way out, and only when asked.
+//
+// Guarded by the environment variable PVHelperKeepsDiagnostics already uses --
+// which is more than a convention here, because a helper is spawned with an
+// EMPTY environment unless diagnostics are on. In a shipping run getenv returns
+// NULL and this costs one lookup per process, once, at exit.
+//
+// `needed` against `drawn` is the pair worth reading. They should be equal; a
+// gap is pages that wanted PDFKit, did not get it, and went out without their
+// annotations. That is the silent blank-page failure PVAnnotationRender.h
+// exists to prevent, and nothing else in the system would report it.
+static void PVReportAnnotationStats(void)
+{
+    const char *value = getenv("PV_HELPER_DIAGNOSTICS");
+    if (!(value && *value && strcmp(value, "0") != 0)) return;
+
+    PVAnnotationStats stats = PVAnnotationStatsSnapshot();
+    if (stats.probed == 0 && stats.memoHits == 0) return;
+
+    fprintf(stderr,
+            "[postview-helper] annotations: probed=%lu memo_hits=%lu "
+            "needed=%lu drawn=%lu declined=%lu capped=%lu\n",
+            stats.probed, stats.memoHits, stats.needed,
+            stats.drawn, stats.declined, stats.capped);
+}
+
 // Adopt the priority one command asked for, and say whether it was changed.
 //
 // Entering and leaving Darwin's background class is a cheap, per-process,
@@ -450,6 +478,12 @@ int main(int argc, const char *argv[])
         document = url ? CGPDFDocumentCreateWithURL((CFURLRef)url) : NULL;
         alarm(0);
 
+        /* Installed before any command is read, so no render can race it.
+         * Costs one string copy: PDFKit is not loaded here, only on the first
+         * page that turns out to carry annotations. See PVAnnotationRender.h. */
+        if (document)
+            PVInstallAnnotationDrawHook([NSString stringWithUTF8String:argv[1]]);
+
         if (document) {
             alarm(PV_OPEN_ALARM_SECONDS);
             BOOL locked = (CGPDFDocumentIsEncrypted(document) &&
@@ -467,6 +501,11 @@ int main(int argc, const char *argv[])
                 open.status = PVRenderOpenOK;
                 open.pageCount = (uint64_t)pageCount;
                 if (wantGeometry) open.geometryCount = (uint32_t)pageCount;
+                /* The annotation verdict table, cleared for exactly the pages
+                 * this document has. Sized at compile time, so this is a memset
+                 * and not an allocation -- there is no failure to handle and
+                 * nothing to undo on any path below. */
+                PVAnnotationMemoReset(pageCount);
             }
         }
     }
@@ -616,6 +655,7 @@ int main(int argc, const char *argv[])
             if (!PVWriteExact(STDOUT_FILENO, &reply, sizeof(reply))) break;
         }
     }
+    PVReportAnnotationStats();
     CGPDFDocumentRelease(document);
     return 0;
 }

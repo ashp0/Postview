@@ -52,10 +52,16 @@ MIN      := 10.9
 # application's object list and linked on its own below.
 HELPER          := PostviewRenderHelper
 HELPER_MAIN     := Sources/PVRenderHelperMain.m
+# Compiled into the helper and NOT into the application. PVAnnotationRender is
+# the PDFKit path for annotated pages: it links nothing and loads Quartz only on
+# the first page that needs it, but it has no business in the viewer, which does
+# not rasterise. Filtered out of SOURCES so the application cannot grow a
+# dependency on it by accident.
+HELPER_ONLY     := $(HELPER_MAIN) Sources/PVAnnotationRender.m
 ALL_SOURCES     := $(wildcard Sources/*.m)
-SOURCES         := $(filter-out $(HELPER_MAIN),$(ALL_SOURCES))
+SOURCES         := $(filter-out $(HELPER_ONLY),$(ALL_SOURCES))
 OBJECTS         := $(patsubst Sources/%.m,$(BUILD)/%.o,$(SOURCES))
-HELPER_SOURCES  := $(HELPER_MAIN) Sources/PVRenderCore.m
+HELPER_SOURCES  := $(HELPER_MAIN) Sources/PVRenderCore.m Sources/PVAnnotationRender.m
 HELPER_OBJECTS  := $(patsubst Sources/%.m,$(BUILD)/helper-%.o,$(HELPER_SOURCES))
 
 # Resources copied into the bundle, listed rather than globbed. A wildcard that
@@ -609,8 +615,9 @@ $(BUILD)/pvstatecontend: Tests/pvstatecontend.m $(OBJECTS) | $(BUILD)
 test: $(SUITE)
 	@test -n "$(PYTHON)" || { echo "FAIL: no python interpreter found"; exit 1; }
 	@$(PYTHON) Tests/make_rotation_fixture.py $(BUILD)/rotation.pdf >/dev/null
+	@$(PYTHON) Tests/make_annot_fixture.py $(BUILD)/annot.pdf >/dev/null
 	$(mkheavy)
-	@$(SUITE) unit $(PDF) $(BUILD)/rotation.pdf $(REALPDF)
+	@$(SUITE) unit $(PDF) $(BUILD)/rotation.pdf $(BUILD)/annot.pdf $(REALPDF)
 
 # Drives a real PVWindowController and snapshots it, so the sidebar, page
 # jumping and position saving are verified without needing Accessibility
