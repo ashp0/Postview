@@ -3,8 +3,6 @@
 #import "PVWelcomeWindowController.h"
 #import "PVDropView.h"
 
-static NSString * const PVToolbarSidebar = @"PVToolbarSidebar";
-static NSString * const PVToolbarZoom    = @"PVToolbarZoom";
 
 // One height for every toolbar control, and one padding around the icon inside
 // it. Stating them once is what keeps the items looking like a set: the
@@ -19,6 +17,10 @@ static NSString * const PVToolbarZoom    = @"PVToolbarZoom";
 // on the system that is actually drawing it, at whatever display scale.
 #define PV_TOOLBAR_ITEM_H     25.0
 #define PV_TOOLBAR_ICON       18.0   // the artwork's own size, in points
+// The title bar is 22 points on 10.9 and the controls have to live inside it,
+// bezel and all, so they are a size down from what a toolbar row would allow.
+#define PV_TITLEBAR_ITEM_H    16.0
+#define PV_TITLEBAR_ICON      12.0
 
 static const CGFloat kZoomSteps[] = {
     0.25, 0.33, 0.50, 0.67, 0.75, 1.00, 1.25, 1.50, 2.00, 3.00, 4.00
@@ -280,12 +282,21 @@ static BOOL PVPageOverlapsColumn(NSRect page, NSRect viewport)
     [_splitView addSubview:_scrollView];
     [[window contentView] addSubview:_splitView];
 
-    NSToolbar *toolbar = [[[NSToolbar alloc] initWithIdentifier:@"PVToolbar"] autorelease];
-    [toolbar setDelegate:self];
-    [toolbar setAllowsUserCustomization:NO];
-    [toolbar setDisplayMode:NSToolbarDisplayModeIconOnly];
-    [toolbar setSizeMode:NSToolbarSizeModeSmall];
-    [window setToolbar:toolbar];
+    // No NSToolbar. Two controls do not need a band of their own.
+    //
+    // A toolbar on 10.9 is a SECOND strip of chrome below the title bar -- call
+    // it 38 points of window given over to holding three small buttons, on a
+    // machine whose screen is 800 points tall. Every one of those points is a
+    // point the page does not get, and this application's whole argument is
+    // that the page should get them.
+    //
+    // 10.9 has no API for merging the two: -[NSWindow setTitleVisibility:] and
+    // NSFullSizeContentViewWindowMask are both 10.10. So the controls are added
+    // to the view that already holds the standard window buttons. Every call
+    // that takes is public and has been since 10.0 -- -standardWindowButton:,
+    // -superview, -addSubview: -- and nothing here asks what class that view
+    // is or assumes anything about it beyond its bounds.
+    [self installTitleBarControls];
 
     // The proxy icon, and the document's own name in the title bar. Both come
     // free with the represented URL and are what make the window read as a
@@ -355,7 +366,7 @@ static BOOL PVPageOverlapsColumn(NSRect page, NSRect viewport)
         // view tree stays alive until -dealloc; it simply stops being the
         // window's, so -dealloc is what finally frees it.
         [_splitView removeFromSuperview];
-        [w setToolbar:nil];
+        [self removeTitleBarControls];
 
         // Same argument as the toolbar, for the same reason: a window AppKit
         // will not let go of should not go on holding a document icon for a
@@ -377,6 +388,8 @@ static BOOL PVPageOverlapsColumn(NSRect page, NSRect viewport)
     [_thumbCache release];
     [_thumbSource release];
     [_splitView release];
+    [_titleBarSidebar release];
+    [_titleBarZoom release];
     [_pageView release];
     [_scrollView release];
     [_pageQueue release];
@@ -479,6 +492,14 @@ static BOOL PVPageOverlapsColumn(NSRect page, NSRect viewport)
     // actually rebuilds the frames either way.
     [_pageView setColumns:_columns];
     [_pageView setCover:_cover];
+    // Page-at-a-time keys belong to Fit Page and to nothing else. In Fit Page
+    // the whole page is on screen, so a downward key can only sensibly mean the
+    // next page; in every other mode the page is larger than the window and
+    // scrolling by a fraction of the viewport is exactly what a reader wants.
+    // Stated here, on the one path that settles the geometry, for the same
+    // reason the column count and the cover flag are -- so the view's idea of
+    // the layout and the controller's cannot drift apart.
+    [_pageView setSnapToPages:(_zoomMode == PVZoomModeFitPage)];
     [_pageView setZoom:z
           backingScale:[self backingScale]
         containerWidth:[self viewportSize].width];
@@ -2675,138 +2696,132 @@ static double PVTransientBackoff(unsigned attempts)
     return YES;
 }
 
-#pragma mark - Toolbar
+#pragma mark - Title bar controls
 
-// Two items, leading-aligned, and nothing else -- the same shape Preview has.
+// The two controls, built the same way so they read as one set.
 //
-// This used to be five: the two controls, a page field, and a pair of flexible
-// spaces with an inert counterweight to balance them, all of it there to hold
-// the page field in the middle of the window across a decade of AppKit. The
-// page number now lives in the window title, where the system centres it for
-// free and it does not have to look like a control at all, so the entire
-// apparatus went with it -- including -setCenteredItemIdentifier:, which
-// existed only to keep that one item centred from Big Sur onwards.
-- (NSArray *)toolbarDefaultItemIdentifiers:(NSToolbar *)toolbar
+// Both are textured segmented controls, including the single-segment sidebar
+// button, and that is not cosmetic on Mavericks: a textured NSButton bezel is
+// taller there than a textured NSSegmentedControl bezel, so a button beside a
+// segmented control is a button that does not line up with it, whatever frame
+// either one is given.
+//
+// Control size is set through the CELL. -[NSControl setControlSize:] arrived in
+// 10.10 and the deployment target is 10.9; the cell has carried it since 10.0
+// and is what the newer method forwards to, so this is the same setting under
+// its older name.
+- (NSSegmentedControl *)newTitleBarSegmentsWithCount:(NSInteger)count
 {
-    // Two items, and nothing to arrange them with.
-    //
-    // Where they end up is the system's decision and differs by release: 10.9
-    // puts the title on its own row and packs the items from the left, while
-    // macOS 11 and later share one row, give the leading region to the title
-    // and lay the items out trailing. Both are that release's own convention,
-    // and each looks right on the system that chose it.
-    //
-    // Measured rather than assumed, because this is where the old toolbar
-    // spent most of its complexity. With the items alone AppKit places them at
-    // x=788 in a 900-point window on macOS 26 and hard left on 10.9; a
-    // trailing flexible space moves that to 780, which is to say it does
-    // nothing except add an item. The only setting that forces them leading on
-    // a current system is the preference-window toolbar style, which also
-    // takes the document title out of the title bar -- a considerably worse
-    // trade than letting each release place two buttons where it puts
-    // everyone else's.
-    return [NSArray arrayWithObjects:PVToolbarSidebar, PVToolbarZoom, nil];
-}
-- (NSArray *)toolbarAllowedItemIdentifiers:(NSToolbar *)toolbar
-{
-    return [self toolbarDefaultItemIdentifiers:toolbar];
+    NSSegmentedControl *c = [[NSSegmentedControl alloc] initWithFrame:
+        NSMakeRect(0, 0, (CGFloat)count * (PV_TITLEBAR_ICON + 14), PV_TITLEBAR_ITEM_H)];
+    [c setSegmentCount:count];
+    [c setSegmentStyle:NSSegmentStyleTexturedRounded];
+    [[c cell] setControlSize:NSMiniControlSize];
+    [[c cell] setTrackingMode:NSSegmentSwitchTrackingMomentary];
+    NSInteger i;
+    for (i = 0; i < count; i++) [c setWidth:(PV_TITLEBAR_ICON + 14) forSegment:i];
+    return c;
 }
 
-// Give a control its natural width and the one standard toolbar height.  The
-// custom-item wrapper makes AppKit's layout deterministic across releases;
-// explicitly applying the height to the child itself matters on Mavericks,
-// where different control classes otherwise draw at different native heights
-// even inside equal-sized wrappers.
-static NSView *PVToolbarBox(NSControl *control)
+- (NSSegmentedControl *)newSidebarControl
 {
-    [control sizeToFit];
-    NSRect f = [control frame];
-    f.size.height = PV_TOOLBAR_ITEM_H;
-    f.origin = NSZeroPoint;
-    [control setFrame:f];
-
-    NSView *box = [[[NSView alloc] initWithFrame:
-        NSMakeRect(0, 0, f.size.width, PV_TOOLBAR_ITEM_H)] autorelease];
-    [box addSubview:control];
-    return box;
+    NSSegmentedControl *b = [self newTitleBarSegmentsWithCount:1];
+    NSImage *icon = PVToolbarImageNamed(@"TB_contentAndThumbs");
+    // A missing asset must not ship a blank button.
+    if (icon) [b setImage:icon forSegment:0];
+    else      [b setLabel:@"Pages" forSegment:0];
+    [b setTarget:self];
+    [b setAction:@selector(toggleSidebar:)];
+    [b setToolTip:@"Show or hide page thumbnails"];
+    return b;
 }
 
-- (NSToolbarItem *)toolbar:(NSToolbar *)toolbar
-     itemForItemIdentifier:(NSString *)identifier
- willBeInsertedIntoToolbar:(BOOL)flag
+- (NSSegmentedControl *)newZoomControl
 {
-    NSToolbarItem *item = [[[NSToolbarItem alloc] initWithItemIdentifier:identifier] autorelease];
-
-    if ([identifier isEqualToString:PVToolbarSidebar]) {
-        // One segment of the same control class and style as the +/- item.
-        // Besides making the two controls a visual set, this removes the
-        // Mavericks-only mismatch where a textured NSButton bezel was taller
-        // than a textured NSSegmentedControl bezel.
-        NSSegmentedControl *b = [[[NSSegmentedControl alloc] initWithFrame:
-            NSMakeRect(0, 0, PV_TOOLBAR_ICON + 16, PV_TOOLBAR_ITEM_H)] autorelease];
-        [b setSegmentCount:1];
-        [b setSegmentStyle:NSSegmentStyleTexturedRounded];
-        // Through the cell, not the control: -[NSControl setControlSize:] was
-        // only added in 10.10, and the deployment target is 10.9. The cell has
-        // carried it since 10.0 and is what the newer control method forwards
-        // to, so this is the same setting by its older name.
-        [[b cell] setControlSize:NSSmallControlSize];
-        [[b cell] setTrackingMode:NSSegmentSwitchTrackingMomentary];
-        NSImage *icon = PVToolbarImageNamed(@"TB_contentAndThumbs");
-        if (icon) {
-            [b setImage:icon forSegment:0];
-        } else {
-            // A missing asset must not ship a blank button.
-            [b setLabel:@"Pages" forSegment:0];
-        }
-        [b setWidth:(PV_TOOLBAR_ICON + 16) forSegment:0];
-        [b setTarget:self];
-        [b setAction:@selector(toggleSidebar:)];
-        [item setView:PVToolbarBox(b)];
-        [item setLabel:@"Thumbnails"];
-        [item setPaletteLabel:@"Thumbnails"];
-        [item setToolTip:@"Show or hide page thumbnails"];
-
-    } else if ([identifier isEqualToString:PVToolbarZoom]) {
-        NSSegmentedControl *seg =
-            [[[NSSegmentedControl alloc] initWithFrame:
-                NSMakeRect(0, 0, 2 * (PV_TOOLBAR_ICON + 14), PV_TOOLBAR_ITEM_H)] autorelease];
-        [seg setSegmentCount:2];
-        [seg setSegmentStyle:NSSegmentStyleTexturedRounded];
-        [[seg cell] setControlSize:NSSmallControlSize];
-        [[seg cell] setTrackingMode:NSSegmentSwitchTrackingMomentary];
-
-        NSImage *out = PVToolbarImageNamed(@"TB_zoomOut");
-        NSImage *in  = PVToolbarImageNamed(@"TB_zoomIn");
-        if (out && in) {
-            [seg setImage:out forSegment:0];
-            [seg setImage:in  forSegment:1];
-        } else {
-            [seg setLabel:@"\u2212" forSegment:0];
-            [seg setLabel:@"+"       forSegment:1];
-        }
-        // Width per segment stated, height left to the control: the bezel is
-        // the part that was being clipped, and only the control knows how much
-        // of it there is on the system in front of it.
-        [seg setWidth:(PV_TOOLBAR_ICON + 14) forSegment:0];
-        [seg setWidth:(PV_TOOLBAR_ICON + 14) forSegment:1];
-        [seg setTarget:self];
-        [seg setAction:@selector(zoomSegmentChanged:)];
-        [item setView:PVToolbarBox(seg)];
-        [item setLabel:@"Zoom"];
-        [item setPaletteLabel:@"Zoom"];
-        [item setToolTip:@"Zoom out or in"];
+    NSSegmentedControl *seg = [self newTitleBarSegmentsWithCount:2];
+    NSImage *out = PVToolbarImageNamed(@"TB_zoomOut");
+    NSImage *in  = PVToolbarImageNamed(@"TB_zoomIn");
+    if (out && in) {
+        [seg setImage:out forSegment:0];
+        [seg setImage:in  forSegment:1];
+    } else {
+        [seg setLabel:@"\u2212" forSegment:0];
+        [seg setLabel:@"+"       forSegment:1];
     }
+    [seg setTarget:self];
+    [seg setAction:@selector(zoomSegmentChanged:)];
+    [seg setToolTip:@"Zoom out or in"];
+    return seg;
+}
 
-    NSView *v = [item view];
-    if (v) {
-        // Pin the size explicitly. A custom-view NSToolbarItem with no
-        // min/max size is laid out by rules that have changed several times
-        // between 10.9 and 26; stating the size removes the variable.
-        [item setMinSize:[v frame].size];
-        [item setMaxSize:[v frame].size];
-    }
-    return item;
+- (void)installTitleBarControls
+{
+    NSWindow *window = [self window];
+    if (!window) return;
+    // The view that already owns the close/minimise/zoom buttons. A window
+    // without them is a window with nowhere to put these, and that is a
+    // reason to do nothing rather than to guess at a superview.
+    NSView *chrome = [[window standardWindowButton:NSWindowCloseButton] superview];
+    if (!chrome) return;
+
+    if (!_titleBarSidebar) _titleBarSidebar = [self newSidebarControl];
+    if (!_titleBarZoom)    _titleBarZoom    = [self newZoomControl];
+    if (!_titleBarSidebar || !_titleBarZoom) return;
+
+    [chrome addSubview:_titleBarSidebar];
+    [chrome addSubview:_titleBarZoom];
+    [self layoutTitleBarControls];
+}
+
+- (void)layoutTitleBarControls
+{
+    NSWindow *window = [self window];
+    if (!window || !_titleBarSidebar || !_titleBarZoom) return;
+    NSView *chrome = [_titleBarSidebar superview];
+    if (!chrome) return;
+
+    // The title bar's height, asked of the window rather than assumed. The
+    // difference between the frame and the content rect is the one definition
+    // that stays true across style masks and releases; 22 is what it happens
+    // to be here, and hard-coding it would be hard-coding this window.
+    NSRect frameRect   = [window frame];
+    NSRect contentRect = [window contentRectForFrameRect:frameRect];
+    CGFloat barHeight  = NSMaxY(frameRect) - NSMaxY(contentRect);
+    if (!(barHeight > 0)) return;
+
+    // Placed from the traffic lights outwards, measured rather than assumed,
+    // so a system that spaces those differently pushes these along instead of
+    // letting them overlap.
+    NSButton *zoomButton = [window standardWindowButton:NSWindowZoomButton];
+    CGFloat x = zoomButton ? NSMaxX([zoomButton frame]) + 12.0 : 78.0;
+    CGFloat top = NSHeight([chrome bounds]);
+
+    NSRect r = [_titleBarSidebar frame];
+    r.origin.x = x;
+    r.origin.y = top - barHeight + floor((barHeight - NSHeight(r)) / 2.0);
+    [_titleBarSidebar setFrame:r];
+
+    NSRect z = [_titleBarZoom frame];
+    z.origin.x = NSMaxX(r) + 8.0;
+    z.origin.y = r.origin.y;
+    [_titleBarZoom setFrame:z];
+
+    // Fixed distance from the top and the left: the title bar does not move
+    // relative to either when the window is resized, so neither should these.
+    [_titleBarSidebar setAutoresizingMask:(NSViewMaxXMargin | NSViewMinYMargin)];
+    [_titleBarZoom    setAutoresizingMask:(NSViewMaxXMargin | NSViewMinYMargin)];
+}
+
+// Taken off the window at teardown, for the reason -teardownReferences gives
+// about the view tree: AppKit does not release a window that has been on
+// screen, and a control left in its chrome would outlive this controller while
+// still holding it as an unretained target.
+- (void)removeTitleBarControls
+{
+    [_titleBarSidebar setTarget:nil];
+    [_titleBarZoom    setTarget:nil];
+    [_titleBarSidebar removeFromSuperview];
+    [_titleBarZoom    removeFromSuperview];
 }
 
 - (IBAction)zoomSegmentChanged:(id)sender

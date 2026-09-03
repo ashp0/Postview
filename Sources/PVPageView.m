@@ -749,6 +749,71 @@
     [self scrollToY:NSMinY([clip documentVisibleRect]) + dy];
 }
 
+#pragma mark - Page-at-a-time navigation
+
+- (void)setSnapToPages:(BOOL)snap { _snapToPages = snap; }
+- (BOOL)snapToPages               { return _snapToPages; }
+
+- (BOOL)snapToAdjacentRow:(NSInteger)direction
+{
+    if (!_snapToPages || !_laidOut || _pageCount == 0 || direction == 0) return NO;
+
+    NSClipView *clip = [[self enclosingScrollView] contentView];
+    if (!clip) return NO;
+    NSRect vis = [clip documentVisibleRect];
+
+    CGFloat fraction = 0;
+    NSUInteger top = [self pageAtTopOfRect:vis fraction:&fraction];
+    if (top >= _pageCount) return NO;
+    NSUInteger first = [self firstPageOfRowContainingPage:top];
+
+    // Only snap when the row genuinely fits the window.
+    //
+    // Fit Page is a request, not a guarantee: the zoom is clamped at both ends,
+    // so in a very short window the fitted page can still be taller than the
+    // viewport. Jumping a whole row there would skip past content the reader
+    // has never seen, which is worse than the drift this method exists to fix.
+    // Checked against the geometry rather than against the mode flag, because
+    // the geometry is the thing that decides whether anything is hidden.
+    NSRect rowRect = [self rectForRowContainingPage:first];
+    if (NSHeight(rowRect) > NSHeight(vis) + 0.5) return NO;
+
+    NSUInteger target;
+    if (direction > 0) {
+        // Walk to the first page of the NEXT row. Bounded by the widest row
+        // this app can lay out, not by the document: a row holds at most
+        // PV_MAX_PAGE_COLUMNS pages, so a corrupt row table cannot turn this
+        // into a walk over the whole book.
+        NSUInteger probe = first + 1, guard = 0;
+        while (probe < _pageCount && guard < PV_MAX_PAGE_COLUMNS &&
+               [self firstPageOfRowContainingPage:probe] == first) {
+            probe++;
+            guard++;
+        }
+        if (probe >= _pageCount) return NO;      // already on the last row
+        target = probe;
+    } else {
+        if (first == 0) return NO;               // already on the first row
+        target = [self firstPageOfRowContainingPage:first - 1];
+    }
+
+    NSRect targetRect = [self rectForRowContainingPage:target];
+    [self cancelScrollAnimation];
+    // Half the inter-page gap above the target, so a sliver of the gap shows
+    // and the page does not sit flush against the toolbar. The same offset
+    // -scrollToPage:fraction: already uses.
+    //
+    // The margin here MUST be smaller than PV_PAGE_GAP, and that is a
+    // correctness constraint rather than a matter of taste. Leave more than the
+    // gap above the target and the viewport's top edge falls back inside the
+    // PREVIOUS page -- so -pageAtTopOfRect: still answers with that page, the
+    // next press computes the same destination, and the document stops moving
+    // altogether. Tried first with PV_EDGE_GAP (14) against a 12-point gap,
+    // which is exactly two points too many: Page Down became a no-op.
+    [self scrollToY:NSMinY(targetRect) - PV_PAGE_GAP / 2.0];
+    return YES;
+}
+
 #pragma mark - Animated scrolling
 
 - (BOOL)isScrollAnimating { return _scrollTimer != nil; }
@@ -951,13 +1016,25 @@
     // -- and every key that falls through to -super, which is most of them --
     // was paying for an answer that could not change what it did.
 
+    // In Fit Page every one of these means a PAGE, because the whole page is
+    // already on screen and there is nothing left to scroll within it. Each
+    // falls through to the ordinary scroll when snapping declines -- at the
+    // ends of the document, or when the fitted page does not actually fit.
     switch (c) {
-        case ' ':                       [self scrollByPoints:shift ? -page : page]; return;
-        case NSPageDownFunctionKey:     [self scrollByPoints:page];   return;
-        case NSPageUpFunctionKey:       [self scrollByPoints:-page];  return;
+        case ' ':
+            if ([self snapToAdjacentRow:(shift ? -1 : 1)]) return;
+            [self scrollByPoints:shift ? -page : page]; return;
+        case NSPageDownFunctionKey:
+            if ([self snapToAdjacentRow:1]) return;
+            [self scrollByPoints:page];   return;
+        case NSPageUpFunctionKey:
+            if ([self snapToAdjacentRow:-1]) return;
+            [self scrollByPoints:-page];  return;
         case NSDownArrowFunctionKey:
+            if ([self snapToAdjacentRow:1]) return;
             [self scrollByPoints:line  animated:[self shouldAnimateScroll]]; return;
         case NSUpArrowFunctionKey:
+            if ([self snapToAdjacentRow:-1]) return;
             [self scrollByPoints:-line animated:[self shouldAnimateScroll]]; return;
         case NSHomeFunctionKey:         [self scrollByPoints:-1e9];   return;
         case NSEndFunctionKey:          [self scrollByPoints:1e9];    return;

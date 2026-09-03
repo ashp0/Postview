@@ -9,7 +9,7 @@
 
 @interface PVWindowController : NSWindowController
     <PVRenderQueueDelegate, PVThumbStripDelegate, PVPageViewDelegate,
-     NSToolbarDelegate, NSSplitViewDelegate, NSWindowDelegate>
+     NSSplitViewDelegate, NSWindowDelegate>
 {
     NSURL            *_url;
 
@@ -35,6 +35,12 @@
     BOOL              _haveThumbState;
 
     NSSplitView      *_splitView;
+    // The two controls that used to be a toolbar, now living in the title
+    // bar itself. Retained so teardown can take them off a window AppKit
+    // will not release; their target is this controller, unretained, and a
+    // control left in the chrome would outlive it.
+    NSSegmentedControl *_titleBarSidebar;
+    NSSegmentedControl *_titleBarZoom;
 
     PVZoomMode        _zoomMode;
     CGFloat           _zoom;

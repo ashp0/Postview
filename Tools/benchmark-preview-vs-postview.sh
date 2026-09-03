@@ -47,27 +47,52 @@
 #    the kernel's own counter. The sampled mean and peak are still reported,
 #    because burstiness is worth seeing, but they no longer decide anything.
 #
-# 4. The two apps were not rasterising the same number of pixels. Nothing set
-#    the window size and nothing set the zoom, so each app opened at its own
-#    default -- Postview at fit-WIDTH, Preview at fit-PAGE. For a 432x648 page
-#    that is roughly 2.4 screenfuls against one, so a single Page Down moved
-#    Preview a whole page and Postview about four tenths of one: 80 keystrokes
-#    travelled 80 pages against 27. The keystroke counts matched and the
-#    workloads did not, and because a page costs up to 59x another at identical
-#    pixel counts, every CPU figure produced that way compared two different
-#    jobs. Both windows are now pinned to the same frame and both apps to
-#    fit-page -- the only zoom mode both have a command for, since Preview has
-#    no fit-width. Key codes rather than characters, so the keyboard layout
-#    cannot reinterpret them: 19 = "2" (Postview), 25 = "9" (Preview).
+# 4. The two apps were not rasterising the same number of pixels, and the
+#    reason was not the one an earlier revision of this comment gave.
+#
+#    Both apps in fact OPEN the same way: fit-width. What differs is the page
+#    display mode. Preview opens in Continuous Scroll, where the document is one
+#    unbroken vertical strip, and in that mode its "Zoom to Fit" fits the WIDTH
+#    -- there is no page boundary to fit to. Postview lays out discrete pages,
+#    so its "Fit Page" fits the whole page. Setting the zoom on both therefore
+#    made them DIVERGE: measured on the target by screenshot, Preview stayed at
+#    ~1162 pt of page width against Postview's ~415, about 7.8x the pixel area
+#    per page. The zoom command was not failing. It was succeeding at something
+#    else, and the TSV recorded "fit-page" for both while it happened.
+#
+#    So the display mode is set first: Preview to Single Page, then Zoom to
+#    Fit; Postview to Fit Page. Verified by screenshot -- Preview's page then
+#    measures 517x777 device px against Postview's 507x760.
+#
+#    Set by clicking the menu item BY NAME rather than by sending a shortcut,
+#    because a name is what this script actually means and a keystroke is a
+#    guess at how the app will route it.
 #
 #    Setting it is not achieving it, so it is not trusted. Each trial reads the
 #    page number out of the app's own window title before and after the
-#    workload and records how far it ACTUALLY travelled. At equal zoom one Page
-#    Down advances exactly one page, so `pages_travelled` must equal PAGEDOWNS
-#    in both apps; the summary refuses a verdict when it does not, rather than
-#    averaging two different workloads into a median. This is the fairness
-#    property the whole section exists for, and it is invisible in the CPU
-#    numbers themselves -- which is exactly how it survived four revisions.
+#    workload and records how far it ACTUALLY travelled.
+#
+# 5. Equal keystrokes are not equal work, because the two apps do not scroll the
+#    same distance per press. Measured on the target at an identical window and
+#    an identical fitted page:
+#
+#        Preview   20 presses -> 20 pages     80 presses -> 80 pages
+#        Postview  20 presses -> 19 pages     80 presses -> 76 pages
+#
+#    Both exactly 5% short, which is what identifies the cause. Preview scrolls
+#    by a whole page. Postview scrolls by the VIEWPORT, and it draws a small gap
+#    between pages, so each press advances slightly less than one page and the
+#    shortfall accumulates. It is proportional, not a one-off: a constant
+#    first-press offset would have given 19 and 79, not 19 and 76.
+#
+#    That is a real difference between the two applications, not an artefact to
+#    be cancelled, and it means "80 Page Downs" is not a workload definition.
+#    So the comparison is normalised to what was actually rendered:
+#    `cpu_seconds_per_page` is the figure that names a winner, and the gate now
+#    asks that the two distances agree within TRAVEL_TOLERANCE percent rather
+#    than that either equals PAGEDOWNS. A large divergence still refuses a
+#    verdict, because at very different distances the pages themselves differ
+#    and a per-page average stops meaning anything.
 #
 # What it still does not control for: display brightness, and everything else
 # outside the two processes. That is why the reported metric is the kernel's
@@ -87,6 +112,11 @@ WARMUP=${WARMUP:-1}
 # for comparing render cost at all; see the equalisation note in the header.
 WIN_W=${WIN_W:-1200}
 WIN_H=${WIN_H:-800}
+# How far apart the two apps' travelled distances may be before the
+# comparison is refused. Postview is reproducibly ~5% short of Preview for
+# the reason in item 5; beyond this the two are not reading the same span of
+# the document and a per-page average stops describing one workload.
+TRAVEL_TOLERANCE=${TRAVEL_TOLERANCE:-12}
 CURRENT_APP=""
 CURRENT_PROCESS=""
 TIMEOUT_TICKS=300
@@ -310,47 +340,60 @@ end run
 AS
 }
 
-# Put both apps in fit-page.
+# Put both apps in the same view: ONE WHOLE PAGE, fitted to the window.
 #
-# Fit-page is the common ground because it is the only mode both apps have a
-# command for: Preview has no fit-width, and Postview's own default IS
-# fit-width, so leaving this alone is what produced the 80-pages-against-27
-# mismatch described in the header. Key codes, not characters, so a non-US
-# layout cannot turn Command-2 into something else.
-#   19 = "2"  Postview  (View > Fit Page)
-#   25 = "9"  Preview   (View > Zoom to Fit)
-# Echoes the mode this trial is claiming, for the TSV. It is a claim and not a
-# measurement; pages_travelled below is the measurement that checks it.
+# By MENU ITEM NAME, never by keyboard shortcut.
 #
-# $1 is the app, which chooses the key; $2 is the process, which is what System
-# Events addresses. They are two different names: POSTVIEW_APP is overridable
-# and the process name comes out of whatever bundle it points at, so a build
-# whose executable is not called "Postview" would otherwise have its keystroke
-# sent to a process that does not exist -- silently, since a failed `tell` here
-# would leave the app at its own default zoom and the TSV still saying
-# "fit-page". The travel check would catch it; not having to is better.
+#   * A name says what is meant. A key code says what to press, and leaves the
+#     app to decide what that means -- which is a decision this script has no
+#     visibility into and no business depending on. Postview's View menu has
+#     TWO items on the character "2" (Fit Page at Command-2, Show Thumbnails at
+#     Option-Command-2); they are correctly distinguished by the modifier, but
+#     reading the menu back through the accessibility API shows both as "2"
+#     unless the modifiers are queried too, so a shortcut here is something that
+#     cannot be verified by looking.
+#   * Preview's "Zoom to Fit" means fit-WIDTH while the document is in
+#     Continuous Scroll, because the vertical axis is then one unbroken strip;
+#     it only means "the whole page" once the view is in Single Page. Preview
+#     opens in Continuous Scroll, so sending the zoom command alone left it at
+#     full width -- rendering roughly 7.8x Postview's pixel area per page --
+#     while the script recorded "fit-page" for both. The zoom command was not
+#     failing. It was succeeding at something else.
+#
+# Verified by screenshot on the target: with Single Page set first, Preview's
+# page is 517x777 device px against Postview's 507x760, i.e. the same view.
+#
+# $1 is the app, which chooses the items; $2 is the process, which is what
+# System Events addresses. They are two different names -- POSTVIEW_APP is
+# overridable and the process name comes from whatever bundle it points at.
 set_fit_page() {
     case "$1" in
-        Postview) fit_key=19 ;;
-        Preview)  fit_key=25 ;;
+        Preview)  fp_items='Single Page|Zoom to Fit' ;;
+        Postview) fp_items='Fit Page' ;;
         *)        printf '%s\n' "unset"; return 0 ;;
     esac
-    /usr/bin/osascript - "$2" "$fit_key" <<'AS' >/dev/null 2>&1
+    /usr/bin/osascript - "$2" "$fp_items" <<'AS' >/dev/null 2>&1
 on run argv
-    set appName to item 1 of argv
-    set kc to (item 2 of argv) as integer
+    set procName to item 1 of argv
+    set AppleScript's text item delimiters to "|"
+    set wanted to text items of (item 2 of argv)
+    set AppleScript's text item delimiters to ""
     tell application "System Events"
-        tell process appName
+        tell process procName
             set frontmost to true
             delay 0.3
-            key code kc using command down
+            repeat with nm in wanted
+                click menu item (nm as text) of menu 1 of ¬
+                      menu bar item "View" of menu bar 1
+                delay 0.8
+            end repeat
         end tell
     end tell
 end run
 AS
     if [ "$?" -eq 0 ]; then
-        /bin/sleep 0.8
-        printf '%s\n' "fit-page"
+        /bin/sleep 0.5
+        printf '%s\n' "one-page-fit"
     else
         printf '%s\n' "unset"
     fi
@@ -463,13 +506,39 @@ APPLESCRIPT
 # on where in the process's life the window happens to fall -- which is what
 # sampled %cpu could not offer. `ps -o time` prints [[HH:]MM:]SS.ss.
 cpu_seconds_for() {
-    /bin/ps -o time= -p "$1" 2>/dev/null | /usr/bin/awk '
-        NR == 1 {
-            gsub(/^[ \t]+/, "", $0)
-            n = split($1, f, ":")
+    # The process AND every descendant of it.
+    #
+    # Postview forks PostviewRenderHelper and rasterises there ON PURPOSE, so
+    # the parent's own counter is not its cost -- it is the part of its cost
+    # that happens to be outside the helper. Measured over a 53-second reading
+    # workload on the target: Postview's parent had spent 7.33 s of CPU while
+    # its helper had spent 4.00 s. Counting the parent alone therefore hid 35%
+    # of the work, in the direction that flatters the app under development,
+    # on the one comparison this script exists to make honestly. Preview forks
+    # nothing, so it was measured correctly and Postview was not.
+    #
+    # Walked from each process up to the root rather than one level down, so a
+    # helper that spawns anything of its own is counted too. The walk is bounded
+    # at 32 ancestors: a process tree that deep is a fault, not a document.
+    /bin/ps -axo pid=,ppid=,time= 2>/dev/null | /usr/bin/awk -v root="$1" '
+        {
+            parent[$1] = $2
+            n = split($3, f, ":")
             s = 0
             for (i = 1; i <= n; i++) s = s * 60 + f[i]
-            printf "%.2f", s
+            cpu[$1] = s
+        }
+        END {
+            total = 0
+            for (p in cpu) {
+                q = p
+                for (d = 0; d < 32; d++) {
+                    if (q == root) { total += cpu[p]; break }
+                    if (!(q in parent) || q == "1" || q == "0") break
+                    q = parent[q]
+                }
+            }
+            printf "%.2f", total
         }'
 }
 
@@ -497,7 +566,7 @@ OUTPUT="$PWD/Postview-vs-Preview-$(/bin/date +%Y%m%d-%H%M%S).tsv"
 # Columns 1-10 are the measurement; 11-15 are the evidence that the two apps
 # were given the same job to do. verdict() addresses columns positionally, so
 # the equalisation columns are appended rather than inserted.
-printf 'app\trun\tlaunch_seconds\tpage_down_input_seconds\tcpu_seconds\tmean_cpu_percent\tpeak_cpu_percent\tpeak_rss_kb\tstart_idle_percent\tsamples\twindow_size\tzoom_mode\tstart_page\tend_page\tpages_travelled\n' > "$OUTPUT"
+printf 'app\trun\tlaunch_seconds\tpage_down_input_seconds\tcpu_seconds\tmean_cpu_percent\tpeak_cpu_percent\tpeak_rss_kb\tstart_idle_percent\tsamples\twindow_size\tzoom_mode\tstart_page\tend_page\tpages_travelled\tcpu_seconds_per_page\n' > "$OUTPUT"
 
 # $1 bundle  $2 app name  $3 process name  $4 run label  $5 record? (1/0)
 run_trial() {
@@ -521,7 +590,13 @@ run_trial() {
     trial_name=$(basename "$trial_pdf" .pdf)
 
     started=$(now)
-    /usr/bin/open -n -a "$bundle" "$trial_pdf" || die "could not launch $app"
+    # No -n. It opens a NEW instance every time, and on the target that left two
+    # Preview processes alive at once -- one of them windowless. `pid_for` takes
+    # the first pgrep match, so a run could sample the process that was doing
+    # nothing while the one under test did the work, and report the result with
+    # a straight face. Nothing is running at this point anyway: the script
+    # refuses to start otherwise and quits each app at the end of its trial.
+    /usr/bin/open -a "$bundle" "$trial_pdf" || die "could not launch $app"
     wait_for_document_window "$process" "$trial_name" || die "$app did not show the PDF window within 30 seconds"
     opened=$(now)
     launch=$(elapsed "$started" "$opened")
@@ -575,14 +650,23 @@ run_trial() {
     end_page=$(page_from_title "$(window_title "$process")")
     [ -n "$end_page" ] || end_page="-"
     travelled=$(pages_travelled "$START_PAGE" "$end_page")
+    # The figure that actually names a winner: cost per page rendered, not per
+    # keystroke sent. "-" when the distance could not be read, never 0.
+    if [ "$travelled" = "-" ] || [ "$travelled" -eq 0 ] 2>/dev/null; then
+        cpu_per_page="-"
+    else
+        cpu_per_page=$(/usr/bin/awk -v c="$cpu_used" -v p="$travelled" \
+            'BEGIN { printf "%.4f", c / p }')
+    fi
 
     input_seconds=$(elapsed "$workload_started" "$workload_finished")
     mean_cpu=$(cpu_average)
     if [ "$record" = "1" ]; then
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$app" "$iteration" "$launch" "$input_seconds" "$cpu_used" "$mean_cpu" \
             "$cpu_peak" "$rss_peak" "$start_idle" "$samples" \
-            "$win_size" "$zoom_mode" "$START_PAGE" "$end_page" "$travelled" >> "$OUTPUT"
+            "$win_size" "$zoom_mode" "$START_PAGE" "$end_page" "$travelled" \
+            "$cpu_per_page" >> "$OUTPUT"
         printf '  %-9s run %-7s: window %6.3f s, CPU %6.2f s (avg/peak %5.1f/%5.1f %%), RSS peak %s MB, idle %s%%, %s px %s, moved %s pages\n' \
             "$app" "$iteration" "$launch" "$cpu_used" "$mean_cpu" "$cpu_peak" \
             "$(/usr/bin/awk -v rss="$rss_peak" 'BEGIN { printf "%.1f", rss / 1024.0 }')" \
@@ -633,8 +717,8 @@ verdict() {
 printf 'Postview vs Preview: %s alternating runs, %s Page Down events each\n' "$RUNS" "$PAGEDOWNS"
 printf 'PDF: %s\n' "$PDF"
 printf 'Each trial opens a fresh path, so both apps start at page 1.\n'
-printf 'Both windows are set to %sx%s and both apps to fit-page, and how far the\n' "$WIN_W" "$WIN_H"
-printf 'document actually moved is checked afterwards rather than assumed.\n'
+printf 'Both windows are set to %sx%s and both apps to one whole fitted page, and\n' "$WIN_W" "$WIN_H"
+printf 'how far the document actually moved is checked afterwards rather than assumed.\n'
 printf 'Waiting for >= %s%% system idle before each trial. Do not interact with the Mac.\n\n' "$MIN_IDLE"
 
 warm=1
@@ -662,7 +746,7 @@ done
 # a comparison of two different workloads and mean nothing -- which is the exact
 # failure that made four earlier revisions of this benchmark disagree.
 fairness_gate() {
-    /usr/bin/awk -F '\t' -v want="$PAGEDOWNS" '
+    /usr/bin/awk -F '\t' -v want="$PAGEDOWNS" -v tol="$TRAVEL_TOLERANCE" '
     NR == 1 { next }
     {
         app = $1
@@ -672,23 +756,18 @@ fairness_gate() {
         if ($15 == "-") { blind[app]++; next }
         seen[app]++
         t = $15 + 0
+        sum[app] += t
         if (!(app in lo) || t < lo[app]) lo[app] = t
         if (!(app in hi) || t > hi[app]) hi[app] = t
-        if (t != want + 0) wrong[app]++
     }
     END {
-        # Two different failures, kept apart on purpose. "Unequal" is a fact
-        # about the apps and disqualifies the comparison. "Unverified" is a
-        # limit of this instrument -- the title did not carry a page number --
-        # and disqualifies only the CLAIM of fairness, not the run. Collapsing
-        # them would report a missing measurement as a measured mismatch.
         split("Preview Postview", apps, " ")
         unequal = 0; unverified = 0
         printf "Equalisation check -- were both apps given the same work?\n\n"
         for (k = 1; k <= 2; k++) {
             a = apps[k]
             if (!(a in n)) { printf "  %-9s no trials recorded\n", a; unequal = 1; continue }
-            printf "  %-9s window %-11s zoom %-9s ", a, wsz[a], zsz[a]
+            printf "  %-9s window %-11s zoom %-13s ", a, wsz[a], zsz[a]
             if (wsz[a] == "MIXED" || zsz[a] == "MIXED") unequal = 1
             if (zsz[a] == "unset") unverified = 1
             if (seen[a] == 0) {
@@ -696,22 +775,33 @@ fairness_gate() {
                 unverified = 1
                 continue
             }
-            if (lo[a] == hi[a]) printf "moved %d of %d pages", lo[a], want
-            else                printf "moved %d-%d of %d pages", lo[a], hi[a], want
-            if (wrong[a] > 0) { printf "   <-- %d of %d trials off\n", wrong[a], n[a]; unequal = 1 }
-            else              { printf "   ok\n" }
+            mean[a] = sum[a] / seen[a]
+            if (lo[a] == hi[a]) printf "moved %d pages for %d presses\n", lo[a], want
+            else                printf "moved %d-%d pages for %d presses\n", lo[a], hi[a], want
         }
         if (("Preview" in n) && ("Postview" in n) && wsz["Preview"] != wsz["Postview"]) {
             printf "\n  The two windows did not end up the same size (%s vs %s).\n",
                    wsz["Preview"], wsz["Postview"]
             unequal = 1
         }
+        # The distances are compared to EACH OTHER, not to the keystroke count.
+        # The two apps genuinely scroll different amounts per press; what has to
+        # hold for a per-page average to mean anything is that they covered
+        # comparable spans of the same document.
+        if (("Preview" in mean) && ("Postview" in mean)) {
+            big = (mean["Preview"] > mean["Postview"]) ? mean["Preview"] : mean["Postview"]
+            gap = mean["Preview"] - mean["Postview"]; if (gap < 0) gap = -gap
+            pct = (big > 0) ? 100.0 * gap / big : 0
+            printf "\n  distance apart: %.1f%% (Preview %.1f pages, Postview %.1f pages, tolerance %s%%)\n",
+                   pct, mean["Preview"], mean["Postview"], tol
+            if (pct > tol + 0) unequal = 1
+        }
         if (unequal)
-            printf "\n  NOT COMPARABLE. The two apps rasterised different amounts, so the\n  figures below describe two different workloads and name no winner.\n\n"
+            printf "\n  NOT COMPARABLE. The two apps covered different spans of the document,\n  so no per-page average below describes one workload.\n\n"
         else if (unverified)
             printf "\n  NOT VERIFIED. The window and zoom were set for both apps, but this\n  script could not read back how far the document moved, so equal render\n  load is an assumption here rather than a measurement.\n\n"
         else
-            printf "\n  Same window, same zoom, one page per keystroke in both. Comparable.\n\n"
+            printf "\n  Same window, same fitted page, comparable distance covered.\n  Compare cost PER PAGE below, not per keystroke.\n\n"
         exit (unequal || unverified) ? 0 + unequal + 2 * unverified : 0
     }' "$OUTPUT"
 }
@@ -727,6 +817,7 @@ esac
 printf 'Median and observed range over %s runs (lower is better for every metric):\n\n' "$RUNS"
 verdict "launch to window"   3 "s"  1
 verdict "CPU during workload" 5 "s"  1
+verdict "CPU per page rendered" 16 "s/page" 1
 verdict "peak memory"        8 "MB" 1024
 
 case "$FAIR" in

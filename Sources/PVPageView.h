@@ -104,6 +104,9 @@ typedef struct {
     // A pinch is in progress. Tracked because the two systems this has to run
     // on disagree about how a gesture ends; see -magnifyWithEvent:.
     BOOL           _magnifying;
+    // Fit Page is in force, so a downward key means the next page rather
+    // than the next viewport. See -setSnapToPages:.
+    BOOL           _snapToPages;
 
     // The animated arrow-key scroll, when one is running. See
     // -scrollByPoints:animated: for what each field is for and why the
@@ -201,4 +204,27 @@ typedef struct {
 // Whether one is running. For the tests, which have to be able to tell an
 // animation that was declined from one that finished in the same instant.
 - (BOOL)isScrollAnimating;
+
+// Page-at-a-time navigation, for the mode where a page fits the window.
+//
+// In Fit Page the whole page is on screen, so there is nothing to scroll
+// WITHIN it: every downward key means "the next page" and every upward one
+// means "the previous page". Scrolling by a fraction of the viewport there
+// does not move a reader forward by a page, it moves them forward by a
+// viewport -- and because the layout puts PV_PAGE_GAP between pages and
+// PV_EDGE_GAP around the column, a viewport is not a page. The two drift
+// apart, measured at 4.2% per press, so eighty presses landed on page 77
+// instead of page 81.
+//
+// Set by the controller from the zoom mode, so it is off the moment a reader
+// zooms in -- where scrolling by a fraction of the viewport is exactly right,
+// because then the page is bigger than the window and there IS something to
+// scroll within.
+- (void)setSnapToPages:(BOOL)snap;
+- (BOOL)snapToPages;
+
+// Jump one row forward (+1) or back (-1). NO when snapping is off, when the
+// row does not actually fit the viewport, or when there is nowhere to go --
+// in which case the caller scrolls the ordinary way instead.
+- (BOOL)snapToAdjacentRow:(NSInteger)direction;
 @end
