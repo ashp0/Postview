@@ -2294,6 +2294,32 @@ static double PVTransientBackoff(unsigned attempts)
     NSRect vis = [[_scrollView contentView] documentVisibleRect];
     NSRange range = [_pageView pageRangeInRect:NSMakeRect(pointInView.x, pointInView.y, 1, 1)];
     _magnifyPage = (range.length > 0) ? range.location : [self currentPageWithFraction:NULL];
+    // -pageRangeInRect: answers with a ROW, and its location is the row's FIRST
+    // page. In a single column that is the page under the point and there is
+    // nothing more to do; in a spread it is the left-hand page, and anchoring
+    // there while the fingers are on the right-hand one puts the gutter inside
+    // the fraction below.
+    //
+    // That is precisely the drift -restoreMagnifyAnchor is written to avoid.
+    // Its comment gives the reason -- the gaps are a constant number of points
+    // at every zoom, so anything that scales with the page drags them along --
+    // and the argument applies to the gap ACROSS a row exactly as it does to
+    // the gaps down the document. The vertical case was handled by anchoring on
+    // a page; the horizontal one was not, because the page it anchored on was
+    // the wrong one. Measured before the fix at 12.5 pt of drift across a 2x
+    // pinch, against 0.5 pt in a single column, with PV_PAGE_GAP at 12.0.
+    //
+    // At most PV_MAX_PAGE_COLUMNS iterations, once per gesture. A point in the
+    // gutter or the margin is on no page at all and keeps the row's first page,
+    // which is what it had before and is the best answer available.
+    NSUInteger j;
+    for (j = 0; j < range.length; j++) {
+        NSUInteger candidate = range.location + j;
+        if (NSPointInRect(pointInView, [_pageView rectForPage:candidate])) {
+            _magnifyPage = candidate;
+            break;
+        }
+    }
 
     NSRect r = [_pageView rectForPage:_magnifyPage];
     _magnifyFractionY = (NSHeight(r) > 0) ? (pointInView.y - NSMinY(r)) / NSHeight(r) : 0;

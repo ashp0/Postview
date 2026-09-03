@@ -1128,6 +1128,231 @@ static void TestLayout(PVPDFSource *src)
     }
     OK(aligned, "bitmap pixels map exactly onto device pixels at fractional zoom");
 
+    // ...and what the draw path may conclude from that, which is the half that
+    // was missing. The alignment above is why a cache hit is USUALLY a 1:1
+    // blit; it is not why a cache hit IS one, and -drawRect: read it as the
+    // second. Above PVMaxRenderPixels() the renderer clamps and the cache is
+    // keyed on the size that was ASKED for -- deliberately, or the lookup the
+    // request came from could never be satisfied and the page would be
+    // re-rendered forever -- so the hit hands back a bitmap smaller than the
+    // destination and the blit is a stretch. Choosing kCGInterpolationNone
+    // there is nearest-neighbour applied to the one case that needs resampling.
+    {
+        CGSize ask   = CGSizeMake(1.0e5, 1.0e5);       // above every tier
+        CGSize built = PVClampPixelSize(ask);
+        OK(built.width < ask.width && built.height < ask.height,
+           "a request above the ceiling really is rasterised smaller than asked");
+        OK(!PVBitmapIsPixelExact(built, ask),
+           "a bitmap clamped below its request is not pixel-exact for it");
+        OK(PVBitmapIsPixelExact(built, built),
+           "a bitmap rendered at the size asked for is pixel-exact");
+        OK(PVBitmapIsPixelExact(CGSizeMake(100, 100), CGSizeMake(100.4, 99.6)),
+           "pixel-exactness uses the same half-pixel tolerance the cache does");
+        OK(!PVBitmapIsPixelExact(CGSizeMake(100, 100), CGSizeMake(101, 100)),
+           "a whole pixel of difference is not exact");
+        OK(!PVBitmapIsPixelExact(CGSizeMake(NAN, 100), CGSizeMake(NAN, 100)),
+           "an unreadable size resamples rather than combing the page");
+    }
+
+    // The same thing through the real objects, because the paragraph above is
+    // an argument and this is the sequence. A bitmap of the size the renderer
+    // would actually have produced is stored under the size that was requested,
+    // exactly as the delivery path does it; the lookup then succeeds while the
+    // pixels do not line up. Both halves are asserted, so a future change that
+    // made the cache key the clamped size would fail the first and a change
+    // that made the clamp a no-op would fail the second.
+    {
+        CGSize askPx   = CGSizeMake(1.0e5, 1.0e5);
+        CGSize builtPx = PVClampPixelSize(askPx);
+        // One pixel, tagged as though it were the clamped bitmap. The blit is
+        // never performed here; only the size the draw path reads off it is.
+        CGColorSpaceRef csx = CGColorSpaceCreateDeviceRGB();
+        CGContextRef bc = CGBitmapContextCreate(NULL, (size_t)builtPx.width, 1, 8, 0, csx,
+                                                kCGImageAlphaNoneSkipFirst |
+                                                kCGBitmapByteOrder32Host);
+        CGImageRef stand = bc ? CGBitmapContextCreateImage(bc) : NULL;
+        OK(stand != NULL, "the stand-in bitmap for the clamped-render check was created");
+        if (stand) {
+            PVImageCache *c2 = [[PVImageCache alloc] initWithBudget:PVPageCacheBudget()];
+            [c2 setFullImage:stand pixelSize:askPx forPage:0];
+            CGImageRef hit = [c2 fullImageForPage:0 pixelSize:askPx];
+            OK(hit != NULL,
+               "a page rendered clamped is still found by the request it came from");
+            OK(hit && !PVBitmapIsPixelExact(
+                   CGSizeMake((CGFloat)CGImageGetWidth(hit),
+                              (CGFloat)CGImageGetHeight(hit)), askPx),
+               "...and that hit is not a 1:1 blit, whatever the lookup says");
+            [c2 release];
+            CGImageRelease(stand);
+        }
+        if (bc) CGContextRelease(bc);
+        CGColorSpaceRelease(csx);
+    }
+
+    // And the defect itself, observed rather than argued.
+    //
+    // The two branches differ only in an interpolation quality, which no API
+    // reports back -- but they differ in their OUTPUT, and that can be read off
+    // the pixels. A hard black/white edge blown up by a non-integer ratio comes
+    // out of nearest-neighbour as nothing but pure black and pure white, and
+    // out of any smoothing filter with a band of intermediate greys along the
+    // edge. Counting the greys is therefore a direct reading of which branch
+    // -drawRect: took.
+    //
+    // Reproduced at small scale on purpose. -drawRect: has never heard of
+    // PVMaxRenderPixels(); all it compares is the bitmap it got against the
+    // size it wanted, so a bitmap stored two thirds of the size it is keyed
+    // under exercises exactly the path a real clamped render takes, without a
+    // 67 MB allocation to get there.
+    {
+        PVImageCache *dc = [[PVImageCache alloc] initWithBudget:PVPageCacheBudget()];
+        PVPageView   *dv = [[PVPageView alloc] initWithSource:src cache:dc];
+        [dv setZoom:1.0 backingScale:1.0 containerWidth:900];
+        NSRect  r0   = [dv rectForPage:0];
+        CGSize  want = [dv pixelSizeForPage:0];
+
+        // Two thirds: a ratio that is not a whole number, so every filter that
+        // is not nearest-neighbour must invent a value somewhere.
+        size_t sw = (size_t)floor(want.width  * 2.0 / 3.0);
+        size_t sh = (size_t)floor(want.height * 2.0 / 3.0);
+        CGColorSpaceRef cs2 = CGColorSpaceCreateDeviceRGB();
+        CGContextRef src8 = CGBitmapContextCreate(NULL, sw, sh, 8, 0, cs2,
+                                                  kCGImageAlphaNoneSkipFirst |
+                                                  kCGBitmapByteOrder32Host);
+        CGImageRef stripes = NULL;
+        if (src8) {
+            // Vertical stripes, four pixels on and four off. Pure black and
+            // pure white and nothing in between anywhere in the source.
+            CGContextSetGrayFillColor(src8, 1.0, 1.0);
+            CGContextFillRect(src8, CGRectMake(0, 0, (CGFloat)sw, (CGFloat)sh));
+            CGContextSetGrayFillColor(src8, 0.0, 1.0);
+            size_t sx;
+            for (sx = 0; sx < sw; sx += 8)
+                CGContextFillRect(src8, CGRectMake((CGFloat)sx, 0, 4, (CGFloat)sh));
+            stripes = CGBitmapContextCreateImage(src8);
+        }
+        OK(stripes != NULL, "the striped stand-in for a clamped render was created");
+
+        NSUInteger greys = 0, pure = 0;
+        if (stripes) {
+            // Stored under the size that was WANTED while being smaller than
+            // it: the delivery path's own arrangement above the ceiling.
+            [dc setFullImage:stripes pixelSize:want forPage:0];
+
+            size_t bw = (size_t)ceil(NSMaxX(r0)), bh = (size_t)ceil(NSMaxY(r0));
+            CGContextRef out = CGBitmapContextCreate(NULL, bw, bh, 8, 0, cs2,
+                                                     kCGImageAlphaNoneSkipFirst |
+                                                     kCGBitmapByteOrder32Host);
+            OK(out != NULL, "the destination bitmap for the draw check was created");
+            if (out) {
+                // The view is flipped; the bitmap context is not. Flip it so
+                // view coordinates land where -drawRect: expects them.
+                CGContextTranslateCTM(out, 0, (CGFloat)bh);
+                CGContextScaleCTM(out, 1.0, -1.0);
+                NSGraphicsContext *g =
+                    [NSGraphicsContext graphicsContextWithGraphicsPort:out flipped:YES];
+                [NSGraphicsContext saveGraphicsState];
+                [NSGraphicsContext setCurrentContext:g];
+                [dv drawRect:r0];
+                [NSGraphicsContext restoreGraphicsState];
+                CGContextFlush(out);
+
+                const unsigned char *p = (const unsigned char *)CGBitmapContextGetData(out);
+                size_t stride = CGBitmapContextGetBytesPerRow(out);
+                if (p) {
+                    // The middle band of the page only, well inside the border
+                    // stroke and the drop shadow, both of which are greys this
+                    // check has no interest in.
+                    size_t y0 = (size_t)(NSMinY(r0) + NSHeight(r0) * 0.4);
+                    size_t y1 = (size_t)(NSMinY(r0) + NSHeight(r0) * 0.6);
+                    size_t x0 = (size_t)(NSMinX(r0) + 8), x1 = (size_t)(NSMaxX(r0) - 8);
+                    size_t yy, xx;
+                    for (yy = y0; yy < y1 && yy < bh; yy++) {
+                        // Written flipped, so row yy of the view is row
+                        // (bh - 1 - yy) of the buffer.
+                        const unsigned char *row = p + (bh - 1 - yy) * stride;
+                        for (xx = x0; xx < x1 && xx < bw; xx++) {
+                            unsigned char v = row[xx * 4 + 1];   // G of xRGB
+                            if (v < 8 || v > 247) pure++; else greys++;
+                        }
+                    }
+                }
+                CGContextRelease(out);
+            }
+            CGImageRelease(stripes);
+        }
+        if (src8) CGContextRelease(src8);
+        CGColorSpaceRelease(cs2);
+
+        printf("  note  stretched blit of a clamped bitmap: %lu smoothed pixels,\n"
+               "        %lu at full black or white\n",
+               (unsigned long)greys, (unsigned long)pure);
+        OK(pure > 0, "the stripes actually reached the page (the blit happened)");
+        // The assertion the fix exists for. Zero greys is nearest-neighbour,
+        // which is what reading a cache hit as a 1:1 blit selected.
+        OK(greys > 0,
+           "a stretched blit is smoothed, not nearest-neighboured");
+        [dv release];
+        [dc release];
+    }
+
+    // Two zoom steps past the render ceiling are ONE bitmap, and the cache has
+    // to know it.
+    //
+    // The renderer clamps before drawing, so its output is a function of
+    // PVClampPixelSize(px): a request of 3672x4752 and one of 4896x6336 both
+    // come back 3600x4659 on a >8 GB machine, byte for byte identical. Keyed on
+    // the request, the second missed and a full page was rasterised again for a
+    // bitmap already in the cache -- measured at 15.3 s of CPU on heavy.pdf.
+    //
+    // Written in terms of the ceiling rather than in fixed numbers, so it holds
+    // on every RAM tier: two requests are chosen that are certainly above it and
+    // certainly different from each other.
+    {
+        double ceil2 = PVMaxRenderPixels();
+        CGFloat side = (CGFloat)(sqrt(ceil2) * 2.0);           // 4x the ceiling
+        CGSize askA  = CGSizeMake(side, side);
+        CGSize askB  = CGSizeMake(side * 1.5, side * 1.5);     // 9x, well apart
+        CGSize builtA = PVClampPixelSize(askA), builtB = PVClampPixelSize(askB);
+
+        OK(fabs(askA.width - askB.width) > 0.5,
+           "the two zoom steps really are different requests");
+        OK(fabs(builtA.width - builtB.width) <= 0.5 &&
+           fabs(builtA.height - builtB.height) <= 0.5,
+           "...and the renderer would produce one identical bitmap for both");
+
+        CGColorSpaceRef cs3 = CGColorSpaceCreateDeviceRGB();
+        CGContextRef bc3 = CGBitmapContextCreate(NULL, 4, 4, 8, 0, cs3,
+                                                 kCGImageAlphaNoneSkipFirst |
+                                                 kCGBitmapByteOrder32Host);
+        CGImageRef small = bc3 ? CGBitmapContextCreateImage(bc3) : NULL;
+        if (small) {
+            PVImageCache *zc = [[PVImageCache alloc] initWithBudget:PVPageCacheBudget()];
+            // Delivered for the first zoom step, exactly as the queue delivers:
+            // the bitmap, tagged with the size that was ASKED for.
+            [zc setFullImage:small pixelSize:askA forPage:3];
+            OK([zc fullImageForPage:3 pixelSize:askA] != NULL,
+               "the page is found by the request that produced it");
+            // The assertion this fix exists for.
+            OK([zc fullImageForPage:3 pixelSize:askB] != NULL,
+               "...and by a second zoom step that produces the same bitmap");
+            OK([zc hasFullImageForPage:3 pixelSize:askB],
+               "the non-mutating query agrees, so the throttle counts the same way");
+            // Still one entry and one bitmap: the two requests share, they do
+            // not each get a copy.
+            OK([zc fullImageCount] == 1,
+               "the two requests share one cached bitmap rather than two");
+            // And a genuinely different bitmap, well under the ceiling, is
+            // still a miss -- the clamp must not collapse everything together.
+            OK([zc fullImageForPage:3 pixelSize:CGSizeMake(64, 64)] == NULL,
+               "a size below the ceiling is still matched exactly");
+            [zc release];
+            CGImageRelease(small);
+        }
+        if (bc3) CGContextRelease(bc3);
+        CGColorSpaceRelease(cs3);
+    }
+
     [v setZoom:0.0001 backingScale:1.0 containerWidth:900];
     OK([v zoom] >= PV_MIN_ZOOM, "zoom is clamped at the low end");
     [v setZoom:999 backingScale:1.0 containerWidth:900];
@@ -6238,6 +6463,119 @@ static int RunUI(int argc, const char *argv[])
 
             [wc zoomFitWidth:nil];
             [wc goToPageNumber:37];
+            PumpUntil(^{ return [(PVRenderQueue *)[wc valueForKey:@"_pageQueue"] isIdle]; }, 60.0);
+        }
+
+        // What the pinch is FOR, which nothing above this checked: the point of
+        // the document under the fingers stays under the fingers.
+        //
+        // -restoreMagnifyAnchor exists for exactly this and explains why it is
+        // expressed as a page plus a fraction rather than as a scroll offset --
+        // the gaps between pages are a constant number of points at every zoom,
+        // so scaling an offset drifts by one gap per page. The tests above drove
+        // the gesture and asserted the zoom; none of them asked where the
+        // document ended up.
+        //
+        // Measured the way a reader would notice it: pick a document point,
+        // note where in the VIEWPORT it sits, zoom, and ask where it sits now.
+        printf("\n[5h2] the point under the fingers stays under the fingers\n");
+        {
+            PVPageView  *pv   = [wc valueForKey:@"_pageView"];
+            NSScrollView *sv  = [wc valueForKey:@"_scrollView"];
+            NSClipView  *clip = (NSClipView *)[sv contentView];
+
+            // Both layouts, and the spread is the one that matters: a row there
+            // holds two pages with a gap between them, and the gap does not
+            // scale with the zoom.
+            NSUInteger cols;
+            for (cols = 1; cols <= 2; cols++) {
+                [wc setValue:[NSNumber numberWithUnsignedLongLong:(unsigned long long)cols]
+                      forKey:@"_columns"];
+                [wc zoomFitWidth:nil];
+                // In far enough that the document is wider than the window,
+                // because a document narrower than the viewport is centred and
+                // the horizontal anchor is deliberately not followed at all.
+                int z;
+                for (z = 0; z < 6; z++) [wc pageView:pv magnifyBy:1.25];
+                [wc pageViewDidMagnify:pv];
+                Pump(0.05);
+
+                NSRect vis0 = [clip documentVisibleRect];
+                if (NSWidth([pv frame]) <= NSWidth(vis0) + 1) {
+                    printf("  note  %lu column(s): document is not wider than the "
+                           "viewport, horizontal anchor not exercised\n",
+                           (unsigned long)cols);
+                }
+
+                // A point over the RIGHT-hand page of a row, which in the spread
+                // is the page the row's range does NOT name.
+                NSRange row = [pv pageRangeInRect:NSMakeRect(NSMidX(vis0), NSMidY(vis0), 1, 1)];
+                NSUInteger target = row.location + (row.length > 1 ? 1 : 0);
+                NSRect tr = [pv rectForPage:target];
+                // Well inside the page, so the point is unambiguously on it.
+                NSPoint p = NSMakePoint(NSMinX(tr) + NSWidth(tr) * 0.5,
+                                        NSMinY(tr) + NSHeight(tr) * 0.5);
+                // Only meaningful if that point is actually on screen.
+                if (!NSPointInRect(p, vis0)) {
+                    printf("  note  %lu column(s): the chosen anchor was off screen, skipped\n",
+                           (unsigned long)cols);
+                    continue;
+                }
+
+                // The document point, as a fraction of the page it is on, and
+                // where it sits in the viewport right now.
+                CGFloat fx = (NSWidth(tr)  > 0) ? (p.x - NSMinX(tr)) / NSWidth(tr)  : 0;
+                CGFloat fy = (NSHeight(tr) > 0) ? (p.y - NSMinY(tr)) / NSHeight(tr) : 0;
+                NSPoint inViewport0 = NSMakePoint(p.x - NSMinX(vis0), p.y - NSMinY(vis0));
+
+                [wc pageViewWillMagnify:pv atPoint:p];
+                int k;
+                for (k = 0; k < 3; k++) [wc pageView:pv magnifyBy:1.26];   // ~2x
+                [wc pageViewDidMagnify:pv];
+                Pump(0.05);
+
+                NSRect vis1 = [clip documentVisibleRect];
+                NSRect tr1  = [pv rectForPage:target];
+                NSPoint now = NSMakePoint(NSMinX(tr1) + fx * NSWidth(tr1),
+                                          NSMinY(tr1) + fy * NSHeight(tr1));
+                NSPoint inViewport1 = NSMakePoint(now.x - NSMinX(vis1), now.y - NSMinY(vis1));
+
+                CGFloat driftX = fabs(inViewport1.x - inViewport0.x);
+                CGFloat driftY = fabs(inViewport1.y - inViewport0.y);
+                printf("  note  %lu column(s), anchored on page %lu: drift %.1f pt "
+                       "across, %.1f pt down\n",
+                       (unsigned long)cols, (unsigned long)target,
+                       (double)driftX, (double)driftY);
+
+                char msg[160];
+                // The clamp at the edges of the document legitimately moves the
+                // anchor, so only assert where there was room to follow it.
+                CGFloat maxX1 = NSWidth([pv frame]) - NSWidth(vis1);
+                BOOL freeX = (NSMinX(vis1) > 1 && NSMinX(vis1) < maxX1 - 1);
+                CGFloat maxY1 = NSHeight([pv frame]) - NSHeight(vis1);
+                BOOL freeY = (NSMinY(vis1) > 1 && NSMinY(vis1) < maxY1 - 1);
+
+                if (freeY) {
+                    snprintf(msg, sizeof msg,
+                             "%lu column(s): the anchor holds vertically through a 2x pinch",
+                             (unsigned long)cols);
+                    OK(driftY < 2.0, msg);
+                }
+                if (freeX) {
+                    // 2 pt is the rounding -scrollClipTo: does plus a little.
+                    // One PV_PAGE_GAP (12 pt) of drift is the failure this
+                    // looks for: anchoring on the row's first page instead of
+                    // the page under the fingers puts the intra-row gap inside
+                    // the fraction, and the gap does not scale with the zoom.
+                    snprintf(msg, sizeof msg,
+                             "%lu column(s): the anchor holds horizontally through a 2x pinch",
+                             (unsigned long)cols);
+                    OK(driftX < 2.0, msg);
+                }
+            }
+
+            [wc setValue:[NSNumber numberWithUnsignedLongLong:1ULL] forKey:@"_columns"];
+            [wc zoomFitWidth:nil];
             PumpUntil(^{ return [(PVRenderQueue *)[wc valueForKey:@"_pageQueue"] isIdle]; }, 60.0);
         }
 

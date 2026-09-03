@@ -219,6 +219,19 @@ double PVMaxRenderPixelsForTier(PVRamTier tier)
     return ceiling;
 }
 
+BOOL PVBitmapIsPixelExact(CGSize have, CGSize want)
+{
+    // A size that is not a number cannot be shown to line up with anything, and
+    // the safe answer is the one that resamples: a smoothed blit of a bitmap
+    // whose dimensions are unreadable is still a picture, while a nearest-
+    // neighbour one is a picture with a comb through it.
+    if (!isfinite(have.width) || !isfinite(have.height) ||
+        !isfinite(want.width) || !isfinite(want.height))
+        return NO;
+    return (fabs(have.width  - want.width)  <= 0.5 &&
+            fabs(have.height - want.height) <= 0.5);
+}
+
 double PVMaxRenderPixels(void)
 {
     return PVMaxRenderPixelsForTier(PVRamTierOfThisMachine());

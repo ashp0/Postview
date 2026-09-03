@@ -401,6 +401,27 @@ double PVMaxRenderPixels(void);
 // matters. It is also what makes the ceiling testable without a PDF.
 CGSize PVClampPixelSize(CGSize px);
 
+// Whether a bitmap that IS `have` pixels lands 1:1 on a destination that wants
+// `want` of them, and so can be blitted with no resampling at all.
+//
+// Not the same question as "did the cache have the bitmap I asked for", and
+// that is the whole reason this exists. A page is cached under the size that
+// was REQUESTED, deliberately: PVClampPixelSize scales an over-large request
+// down, and a cache keyed on the clamped size would never satisfy the lookup
+// the request came from, so the wanted-set would name that page again on every
+// scroll event and the queue would rasterise it forever. The key has to be the
+// request.
+//
+// The consequence is that a cache hit above the ceiling hands back a bitmap
+// SMALLER than the destination, and the draw path cannot read "the lookup
+// matched" as "the pixels line up". It did, and chose kCGInterpolationNone --
+// nearest neighbour -- for precisely the blit that is being stretched, which
+// is the one place it is the wrong choice.
+//
+// Compared with the same half-pixel tolerance the cache matches sizes with, so
+// the two cannot disagree about a bitmap that is on the boundary.
+BOOL PVBitmapIsPixelExact(CGSize have, CGSize want);
+
 // How far one arrow press scrolls in a viewport this tall, in points. Split out
 // of -[PVPageView keyDown:] so the travel a scenario produces can be asserted
 // without a window: the showdown's fairness gate compares this against what

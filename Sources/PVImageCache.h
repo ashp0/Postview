@@ -56,6 +56,24 @@
 - (void)setPinnedPages:(NSRange)range;
 
 // Exact-size match only; NULL if the cached bitmap was rendered at another zoom.
+//
+// "Another zoom" means another BITMAP, and those are not the same question
+// above PVMaxRenderPixels(). The renderer clamps its request before drawing, so
+// its output is a function of PVClampPixelSize(px) and not of px -- two zoom
+// steps past the ceiling ask for different sizes and are handed the identical
+// bitmap. The size is therefore clamped here, on the way in, and both halves of
+// the cache are keyed on the bitmap that will actually exist.
+//
+// Keyed on the request instead, as it was, every zoom step past the ceiling
+// missed and re-rasterised a page it already held. Measured on `heavy.pdf`:
+// requests of 3672x4752 and 4896x6336 both produce 3600x4659, byte for byte
+// identical, and the second cost 15.3 s of CPU to arrive at a bitmap already in
+// the cache. The same rule -prepareFailureSlot: already applies for the same
+// reason: what identifies a bitmap is what the renderer will make of it.
+//
+// It does NOT make a stretched bitmap look exact. -drawRect: asks the image for
+// its own dimensions -- see PVBitmapIsPixelExact -- so a clamped bitmap serving
+// a larger request is still resampled rather than blitted 1:1.
 - (CGImageRef)fullImageForPage:(NSUInteger)page pixelSize:(CGSize)px;
 // The same question, asked without touching the cache. -fullImageForPage: bumps
 // the entry's LRU stamp, which is right for a caller about to draw and wrong for

@@ -18,7 +18,12 @@
 @interface PVCacheEntry : NSObject {
 @public
     CGImageRef full;  CGSize fullPx;  size_t fullBytes;
-    CGImageRef prev;  CGSize prevPx;  size_t prevBytes;
+    // No prevPx beside prevBytes, and its absence is the point. A preview is
+    // matched by page alone -- see -hasPreviewForPage: -- so a size stored here
+    // would be a field nothing reads that looks exactly like a size check that
+    // already exists. The one this file does perform is on the full bitmap, and
+    // it goes through PVCacheKeySize.
+    CGImageRef prev;  size_t prevBytes;
     unsigned long long stamp;
     // GreedyDual values, one per bitmap rather than one per entry: an entry's
     // full bitmap and its preview are evicted in separate passes and are worth
@@ -191,12 +196,33 @@
     return e;
 }
 
+// The size a full bitmap is filed under: the one the renderer will actually
+// produce, not the one the caller asked for.
+//
+// Stated once, and applied by every full-image method in this file, so the
+// store and the two lookups cannot drift into keying on different things --
+// which is the failure that matters here. Store clamped and look up unclamped
+// and the lookup never matches, so the page is rasterised on every scroll
+// event forever; store unclamped and look up unclamped, as this file did, and
+// every zoom step past PVMaxRenderPixels() re-rasterises a bitmap the cache is
+// already holding. Both halves clamping is the only arrangement that is
+// consistent in both directions.
+//
+// Below the ceiling this is the identity on every size this app produces: the
+// layout rounds page rects to whole points before multiplying by the backing
+// scale, so the request is already integral and the clamp returns it unchanged.
+static inline CGSize PVCacheKeySize(CGSize px)
+{
+    return PVClampPixelSize(px);
+}
+
 - (CGImageRef)fullImageForPage:(NSUInteger)page pixelSize:(CGSize)px
 {
     PVCacheEntry *e = [self entryForPage:page create:NO];
     if (!e || !e->full) return NULL;
+    CGSize key = PVCacheKeySize(px);
     // Sizes are derived from rounded point sizes, so an exact match is expected.
-    if (fabs(e->fullPx.width - px.width) > 0.5 || fabs(e->fullPx.height - px.height) > 0.5)
+    if (fabs(e->fullPx.width - key.width) > 0.5 || fabs(e->fullPx.height - key.height) > 0.5)
         return NULL;
     return e->full;
 }
@@ -206,8 +232,9 @@
     NSNumber *key = [NSNumber numberWithUnsignedLongLong:(unsigned long long)page];
     PVCacheEntry *e = [_entries objectForKey:key];   // no stamp bump: this is a query
     if (!e || !e->full) return NO;
-    return (fabs(e->fullPx.width  - px.width)  <= 0.5 &&
-            fabs(e->fullPx.height - px.height) <= 0.5);
+    CGSize want = PVCacheKeySize(px);
+    return (fabs(e->fullPx.width  - want.width)  <= 0.5 &&
+            fabs(e->fullPx.height - want.height) <= 0.5);
 }
 
 - (CGImageRef)placeholderImageForPage:(NSUInteger)page
@@ -280,7 +307,9 @@
         _fullCount++;
     }
     e->full      = incoming;
-    e->fullPx    = px;
+    // The other half of PVCacheKeySize. Filed under the bitmap that exists, so
+    // the lookup that clamps its request finds it.
+    e->fullPx    = PVCacheKeySize(px);
     e->fullBytes = PVImageBytes(incoming);
     e->fullH     = [self gdsValueForSeconds:renderSeconds bytes:e->fullBytes];
     [self addBytes:e->fullBytes];
@@ -301,7 +330,6 @@
     }
     if (e->prev) { [self subtractBytes:e->prevBytes]; CGImageRelease(e->prev); }
     e->prev      = incoming;
-    e->prevPx    = px;
     e->prevBytes = PVImageBytes(incoming);
     e->prevH     = [self gdsValueForSeconds:renderSeconds bytes:e->prevBytes];
     [self addBytes:e->prevBytes];

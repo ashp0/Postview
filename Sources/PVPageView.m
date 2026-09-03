@@ -530,7 +530,17 @@
 
         CGSize want = [self pixelSizeForPage:i];
         CGImageRef img = [_cache fullImageForPage:i pixelSize:want];
-        BOOL exact = (img != NULL);
+        // Asked of the BITMAP, not of the lookup. A cache hit means the page
+        // was rendered for this request; it does not mean the pixels line up,
+        // because a request over PVMaxRenderPixels() is rasterised clamped and
+        // cached under the size that was asked for -- see PVBitmapIsPixelExact
+        // for why the key has to be the request. Reading the hit as a 1:1 blit
+        // chose nearest-neighbour for the one case that is being stretched: on
+        // this machine every zoom past ~2.9x, which is the top half of the
+        // range PV_MAX_ZOOM allows.
+        BOOL exact = img && PVBitmapIsPixelExact(
+            CGSizeMake((CGFloat)CGImageGetWidth(img),
+                       (CGFloat)CGImageGetHeight(img)), want);
         if (!img) img = [_cache placeholderImageForPage:i];
 
         if (img) {

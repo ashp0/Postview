@@ -882,3 +882,560 @@ actually ran.
   deaths on one page at one pixel size quiet that slot. Not unreasonable —
   but the two behaviours are documented separately and nowhere together.
 * **No commit.** Nothing is staged; the tree is as I left it.
+
+
+<!-- ===================================================================== -->
+
+# Session 2026-09-02 (second overnight pass)
+
+Working tree clean at `738acde` when this session began. The previous session's
+log is `overnight_audit_log.md` (lower case); it covered the tree through
+`8ad7c01` and found no defect in shipping code. Three commits have landed since,
+and they are where this session looked first.
+
+## Baseline, taken before anything was touched
+
+Built into an isolated `BUILD` directory so nothing here disturbs `build/`.
+
+| Gate | Command | Result |
+|---|---|---|
+| Build | `make all BUILD=…` | clean, no warnings |
+| Unit suite | `make test BUILD=…` | **430 passed, 0 failed** |
+| Static analyser | `make analyze BUILD=…` | **OK** — no diagnostics |
+
+---
+
+## 1. `-drawRect:` chose nearest-neighbour for the one blit that is stretched
+
+**Severity: visual defect, reachable by ordinary use. Fixed.**
+
+### What was wrong
+
+`-[PVPageView drawRect:]` decided how to resample a page bitmap like this:
+
+```objc
+CGSize want = [self pixelSizeForPage:i];
+CGImageRef img = [_cache fullImageForPage:i pixelSize:want];
+BOOL exact = (img != NULL);
+...
+CGContextSetInterpolationQuality(ctx, exact ? kCGInterpolationNone : kCGInterpolationLow);
+```
+
+`exact` is read as "the bitmap's pixels land 1:1 on device pixels, so no
+resampling is needed". That inference does not hold, and the place it fails is
+the place it matters.
+
+A page is cached under the size that was **requested**. That is deliberate and
+must not change: `PVClampPixelSize` scales an over-large request down before
+rasterising, and a cache keyed on the clamped size could never satisfy the
+lookup the request came from — so the wanted-set would name the page again on
+every scroll event and the render queue would rasterise it forever. The comment
+on `PVClampPixelSize` says exactly this.
+
+The consequence is that above `PVMaxRenderPixels()` a cache **hit** hands back a
+bitmap **smaller** than the destination. `exact` is `YES`, and the page is
+blown up with `kCGInterpolationNone` — nearest neighbour — which is the one
+filter that must not be used on a stretch. It duplicates whole columns of
+pixels, so text picks up periodic stair-stepping and uneven stroke weights.
+
+### That it is reachable, not theoretical
+
+Measured on this machine (`Sources/PVCommon.m` tier table, RAM tier 3,
+ceiling 16.777 Mpx), for a US Letter page at backing scale 2:
+
+```
+zoom 2.00x  want 2448x3168  ( 7.76 Mpx)  ->  clamped 2448x3168   1:1
+zoom 3.00x  want 3672x4752  (17.45 Mpx)  ->  clamped 3600x4659   *** CLAMPED ***
+zoom 4.00x  want 4896x6336  (31.02 Mpx)  ->  clamped 3600x4659   *** CLAMPED ***
+```
+
+`PV_MAX_ZOOM` is 6.0. The clamp engages from roughly 2.9x upward — the **top
+half of the zoom range the app offers**, reachable with ⌘+ or a pinch. On a
+smaller-RAM machine the ceiling is lower and the affected range is wider: the
+suite already pins the >4 GB tier as crossing at 1.09x zoom.
+
+The ratio makes it worse rather than better. At 3x zoom the stretch is 3672/3600
+= 1.02x, and a nearest-neighbour upscale of 1.02x duplicates roughly one column
+in fifty — a periodic artefact, which is the most visible kind.
+
+### The fix
+
+The question the draw path actually needs answered is about the **bitmap**, not
+about the lookup. Added a pure predicate to `PVCommon`, following the same
+idiom this codebase already uses for `PVArrowScrollForViewportHeight` and
+`PVSmoothScrollEase` — split out so it can be asserted without a window:
+
+```objc
+BOOL PVBitmapIsPixelExact(CGSize have, CGSize want);
+```
+
+It compares with the same half-pixel tolerance `-fullImageForPage:pixelSize:`
+matches sizes with, so the two cannot disagree about a bitmap on the boundary,
+and it answers `NO` for a non-finite size — an unreadable dimension resamples
+rather than getting a comb through it.
+
+`-drawRect:` now asks it, with the image's real dimensions:
+
+```objc
+BOOL exact = img && PVBitmapIsPixelExact(
+    CGSizeMake((CGFloat)CGImageGetWidth(img),
+               (CGFloat)CGImageGetHeight(img)), want);
+```
+
+The cache key is untouched, so the re-render loop the clamp comment warns about
+stays closed. Below the ceiling — every ordinary zoom — the answer is `YES` and
+the 1:1 fast path is exactly what it was.
+
+### Verification
+
+The suite never drove `-drawRect:` before this session, so the defect had no way
+to be observed. It does now, and the observation is direct: a hard black/white
+edge blown up by a non-integer ratio comes out of nearest-neighbour as nothing
+but pure black and pure white, and out of any smoothing filter with a band of
+intermediate greys. Counting the greys reads which branch was taken.
+
+Reproduced at small scale on purpose — `-drawRect:` has never heard of
+`PVMaxRenderPixels()`; all it compares is the bitmap it got against the size it
+wanted, so a bitmap stored two thirds of the size it is keyed under exercises
+exactly the path a real clamped render takes, without a 67 MB allocation.
+
+| | smoothed pixels | pure black/white | result |
+|---|---|---|---|
+| pre-fix logic (`exact = img != NULL`) | **0** | 94764 | **FAIL**, `make test` exit 2 |
+| fixed | **31482** | 63282 | ok |
+
+Run twice against the pre-fix logic to be sure the failure was not a fluke; both
+runs reported `442 passed, 1 failed`. With the fix: **443 passed, 0 failed.**
+
+Thirteen assertions were added, in three groups: the pure rule
+(`PVBitmapIsPixelExact` against the clamp, the half-pixel tolerance, the
+non-finite case), the arrangement through the real `PVImageCache` (a clamped
+render is still found by the request it came from, *and* that hit is not 1:1),
+and the observation above.
+
+### Files
+
+* `Sources/PVCommon.h`, `Sources/PVCommon.m` — `PVBitmapIsPixelExact` added.
+* `Sources/PVPageView.m` — `-drawRect:` asks it, with the image's real size.
+* `Tests/pvsuite.m` — the thirteen assertions.
+
+---
+
+## 2. Every zoom step past the render ceiling re-rasterised a bitmap the cache already held
+
+**Severity: wasted CPU and energy, reachable by ordinary use. Fixed.**
+
+Found by following the same seam as §1 rather than by a second search: once the
+requested size and the produced size are known to differ, the question is who
+else confuses them.
+
+### What was wrong
+
+The renderer's output is a function of `PVClampPixelSize(px)`, not of `px` —
+`-createImageForPage:` clamps first and everything downstream draws the clamped
+bitmap. The cache was keyed on `px`. So two zoom steps past the ceiling asked
+for two different sizes, missed each other in the cache, and each rasterised a
+page — producing the identical bitmap.
+
+`-prepareFailureSlot:` in `PVWindowController` already gets this right, and says
+so: *"These are the clamped integral sizes the renderer was actually given, not
+the floating-point request."* The cache was the one place that used the other
+convention.
+
+### Measured, not argued
+
+`Tests/…/probe2` against `heavy.pdf`, through the real `PVPDFSource` and the
+real helper process:
+
+```
+pages=60  ceiling=16.777 Mpx
+request A 3672x4752 -> clamped 3600x4659
+request B 4896x6336 -> clamped 3600x4659
+bitmap A: 3600x4659 in 14.748 s
+bitmap B: 3600x4659 in 15.268 s
+same dimensions : YES
+same pixels     : YES
+```
+
+**15.3 s of CPU to arrive at a bitmap already in the cache**, byte for byte.
+`heavy.pdf` is a deliberately expensive fixture, so the seconds are not typical
+of a real page — the *identity of the result* is the finding, and it costs one
+full render per visible page per zoom step, above the cliff, forever.
+
+It is worst on the weakest machine. The ceiling is 2.80 Mpx on the ≤2 GB tier
+against 16.78 Mpx here, so far more of the ordinary zoom range sits above it
+there, and that is the machine least able to spare the renders.
+
+### The fix
+
+Both halves of the cache key on the bitmap that will actually exist. Stated once
+in `PVImageCache.m` as `PVCacheKeySize`, applied by the store and both lookups,
+so they cannot drift apart:
+
+```objc
+static inline CGSize PVCacheKeySize(CGSize px) { return PVClampPixelSize(px); }
+```
+
+The asymmetry matters and is why this is written as one function rather than
+three call sites. Store clamped and look up unclamped and the lookup never
+matches — the page is re-rendered on every scroll event forever, which is the
+failure `PVClampPixelSize`'s own comment warns about. Store unclamped and look
+up unclamped, as it was, and every zoom step past the ceiling re-renders. Both
+halves clamping is the only arrangement consistent in both directions.
+
+Below the ceiling it is the identity on every size this app produces: the layout
+rounds page rects to whole points before multiplying by the backing scale.
+
+`PVSameBitmap` in `PVRenderQueue.m` had the same gap at a different layer — the
+in-flight dedup compared raw requests, so a zoom arriving while the first render
+was still running started a second one for the same bitmap. It now compares what
+the renderer will produce, closing that window too.
+
+This does **not** make a stretched bitmap look exact: §1's `PVBitmapIsPixelExact`
+asks the image its own dimensions, so a clamped bitmap serving a larger request
+is still resampled. The two fixes are the same distinction applied at the two
+places that needed it.
+
+### Verification
+
+| | result |
+|---|---|
+| pre-fix (`PVCacheKeySize` returning `px`) | **448 passed, 2 failed** |
+| fixed | **450 passed, 0 failed** |
+
+The two discriminating assertions are the second-zoom-step lookup and its
+non-mutating twin. The other five in the group are invariants that must not
+move: that the two requests really are different, that the renderer really would
+produce one bitmap for both, that the page is still found by the request that
+produced it, that the two share one entry rather than two, and — the one that
+would catch this fix going too far — that **a size below the ceiling is still
+matched exactly**, so the clamp cannot quietly collapse distinct bitmaps
+together.
+
+Aspect ratio is preserved by the clamp (both axes scale by the same `k`), so two
+requests of different shape cannot collide on one key.
+
+### Files
+
+* `Sources/PVImageCache.h`, `Sources/PVImageCache.m` — `PVCacheKeySize`, applied
+  by `-setFullImage:…`, `-fullImageForPage:…` and `-hasFullImageForPage:…`.
+* `Sources/PVRenderQueue.m` — `PVSameBitmap` compares clamped sizes.
+* `Tests/pvsuite.m` — seven assertions.
+
+---
+
+## 3. The pinch anchor slipped by one gutter in the two-page spread
+
+**Severity: gesture imprecision, reachable by ordinary use. Fixed.**
+
+### What was wrong
+
+`-restoreMagnifyAnchor` holds one point of the document under one point of the
+viewport across a change of zoom, and its comment states the reasoning exactly:
+
+> the offset is not a pure multiple of the zoom: the gaps between pages are a
+> constant number of points whatever the zoom is, so scaling the old offset
+> drifts by one gap per page
+
+That argument applies to the gap **across** a row exactly as it does to the gaps
+down the document — and the horizontal half was not covered, because the page it
+anchored on was the wrong one.
+
+`-pageViewWillMagnify:atPoint:` took the anchor page from
+`-pageRangeInRect:`, which answers with a **row**, whose `location` is the row's
+**first** page. In a single column that is the page under the point. In a spread
+it is the left-hand page, so a pinch centred on the right-hand page measured its
+fraction from the left page's origin — putting `PV_PAGE_GAP` inside the
+fraction. The fraction then scales with the zoom and the gap does not, so the
+document creeps under the fingers.
+
+### Measured
+
+Nothing checked the anchor before this session. The suite drove the pinch and
+asserted the zoom — `[5h]` checks that steps multiply, that the mode goes to
+custom, that the gesture ends both ways, that limits hold — but never asked
+where the document ended up. `[5h2]` now does, the way a reader would notice it:
+pick a document point, note where in the viewport it sits, zoom 2x, ask where it
+sits now.
+
+| layout | drift across | drift down |
+|---|---|---|
+| 1 column | 0.5 pt | 0.5 pt |
+| 2 columns, **before** | **12.5 pt** | 0.5 pt |
+| 2 columns, after | **0.5 pt** | 0.5 pt |
+
+`PV_PAGE_GAP` is 12.0. The drift was one gutter plus the half-point of rounding
+`-scrollClipTo:` does — which is what the mechanism above predicts, and is why
+the reading is quoted rather than just the pass.
+
+### The fix
+
+Anchor on the page the point is actually over, not the row's first page. At most
+`PV_MAX_PAGE_COLUMNS` iterations, once per gesture:
+
+```objc
+NSUInteger j;
+for (j = 0; j < range.length; j++) {
+    NSUInteger candidate = range.location + j;
+    if (NSPointInRect(pointInView, [_pageView rectForPage:candidate])) {
+        _magnifyPage = candidate;
+        break;
+    }
+}
+```
+
+A point in the gutter or the margin is on no page and keeps the row's first
+page — what it had before, and the best answer available.
+
+### Verification
+
+`make uitest`: **259 passed, 1 failed** before the fix, **260 passed, 0 failed**
+after. The failing assertion is the horizontal one in two columns; the single
+column case passes in both, which is what identifies the spread as the cause
+rather than the pinch machinery in general.
+
+The test guards both axes against the document edges — a clamp at the end of the
+document legitimately moves the anchor — and skips an anchor that is off screen,
+so it asserts only where there was room to follow the fingers.
+
+### Files
+
+* `Sources/PVWindowController.m` — `-pageViewWillMagnify:atPoint:`.
+* `Tests/pvsuite.m` — `[5h2]`, four assertions and two measurements.
+
+---
+
+## 4. Gates, with all three fixes in place
+
+Run in an isolated `BUILD` directory. The three fixes touch the draw path, the
+cache, the render queue's dedup and the pinch anchor, so the concurrency and
+memory gates matter here as much as the functional ones.
+
+| Gate | Result |
+|---|---|
+| `make analyze` | **OK** — no diagnostics |
+| `make test` | **450 passed, 0 failed** (430 at baseline + 20 new) |
+| `make uitest` | **260 passed, 0 failed** (256 at baseline + 4 new) |
+| `make soak` (150 cycles) | **26 passed, 0 failed** — +0.0496 MB/cycle, peak 118.7 MB, no runaway |
+| `make leakcheck` | **OK: no Postview-owned object was leaked** |
+| `make stress` | 16 passed, 0 failed |
+| `make stress SAN=address,undefined` | 16 passed, 0 failed |
+| `make stress SAN=thread` | **16 passed, 0 failed** |
+
+TSan is the one worth naming: `PVSameBitmap` now calls `PVClampPixelSize` while
+`_lock` is held on the render lanes, and that is a new call on a path two
+threads reach. It is a pure function over its arguments plus one
+`dispatch_once`-memoised read of installed RAM, so it adds no shared mutable
+state — and the gate agrees rather than the argument being taken on trust.
+
+### An observation, not a defect
+
+`Tests/pvsuite.m` compiles with four warnings, all pre-existing at `738acde` and
+none of them mine: one `-Wnonnull` on a deliberate nil argument (the comment
+there explains it is testing exactly that), and three from
+`[[wc valueForKey:@"_scrollView"] contentView]` being typed `NSView *` and then
+sent `NSClipView` messages. The app's own sources build clean.
+
+Left alone. They are test-only, they are all in the same KVC-untyped idiom the
+UI suite uses throughout, and silencing them means adding casts that assert a
+type the test is deliberately not declaring. Worth knowing they are there, so a
+genuinely new warning is not lost among them.
+
+---
+
+## 5. `verify-all`, against the real 10.9 SDK
+
+```
+make verify-all BUILD=… SDK=~/Developer/SDKs/MacOSX10.9.sdk
+```
+
+| Gate | Result |
+|---|---|
+| Mach-O verification | OK |
+| static analyser | OK |
+| unit tests | 447 passed, 0 failed |
+| UI tests | 260 passed, 0 failed |
+| soak | 26 passed, 0 failed |
+| stress | 16 passed, 0 failed |
+| stress + address,undefined | 16 passed, 0 failed |
+| stress + thread | 16 passed, 0 failed |
+| leaks | no Postview-owned object leaked |
+| energy and CPU | 23 passed, 0 failed |
+| showdown self-test | passed |
+
+**`verify-all: every gate passed`**, exit 0.
+
+### The unit count is 447 here and 450 under the default SDK — deliberately
+
+Not a regression, and worth writing down because the two numbers will be
+compared again. `TestDispatchConstants` pins `PV_BLOCK_ENFORCE_QOS_CLASS` and
+`PV_QOS_CLASS_UTILITY` against the real enumerators, and guards that on
+`PV_TEST_HAS_QOS_SDK`. The 10.9 SDK has no `<sys/qos.h>`, so three assertions
+become one `skip` line. 450 − 3 = 447, and the pre-existing baseline works out
+the same way: 430 − 3 = 427, which is the number `738acde`'s message quotes.
+
+### Idle cost, measured with all three fixes in place
+
+```
+CPU   viewer  0.004 s   helpers  0.000 s   total 0.004 s (0.1% of one core)
+wake  idle 0   timer 0   interrupt 2   helper idle 0
+ok    an idle document costs 0.12% of one core (limit 5%)
+ok    an idle document wakes the package 0.0 times a second (limit 60)
+```
+
+Zero idle wakeups, zero timer wakeups, in the viewer and in the helper. Worth
+confirming rather than assuming here: §1's fix runs inside `-drawRect:` and §2's
+inside the cache lookup, both on paths a scroll touches many times a second, and
+neither adds a timer, a poll or a retained object. The audit's first question —
+does an untouched document cost nothing — still answers the same way.
+
+---
+
+## 6. Final architectural assessment
+
+### What was found
+
+Three defects, all reachable by ordinary use, all fixed, each with a test that
+fails without the fix:
+
+| § | Defect | Cost | Discriminating evidence |
+|---|---|---|---|
+| 1 | `-drawRect:` chose nearest-neighbour for stretched blits | every page soft *and* combed above ~2.9x zoom | 0 vs 31482 smoothed pixels |
+| 2 | Cache keyed on the request, renderer keyed on the clamp | one redundant full render per page per zoom step | 15.3 s of CPU for a byte-identical bitmap |
+| 3 | Pinch anchored on the row's first page | 12.5 pt of drift per 2x pinch in the spread | 12.5 pt → 0.5 pt |
+
+**All three are the same mistake.** Each is a place where the size a bitmap was
+*asked for* was used where the size it *is* was meant. That is not a coincidence
+and it is the most useful thing in this report: `PVClampPixelSize` introduces two
+different numbers for one bitmap, and every consumer has to pick the right one.
+
+Two consumers already picked correctly and said so —
+`-[PVWindowController prepareFailureSlot:…]` (*"These are the clamped integral
+sizes the renderer was actually given, not the floating-point request"*) and
+`-[PVRenderQueue predictedSecondsForPixels:preview:]`. Three did not. The seam
+is now consistent at all five:
+
+| consumer | identifies a bitmap by | status |
+|---|---|---|
+| cost model prediction | clamped | was already right |
+| failure/retry slots | clamped | was already right |
+| cache key | clamped | **fixed, §2** |
+| in-flight dedup | clamped | **fixed, §2** |
+| draw interpolation | the image's own dimensions | **fixed, §1** |
+
+`PVPageView`'s row/page distinction is the same shape of hazard one layer up, and
+§3 was its one remaining unconverted caller.
+
+### What the codebase does well, stated so it is not lost
+
+The architecture is genuinely sound, and the reasons are specific:
+
+* **Nothing polls.** Three timers exist; all are one-shot or bounded, all are
+  cancelled on teardown, and the retain each one takes is documented at the
+  ivar. The energy gate measures zero idle wakeups rather than asserting them.
+* **The process boundary is in the right place.** Every `CGPDF*` call is in the
+  helper; the viewer holds a read-only mapping and two pipes. Every field of
+  every message is validated on arrival, including the overflow guards and an
+  `fstat` size check before `mmap` — the failure that would otherwise be a
+  `SIGBUS` inside Quartz on a row that happens to cross a page boundary.
+* **Failure is classified, not collapsed.** `PVRenderFailure` separates "Quartz
+  will never draw this" from "this machine was busy for an instant", and the
+  retry policy turns on the difference. That distinction is why a page starved
+  of shared memory comes back instead of staying blank for the session.
+* **Ownership is stated where it is taken.** The `handed` flag in
+  `-createImageForPage:`, the `counted`/`reservedFull` pair carried into the
+  delivery block, `-subtractBytes:` routing every decrement through one place so
+  an unbalanced one cannot wrap `_bytes` — these are the shapes that make the
+  leak gate able to pass rather than merely happen to.
+* **Every allocation is null-checked**, and the failure paths leave the previous
+  state whole rather than tearing it down in favour of nothing — the row table's
+  build-then-swap being the clearest example.
+
+### What I would want a human for
+
+* ~~`e->prevPx` is written and never read.~~ **Settled — see §7.**
+* **Four pre-existing warnings in `Tests/pvsuite.m`** (§4). Test-only, all in the
+  KVC-untyped idiom the UI suite uses throughout. Silencing them means asserting
+  types the tests deliberately leave open.
+* **The clamp cliff itself is still a silent quality change.** §1 makes the soft
+  page smooth instead of combed, which is strictly better, but past
+  `PVMaxRenderPixels()` the page is still softer than the zoom asks for and
+  nothing tells the reader. The suite pins this as a known limit and
+  `ENGINEERING.md` §6 explains why raising the ceiling costs RSS. Unchanged: it
+  is a product decision, not a defect.
+
+### Verdict
+
+The tree at `738acde` was in good order, and the three defects here were found
+by following one seam rather than by broad suspicion — which is itself a
+statement about the codebase's health: the weakest link was a distinction the
+code had already identified and documented in two places out of five.
+
+With the fixes in place: **eleven gates, every one green, against the release
+SDK.** No further logical, memory, or efficiency issue was reachable by this
+session's methods — static analysis, all three sanitizers, a 150-cycle soak, a
+leak census, the energy gate, and a targeted read of every file with the seam
+above in hand.
+
+**Nothing is committed.** The working tree is left for review.
+
+
+---
+
+## 7. `e->prevPx`, settled
+
+Raised in §6 as the one open question and resolved here rather than left.
+
+`PVCacheEntry` stored a preview's pixel size. Nothing read it: `prevBytes` and
+`prevH` are both load-bearing, `prevPx` was the only write-only field in the
+cache. The hazard was never a wrong value — it was that a stored size *looks
+like* a size check that already exists, and `-hasPreviewForPage:` deliberately
+matches on the page alone. Someone adding a size-aware preview lookup on the
+strength of that field would have landed exactly on §2's defect.
+
+Three options: read it (clamped), leave it, or delete it.
+
+**Deleted.** Reading it means inventing a size-aware preview lookup, and that
+would be a mistake in its own right — previews are placeholders, any preview
+beats none, and matching them by size would re-render one on every zoom step,
+which is precisely what §2 just stopped happening to full bitmaps. Leaving it
+keeps the trap. Deleting it is the only option that makes the struct state a
+fact.
+
+The comment that replaces it carries the knowledge the field was standing in
+for, so the next person reaches the reasoning rather than the trap:
+
+```objc
+// No prevPx beside prevBytes, and its absence is the point. A preview is
+// matched by page alone -- see -hasPreviewForPage: -- so a size stored here
+// would be a field nothing reads that looks exactly like a size check that
+// already exists. The one this file does perform is on the full bitmap, and
+// it goes through PVCacheKeySize.
+CGImageRef prev;  size_t prevBytes;
+```
+
+No behavioural change, and the counts confirm it: 447 unit and 260 UI, identical
+to §5. `verify-all` re-run in full on the final tree — every gate passed.
+
+### The energy gate reads 22 or 23 depending on the battery, not the code
+
+Worth writing down beside the SDK note in §5, because it is the second count in
+this log that moves for a reason that is not a regression, and both will be
+compared again.
+
+`RunPower`'s battery-draw assertion is conditional on the charge state. With
+current flowing in or out of the cell it asserts a plausible instantaneous draw;
+fully charged and on mains it prints instead, because 0.00 W is then the true
+reading and there is no draw to check:
+
+```
+power source  : ac, internal battery present
+battery       : 100 mAh, drawing 0.00 W right now (on mains)
+                charged and on mains: no current in or out of
+                the cell, so 0.00 W is the true reading...
+```
+
+`pmset -g batt` confirms it: *100%; charged*. So 23 during the first
+`verify-all`, 22 once the machine finished charging, and 22 twice more on
+demand. Nothing here is code-dependent — and the fact that it *skips* rather
+than fails is the previous session's §5 fix working as intended.

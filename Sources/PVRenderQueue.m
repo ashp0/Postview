@@ -19,11 +19,20 @@ static PVBlockCreateQoS PVBlockCreateWithQoS(void)
 // Two requests describe the same bitmap. Sizes are derived from point sizes
 // rounded to whole points, so an exact match is the expected case and the
 // half-pixel tolerance only absorbs the float round trip.
+//
+// Compared as the bitmaps they will BECOME, not as the requests they are. The
+// renderer clamps to PVMaxRenderPixels() before drawing, so two requests past
+// the ceiling that differ -- two zoom steps, say -- produce one identical
+// bitmap; comparing the raw sizes called them different work and let the second
+// one through while the first was still being rasterised. Same rule as the
+// cache's key and -prepareFailureSlot:'s size: a bitmap is identified by what
+// the renderer will make of it.
 static BOOL PVSameBitmap(PVRenderRequest *a, PVRenderRequest *b)
 {
+    CGSize pa = PVClampPixelSize(a->px), pb = PVClampPixelSize(b->px);
     return (a->page == b->page && a->preview == b->preview &&
-            fabs(a->px.width  - b->px.width)  < 0.5 &&
-            fabs(a->px.height - b->px.height) < 0.5);
+            fabs(pa.width  - pb.width)  < 0.5 &&
+            fabs(pa.height - pb.height) < 0.5);
 }
 
 @implementation PVRenderQueue
