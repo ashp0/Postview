@@ -41,7 +41,11 @@
     [super dealloc];
 }
 
-+ (BOOL)isCompatibleWithResponsiveScrolling { return YES; }
+// Declined for the same reason PVPageView declines it, and measured in the same
+// profile. The sidebar is a scroll view over a document view as tall as the
+// book, so AppKit would prefetch overdraw tiles of thumbnails nobody is looking
+// at, in the idle between page turns -- the cheaper twin of the same mistake.
++ (BOOL)isCompatibleWithResponsiveScrolling { return NO; }
 - (BOOL)isFlipped { return YES; }
 - (BOOL)isOpaque  { return YES; }
 

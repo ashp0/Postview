@@ -60,10 +60,40 @@
     [super dealloc];
 }
 
-// Opting in to responsive scrolling lets AppKit pre-draw beyond the visible
-// rect while the main thread is idle, so most scrolling exposes area we have
-// already drawn. It requires that we do not override -scrollWheel:.
-+ (BOOL)isCompatibleWithResponsiveScrolling { return YES; }
+// Responsive scrolling, declined -- and this used to say YES.
+//
+// The reasoning for opting in was sound and is worth keeping: AppKit pre-draws
+// beyond the visible rect while the main thread is idle, so most scrolling
+// exposes area that has already been drawn. What it did not account for is what
+// that costs on THIS document view, and a profile of the shipping build at a
+// reading pace settles it. Of the main thread's ~2700 non-idle samples over
+// twenty seconds, 2066 -- about 76% -- were under:
+//
+//     -[NSView _doIdlePrefetch]
+//       CA::Transaction::commit()
+//         -[NSTileLayer display]
+//           -[_NSTiledLayer drawTile:inContext:]
+//             -[PVPageView drawRect:]  ->  CGContextDrawImage
+//
+// That is this view blitting page bitmaps into offscreen tiles for content the
+// reader is not looking at. The document view is hundreds of thousands of
+// points tall, so there is a great deal of "just off screen" to prefetch, and
+// every tile of it costs a real CGContextDrawImage of a real bitmap.
+//
+// The part that makes it the wrong trade rather than merely an expensive one is
+// WHEN it runs: from a run-loop idle observer, which is precisely what a reader
+// spends their time in. Measured against Preview on the target -- 675-page
+// document, both apps one fitted page in a 1200x640 window, equal distance
+// travelled -- Postview cost 3.7x LESS CPU when pages were flicked past and 39%
+// MORE at a reading pace. Flicking leaves no idle for the prefetch to run in;
+// reading is nothing but idle.
+//
+// Nothing this application wanted is given up. Overdraw buys smoothness during
+// continuous wheel scrolling by spending CPU in advance on work that may never
+// be needed, and refusing to do exactly that is what the motion gate and the
+// dwell test are for. Having built those to avoid rasterising what the reader
+// will not look at, it would be strange to let AppKit rasterise it anyway.
++ (BOOL)isCompatibleWithResponsiveScrolling { return NO; }
 
 - (BOOL)isFlipped   { return YES; }
 - (BOOL)isOpaque    { return YES; }
