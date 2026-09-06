@@ -4230,7 +4230,6 @@ static void PVInstallRequestCounter(void)
 - (void)pageViewDidMagnify:(PVPageView *)v;
 - (void)pageViewSmartMagnify:(PVPageView *)v atPoint:(NSPoint)p;
 - (void)scrollViewFrameChanged:(NSNotification *)note;
-- (NSArray *)toolbarDefaultItemIdentifiers:(NSToolbar *)tb;
 - (NSApplicationPresentationOptions)window:(NSWindow *)window
      willUseFullScreenPresentationOptions:(NSApplicationPresentationOptions)proposedOptions;
 // Reached only by the stress suite, which used to declare a second category of
@@ -4351,6 +4350,109 @@ static void DriveScroll(PVWindowController *wc, NSScrollView *sv,
             postNotificationName:NSScrollViewDidEndLiveScrollNotification object:sv];
 }
 
+// The controls the title bar carries, left to right, with a short name for
+// each so that a failure says which one.
+//
+// There is no NSToolbar to enumerate any more. -installTitleBarControls adds
+// these straight to the view that already owns the close, minimise and zoom
+// buttons, so the live set has to be read off the controller -- by ivar name
+// rather than by sweeping the chrome for segmented controls, because the
+// chrome is AppKit's own view and whatever else it has put in there is not
+// this suite's business.
+//
+// A name this build does not have contributes nothing rather than raising.
+// The controls arrived one at a time -- the sidebar and the zoom pair when the
+// toolbar came out, the mark-and-return control after them -- and a check that
+// covers the ones that exist is worth more than one that cannot run until the
+// last of them lands.
+static NSArray *TitleBarControls(PVWindowController *wc, NSArray **outNames)
+{
+    static const char *const kIvars[] = {
+        "_titleBarSidebar", "_titleBarZoom", "_titleBarReturn"
+    };
+    static const char *const kNames[] = { "sidebar", "zoom", "return" };
+
+    NSMutableArray *controls = [NSMutableArray array];
+    NSMutableArray *names    = [NSMutableArray array];
+    unsigned i;
+    for (i = 0; i < sizeof kIvars / sizeof *kIvars; i++) {
+        if (!class_getInstanceVariable([wc class], kIvars[i])) continue;
+        NSView *v = [wc valueForKey:[NSString stringWithUTF8String:kIvars[i]]];
+        if (!v) continue;
+        [controls addObject:v];
+        [names    addObject:[NSString stringWithUTF8String:kNames[i]]];
+    }
+
+    // Left to right, so "these two do not overlap" can be asked of every
+    // neighbouring pair without assuming the order they were declared in.
+    // They share a superview, so their own frames are comparable as they are.
+    NSUInteger a, b;
+    for (a = 0; a + 1 < [controls count]; a++) {
+        NSUInteger least = a;
+        for (b = a + 1; b < [controls count]; b++) {
+            NSView *candidate = [controls objectAtIndex:b];
+            NSView *incumbent = [controls objectAtIndex:least];
+            if (NSMinX([candidate frame]) < NSMinX([incumbent frame])) least = b;
+        }
+        if (least == a) continue;
+        [controls exchangeObjectAtIndex:a withObjectAtIndex:least];
+        [names    exchangeObjectAtIndex:a withObjectAtIndex:least];
+    }
+
+    if (outNames) *outNames = names;
+    return controls;
+}
+
+// The shape every one of them has to have, wherever it is asked: a textured
+// segmented control, the same height as the others.
+//
+// Equal heights are not enough on their own and the bezel is why. Mavericks
+// draws a textured NSButton taller than a textured NSSegmentedControl whatever
+// frame either one is given, so the single-segment sidebar control is a
+// segmented control rather than the button it reads as -- and a build that
+// swapped it back would line the frames up and still look wrong on the one
+// release this is for.
+//
+// Two callers -- [1b] across a range of window widths, [7] on a second window
+// built from restored state -- and one definition, so a change to the controls
+// has one place here to disagree with.
+static BOOL TitleBarControlsAreWellShaped(NSArray *controls)
+{
+    CGFloat firstH = -1;
+    NSUInteger i;
+    if ([controls count] == 0) return NO;
+    for (i = 0; i < [controls count]; i++) {
+        NSView *c = [controls objectAtIndex:i];
+        if (![c isKindOfClass:[NSSegmentedControl class]]) return NO;
+        if ([(NSSegmentedControl *)c segmentStyle] != NSSegmentStyleTexturedRounded)
+            return NO;
+        if (firstH < 0) firstH = NSHeight([c frame]);
+        else if (fabs(NSHeight([c frame]) - firstH) > 0.01) return NO;
+    }
+    return YES;
+}
+
+// And a frame no smaller than the cell says it needs to draw in.
+//
+// The zoom control used to be sized as two 36-point segments with nothing left
+// over for the bezel, so the trailing edge of the last segment was drawn
+// outside the frame and clipped -- visible on Mavericks as a flattened
+// right-hand side on both magnifiers. PVSizeTitleBarControl asks the control
+// how big it needs to be instead of doing that arithmetic, and this is the
+// assertion that keeps it asking.
+static BOOL TitleBarControlsAreUnclipped(NSArray *controls)
+{
+    NSUInteger i;
+    if ([controls count] == 0) return NO;
+    for (i = 0; i < [controls count]; i++) {
+        NSControl *c = [controls objectAtIndex:i];
+        NSSize needed = [[c cell] cellSize];
+        if (NSWidth([c frame])  < needed.width  - 0.5) return NO;
+        if (NSHeight([c frame]) < needed.height - 0.5) return NO;
+    }
+    return YES;
+}
+
 static void Snap(NSWindow *win, NSString *path)
 {
     NSView *v = [win contentView];
@@ -4421,100 +4523,146 @@ static int RunUI(int argc, const char *argv[])
         printf("\n[1] default view, fit width\n");
         Snap([wc window], [out stringByAppendingPathComponent:@"01-default.png"]);
 
-        // Toolbar centring, checked at two very different window widths. This
-        // is the regression that showed up as "the toolbar is not centred on an
-        // iMac": with a plain trailing flexible space the controls drifted
-        // further right the wider the window got.
-        printf("\n[1b] the toolbar keeps its shape as the window widens\n");
+        // Title-bar layout, checked at three very different window widths.
+        // This is the regression that showed up as "the toolbar is not centred
+        // on an iMac": with a plain trailing flexible space the controls
+        // drifted further right the wider the window got. The toolbar is gone
+        // -- the controls sit in the title bar itself now -- but the question
+        // is the same one, and so is the answer it has to give.
+        printf("\n[1b] the title bar keeps its shape as the window widens\n");
         {
-            // Checked on the LIVE toolbar rather than on freshly built items,
-            // because what is being pinned is how AppKit lays them out -- which
-            // is the part that has changed repeatedly between 10.9 and now, and
-            // the part that produced the clipped zoom control on Mavericks.
+            // Checked on the LIVE controls rather than on freshly built ones,
+            // because what is being pinned is where they end up once the window
+            // has laid itself out -- which is the part that has changed
+            // repeatedly between 10.9 and now, and the part that produced the
+            // clipped zoom control on Mavericks.
             CGFloat widths[] = { 700, 900, 1900 };
+            // Where they sat at the narrowest width, to compare the wider ones
+            // against. See the assertion at the bottom of the loop.
+            NSString *firstShape = nil;
             unsigned wi;
             for (wi = 0; wi < sizeof(widths)/sizeof(*widths); wi++) {
-                NSRect f = [[wc window] frame];
+                NSWindow *win = [wc window];
+                NSRect f = [win frame];
                 f.size.width = widths[wi];
-                [[wc window] setFrame:f display:YES];
+                [win setFrame:f display:YES];
                 Pump(0.4);
 
-                NSArray *items = [[[wc window] toolbar] items];
-                NSView *sidebar = nil, *zoom = nil;
+                NSArray *names = nil;
+                NSArray *controls = TitleBarControls(wc, &names);
+                char msg[320];
+
+                snprintf(msg, sizeof msg,
+                         "the title bar has its controls at %.0f pt wide (%lu of them)",
+                         widths[wi], (unsigned long)[controls count]);
+                OK([controls count] >= 2, msg);
+                if ([controls count] < 2) continue;
+
+                // The window's own coordinates rather than the content view's:
+                // these live in the title bar, which is above the content view
+                // and not inside it. The band they have to stay within runs
+                // from the top of the content rect to the top of the frame --
+                // measured off the window, the way -layoutTitleBarControls
+                // measures it, rather than assumed to be 22 points.
+                CGFloat windowW   = NSWidth([win frame]);
+                CGFloat windowH   = NSHeight([win frame]);
+                CGFloat barBottom = NSHeight([win contentRectForFrameRect:[win frame]]);
+
+                BOOL onScreen = YES, whole = YES, separate = YES;
+                NSRect previous = NSZeroRect;
+                NSMutableString *where = [NSMutableString string];
                 NSUInteger k;
-                for (k = 0; k < [items count]; k++) {
-                    NSToolbarItem *it = [items objectAtIndex:k];
-                    if ([[it itemIdentifier] isEqualToString:@"PVToolbarSidebar"]) sidebar = [it view];
-                    if ([[it itemIdentifier] isEqualToString:@"PVToolbarZoom"])    zoom    = [it view];
+                for (k = 0; k < [controls count]; k++) {
+                    NSView *c = [controls objectAtIndex:k];
+                    NSRect r = [c convertRect:[c bounds] toView:nil];
+                    [where appendFormat:@"%@%@ %.0f..%.0f", (k ? @", " : @""),
+                                        [names objectAtIndex:k], NSMinX(r), NSMaxX(r)];
+
+                    // On screen at all: in a window, in a view tree, and not
+                    // hidden. Full screen hides them -- there is no title bar
+                    // to be in, and left visible they smear down the left edge
+                    // of the document as the clip view copies on scroll -- and
+                    // this window is not in full screen.
+                    if (![c window] || ![c superview] ||
+                        [c isHiddenOrHasHiddenAncestor]) onScreen = NO;
+
+                    // Wholly inside the window, and inside the title bar rather
+                    // than over the page.
+                    //
+                    // Deliberately not "leading" or "trailing": which edge they
+                    // sit at is the system's own convention and differs by
+                    // release -- 10.9 packs them left with the title on its own
+                    // row, macOS 11 and later reserve the leading region for
+                    // the title. Asserting one of those would be asserting
+                    // against the platform on the other. What must hold on
+                    // every release is that they are on screen, whole, in the
+                    // bar, and separate.
+                    if (NSMinX(r) < -0.5 || NSMaxX(r) > windowW + 0.5 ||
+                        NSMinY(r) < barBottom - 0.5 || NSMaxY(r) > windowH + 0.5)
+                        whole = NO;
+
+                    // And not on top of the one to its left. They are laid out
+                    // with a measured gap between them, so unlike the toolbar
+                    // items they replaced -- whose boxes abutted with the
+                    // bezels inset inside them -- these must not touch at all.
+                    if (k > 0 && NSMinX(r) < NSMaxX(previous) - 0.5) separate = NO;
+                    previous = r;
                 }
-                char msg[160];
-                if (!sidebar || !zoom || ![sidebar window] || ![zoom window]) {
+
+                snprintf(msg, sizeof msg, "every control is on screen at %.0f pt wide (%s)",
+                         widths[wi], [where UTF8String]);
+                OK(onScreen, msg);
+
+                snprintf(msg, sizeof msg,
+                         "every control is whole and in the title bar at %.0f pt wide "
+                         "(%s, window %.0f wide, bar from %.0f up)",
+                         widths[wi], [where UTF8String], windowW, barBottom);
+                OK(whole, msg);
+
+                snprintf(msg, sizeof msg, "no two controls overlap at %.0f pt wide (%s)",
+                         widths[wi], [where UTF8String]);
+                OK(separate, msg);
+
+                // Nor on top of the traffic lights, which is what
+                // -layoutTitleBarControls measures from rather than guessing
+                // at: a system that spaces those differently pushes these
+                // along instead of letting them collide.
+                NSButton *zoomButton = [win standardWindowButton:NSWindowZoomButton];
+                if (zoomButton) {
+                    NSView *first = [controls objectAtIndex:0];
                     snprintf(msg, sizeof msg,
-                             "both toolbar controls are on screen at %.0f pt wide", widths[wi]);
-                    OK(NO, msg);
-                    continue;
+                             "the controls clear the window buttons at %.0f pt wide "
+                             "(buttons end %.0f, controls start %.0f)",
+                             widths[wi], NSMaxX([zoomButton frame]), NSMinX([first frame]));
+                    OK(NSMinX([first frame]) >= NSMaxX([zoomButton frame]) - 0.5, msg);
                 }
 
-                NSRect sr = [sidebar convertRect:[sidebar bounds] toView:nil];
-                NSRect zr = [zoom    convertRect:[zoom    bounds] toView:nil];
-                CGFloat windowW = NSWidth([[[wc window] contentView] bounds]);
-
-                // Both fully inside the window, and not on top of each other.
-                //
-                // Deliberately not "leading" or "trailing": which edge they sit
-                // at is the system's own convention and differs by release --
-                // 10.9 packs them left with the title on its own row, macOS 11
-                // and later reserve the leading region for the title and lay
-                // them out trailing. Asserting one of those would be asserting
-                // against the platform on the other. What must hold on every
-                // release is that they are on screen, whole, and separate.
                 snprintf(msg, sizeof msg,
-                         "both controls are wholly inside the window at %.0f pt wide "
-                         "(sidebar %.0f..%.0f, zoom %.0f..%.0f, window %.0f)",
-                         widths[wi], NSMinX(sr), NSMaxX(sr), NSMinX(zr), NSMaxX(zr), windowW);
-                // The couple of points of slack between the two is AppKit's own
-                // item spacing: the boxes abut and the bezels sit inset within
-                // them, so their frames touch by a point or two without the
-                // controls ever overlapping on screen.
-                OK(NSMinX(sr) >= -0.5 && NSMaxX(zr) <= windowW + 0.5 &&
-                   NSMinX(zr) >= NSMaxX(sr) - 4.0, msg);
+                         "they are equal-height textured segmented controls at %.0f pt wide",
+                         widths[wi]);
+                OK(TitleBarControlsAreWellShaped(controls), msg);
 
-                // Same height, same vertical centre: they have to read as one
-                // group, which they did not when they were built from
-                // unrelated numbers.
                 snprintf(msg, sizeof msg,
-                         "the two controls share a height and a baseline at %.0f pt wide",
+                         "no control is clipped by the frame it was given at %.0f pt wide",
                          widths[wi]);
-                OK(fabs(NSHeight(sr) - NSHeight(zr)) < 1.0 &&
-                   fabs(NSMidY(sr) - NSMidY(zr)) < 1.0, msg);
+                OK(TitleBarControlsAreUnclipped(controls), msg);
 
-                // Equal wrapper views are not enough.  Mavericks gives a
-                // textured NSButton and a textured NSSegmentedControl
-                // different native bezel heights inside those wrappers.  The
-                // thumbnail control intentionally uses the same one-segment
-                // segmented control as +/- so the pixels, not just the boxes,
-                // stay aligned on that release.
-                NSArray *ssubs = [sidebar subviews];
-                NSArray *zsubs = [zoom subviews];
-                NSView *scontrol = ([ssubs count] > 0) ? [ssubs objectAtIndex:0] : nil;
-                NSView *zcontrol = ([zsubs count] > 0) ? [zsubs objectAtIndex:0] : nil;
-                snprintf(msg, sizeof msg,
-                         "the thumbnail and +/- use equal-height segmented controls at %.0f pt wide",
-                         widths[wi]);
-                OK([scontrol isKindOfClass:[NSSegmentedControl class]] &&
-                   [zcontrol isKindOfClass:[NSSegmentedControl class]] &&
-                   fabs(NSHeight([scontrol frame]) - NSHeight([zcontrol frame])) < 0.01,
-                   msg);
-
-                // And neither is clipped by the item that holds it: the zoom
-                // control used to be given 74 points for two 36-point segments,
-                // leaving nothing for the bezel and cutting the outer edge off
-                // both magnifiers.  (zsubs is the one fetched above.)
-                snprintf(msg, sizeof msg, "the zoom control is not clipped at %.0f pt wide",
-                         widths[wi]);
-                OK([zsubs count] > 0 &&
-                   NSMaxX([(NSView *)[zsubs objectAtIndex:0] frame]) <= NSWidth([zoom bounds]) + 0.01,
-                   msg);
+                // And in the SAME place at every width, which is the regression
+                // this section is named for and the one thing the toolbar
+                // version could not check. The controls are laid out from the
+                // traffic lights outwards, so a wider window adds room to the
+                // right of them and moves nothing; controls that drift with the
+                // width are "the toolbar is not centred on an iMac" coming
+                // back, and they would stay inside the window for a very long
+                // way before any of the checks above noticed them going.
+                if (wi == 0) {
+                    firstShape = [[where copy] autorelease];
+                } else {
+                    snprintf(msg, sizeof msg,
+                             "the controls have not moved at %.0f pt wide (%s, was %s)",
+                             widths[wi], [where UTF8String], [firstShape UTF8String]);
+                    OK([where isEqualToString:firstShape], msg);
+                }
             }
         }
         [[wc window] setFrame:NSMakeRect(120, 120, 900, 760) display:YES];
@@ -6965,9 +7113,11 @@ static int RunUI(int argc, const char *argv[])
             OK([[wc2 window] representedURL] != nil,
                "the window has a represented URL, so it gets a proxy icon");
 
-            // The toolbar is two items now, and both draw from the bundled
-            // artwork rather than from text. A missing asset is a blank
-            // button, which is not something a build should be able to ship.
+            // Two controls in the title bar now, and both draw from the
+            // bundled artwork rather than from text. A missing asset is a
+            // blank button, which is not something a build should be able to
+            // ship -- the names are still the toolbar's because the artwork
+            // and the loader that finds it are the parts that did not change.
             OK(PVToolbarImageNamed(@"TB_contentAndThumbs") != nil, "the sidebar icon is in the bundle");
             OK(PVToolbarImageNamed(@"TB_zoomIn")  != nil, "the zoom-in icon is in the bundle");
             OK(PVToolbarImageNamed(@"TB_zoomOut") != nil, "the zoom-out icon is in the bundle");
@@ -6984,43 +7134,38 @@ static int RunUI(int argc, const char *argv[])
                (actual & NSApplicationPresentationAutoHideToolbar) != 0,
                "full screen detaches and hides the toolbar until the top-edge reveal");
 
-            NSArray *ids = [wc2 toolbarDefaultItemIdentifiers:[[wc2 window] toolbar]];
-            OK([ids count] == 2, "the toolbar is down to two items");
+            // No NSToolbar at all, and that absence is the point rather than a
+            // side effect. A toolbar on 10.9 is a SECOND strip of chrome below
+            // the title bar -- call it 38 points of window given over to
+            // holding three small buttons, on a machine whose screen is 800
+            // points tall. The controls went into the title bar itself so the
+            // page could have those points back, and a build that grew a
+            // toolbar again would take them straight back off it.
+            OK([[wc2 window] toolbar] == nil,
+               "the window carries no toolbar band, only its title bar");
 
-            // Every item the same height, and none of them clipped: the zoom
-            // control used to be pinned to 74 points for two 36-point segments,
-            // which left nothing for the bezel and cut the outer edge off both
-            // magnifiers on Mavericks.
-            BOOL sameHeight = YES, fits = YES, matchingControls = YES;
-            CGFloat firstH = -1;
-            CGFloat firstControlH = -1;
+            NSArray *titleBar = TitleBarControls(wc2, NULL);
+            OK([titleBar count] >= 2, "the title bar has its controls");
+
+            // In the chrome of THIS window. [1b] asks the same questions of
+            // the first window as it is resized; this one was built from
+            // restored state and never resized, so it is the one that says
+            // -installTitleBarControls runs for every window rather than for
+            // the first one the process happens to open.
+            NSView *chrome =
+                [[[wc2 window] standardWindowButton:NSWindowCloseButton] superview];
+            BOOL installed = ([titleBar count] > 0 && chrome != nil);
             NSUInteger ii;
-            for (ii = 0; ii < [ids count]; ii++) {
-                NSToolbarItem *it = [wc2 toolbar:[[wc2 window] toolbar]
-                           itemForItemIdentifier:[ids objectAtIndex:ii]
-                       willBeInsertedIntoToolbar:YES];
-                NSView *v = [it view];
-                if (!v) continue;          // the flexible space has no view
-                if (fabs([v frame].size.height - [it minSize].height) > 0.01) sameHeight = NO;
-                if (firstH < 0) firstH = [v frame].size.height;
-                else if (fabs([v frame].size.height - firstH) > 0.01) sameHeight = NO;
-                // The control inside must fit the box it was given, or it is
-                // being clipped.
-                NSArray *subs = [v subviews];
-                if ([subs count] > 0) {
-                    NSRect cf = [(NSView *)[subs objectAtIndex:0] frame];
-                    if (![(NSView *)[subs objectAtIndex:0] isKindOfClass:[NSSegmentedControl class]])
-                        matchingControls = NO;
-                    if (firstControlH < 0) firstControlH = cf.size.height;
-                    else if (fabs(cf.size.height - firstControlH) > 0.01) matchingControls = NO;
-                    if (NSMaxX(cf) > NSWidth([v frame]) + 0.01 ||
-                        NSMaxY(cf) > NSHeight([v frame]) + 0.01 ||
-                        NSMinX(cf) < -0.01 || NSMinY(cf) < -0.01) fits = NO;
-                }
-            }
-            OK(sameHeight, "every toolbar item is the same height");
-            OK(matchingControls, "toolbar children are equal-height segmented controls on Mavericks");
-            OK(fits, "no toolbar control is clipped by the item that holds it");
+            for (ii = 0; ii < [titleBar count]; ii++)
+                if ([(NSView *)[titleBar objectAtIndex:ii] superview] != chrome)
+                    installed = NO;
+            OK(installed,
+               "installed in the view that owns the close, minimise and zoom buttons");
+
+            OK(TitleBarControlsAreWellShaped(titleBar),
+               "they are equal-height textured segmented controls on Mavericks");
+            OK(TitleBarControlsAreUnclipped(titleBar),
+               "no control is clipped by the frame it was given");
 
             [[wc2 window] performClose:nil];
             Pump(0.5);
@@ -7077,7 +7222,21 @@ static int RunUI(int argc, const char *argv[])
                 Pump(0.3);
                 OK([[wc3 valueForKey:@"_splitView"] superview] == nil,
                    "closing detaches the view tree from the window");
-                OK([heldWindow toolbar] == nil, "and takes the toolbar with it");
+                // The toolbar this used to check for is gone; what teardown
+                // now has to take off the window is the title-bar controls,
+                // and for a sharper reason. Their target is this controller
+                // and a target is not retained, so a control left in the
+                // chrome of a window AppKit will never release is a control
+                // that outlives the controller it points at, still wired to
+                // send it messages.
+                NSArray *titleBar = TitleBarControls(wc3, NULL);
+                BOOL detached = ([titleBar count] > 0);
+                NSUInteger bi;
+                for (bi = 0; bi < [titleBar count]; bi++) {
+                    NSControl *c = [titleBar objectAtIndex:bi];
+                    if ([c superview] || [c target]) detached = NO;
+                }
+                OK(detached, "and takes the title-bar controls off it, target and all");
 
                 [wc3 release];
                 [s3 release];
