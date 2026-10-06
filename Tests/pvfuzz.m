@@ -39,11 +39,17 @@ static void CHECK(int cond, const char *what, const char *detail)
 // machine -- which is exactly what happened the first time this ran, with a
 // soak in another terminal spawning helpers of its own. What this probe can
 // speak for is its own children, so that is what it counts.
+//
+// Matched against the whole line, not one field. `comm` is the executable's
+// full path, and in a tree whose path has a space in it -- this repository's
+// own, "Mavericks Projects" -- the path splits across fields: the field that
+// was tested never named the helper, so the probe could never see a
+// helper left running, and "no helper is left running" passed vacuously.
 static int LiveHelpers(void)
 {
     char cmd[256];
     snprintf(cmd, sizeof cmd,
-             "/bin/ps -axo ppid=,comm= | /usr/bin/awk '$1==%d && $2 ~ /PostviewRenderHelper/' "
+             "/bin/ps -axo ppid=,comm= | /usr/bin/awk '$1==%d && $0 ~ /PostviewRenderHelper/' "
              "| /usr/bin/wc -l", (int)getpid());
     FILE *p = popen(cmd, "r");
     if (!p) return -1;

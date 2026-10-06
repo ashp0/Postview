@@ -2855,6 +2855,23 @@ static void PVSizeTitleBarControl(NSSegmentedControl *c)
 - (void)windowDidExitFullScreen:(NSNotification *)note
 {
     (void)note;
+    [self showTitleBarControls];
+}
+
+// The transition into full screen can be refused after it has been announced,
+// and then -windowDidExitFullScreen: never comes: there was no full screen to
+// leave. The controls were hidden on the announcement, so without this they
+// stayed hidden for the rest of the window's life -- a title bar with no way to
+// reach the sidebar or the zoom from it -- over a window still in its ordinary
+// frame. The window never left the title bar, so this is the same restore.
+- (void)windowDidFailToEnterFullScreen:(NSWindow *)window
+{
+    (void)window;
+    [self showTitleBarControls];
+}
+
+- (void)showTitleBarControls
+{
     [_titleBarSidebar setHidden:NO];
     [_titleBarZoom    setHidden:NO];
     // The frame changed twice on the way out and the title bar's height is

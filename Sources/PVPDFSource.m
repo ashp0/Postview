@@ -121,14 +121,22 @@ static CGSize PVUsablePageSize(CGSize s)
 //
 // Opt-in through the environment, so that no shipping build can take this path
 // by accident and a developer can turn it on for a single run.
+//
+// Resolved once, under dispatch_once. The first caller is whichever thread
+// opens a document first, and PVDocument reads documents concurrently -- a
+// multi-file Open hands each one to its own thread -- so a lazily filled
+// static here was an unsynchronised write two threads could make at once.
+// Both would have written the same value, which is why it never showed; it is
+// still a data race, and the same pattern PVStatsEnabled already avoids.
 static BOOL PVHelperKeepsDiagnostics(void)
 {
-    static int cached = -1;
-    if (cached < 0) {
+    static BOOL keeps;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
         const char *value = getenv("PV_HELPER_DIAGNOSTICS");
-        cached = (value && *value && strcmp(value, "0") != 0) ? 1 : 0;
-    }
-    return cached ? YES : NO;
+        keeps = (value && *value && strcmp(value, "0") != 0) ? YES : NO;
+    });
+    return keeps;
 }
 
 // The environment a helper is spawned with: none at all, unless diagnostics are
@@ -1195,7 +1203,31 @@ failed:
 // or retired.
 - (BOOL)ensureRenderHelper:(PVRenderFailure *)outFailure
 {
-    if (_helperPid > 0 && _helperIn >= 0 && _helperOut >= 0) return YES;
+    if (_helperPid > 0 && _helperIn >= 0 && _helperOut >= 0) {
+        // Still alive, asked rather than assumed.
+        //
+        // A helper that died between renders -- killed, or gone for any other
+        // reason while it sat waiting for a command -- still satisfies every
+        // test above: the pid is stale and both descriptors stay open until
+        // I/O on them fails. So its death used to be discovered by FAILING the
+        // next render, which the layer above then retried after a backoff: one
+        // page blank for a quarter of a second, every time, for a fault that
+        // was knowable before the command was sent. Measured by `make
+        // helperkill`, arm A: recovery cost exactly one failed render.
+        //
+        // One non-blocking waitpid answers it, against a render measured in
+        // milliseconds to seconds. A helper that has exited is reaped HERE, so
+        // its pid is dropped before -stopRenderHelper runs: a pid that has been
+        // waited for may already belong to another process, and must not be
+        // sent the SIGKILL that function would otherwise deliver.
+        int status = 0;
+        pid_t reaped;
+        do { reaped = waitpid(_helperPid, &status, WNOHANG); }
+        while (reaped < 0 && errno == EINTR);
+        if (!(reaped == _helperPid || (reaped < 0 && errno == ECHILD))) return YES;
+        _helperPid = 0;
+        [self stopRenderHelper];
+    }
     if (_helperUnavailable) {
         *outFailure = PVRenderFailureHelperUnavailable;
         return NO;

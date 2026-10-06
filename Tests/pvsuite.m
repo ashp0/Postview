@@ -2249,6 +2249,202 @@ static void TestAnnotations(NSString *path)
     [src release];
 }
 
+// A helper that dies while it is idle is replaced before the next page is sent
+// to it, not discovered by failing that page.
+//
+// Its pid and both descriptors outlive it -- the pid goes stale and the pipes
+// stay open until I/O on them fails -- so -ensureRenderHelper: used to hand the
+// command to a dead process, the render failed as a protocol error, and the
+// page sat blank through a retry backoff for a fault that was knowable first.
+// `make helperkill` measured it as exactly one failed render per death.
+static void TestDeadHelperReplacedBeforeRender(NSURL *url)
+{
+    printf("\n[a helper that died while idle is replaced before the next render]\n");
+    NSError *err = nil;
+    PVPDFSource *src = [[PVPDFSource alloc] initWithURL:url error:&err];
+    if (!src) { OK(NO, "a fresh source for the dead-helper check"); return; }
+
+    PVRenderFailure f = PVRenderFailureNone;
+    CGImageRef im = [src createImageForPage:0 pixelSize:CGSizeMake(120, 160)
+                                interactive:NO failure:&f];
+    OK(im != NULL, "the first render starts a helper and succeeds");
+    if (im) CGImageRelease(im);
+
+    int round, recovered = 0, rounds = 5;
+    for (round = 0; round < rounds; round++) {
+        pid_t helper = (pid_t)[[src valueForKey:@"_helperPid"] intValue];
+        if (helper <= 0) { OK(NO, "there is a live helper to kill"); break; }
+        kill(helper, SIGKILL);
+        // Long enough for the kernel to finish the death -- a SIGKILLed process
+        // is a zombie within microseconds -- and nothing reaps it but the source.
+        usleep(100000);
+
+        f = PVRenderFailureNone;
+        im = [src createImageForPage:(NSUInteger)(round % [src pageCount])
+                           pixelSize:CGSizeMake(120, 160) interactive:NO failure:&f];
+        if (im && f == PVRenderFailureNone) recovered++;
+        if (im) CGImageRelease(im);
+        pid_t next = (pid_t)[[src valueForKey:@"_helperPid"] intValue];
+        if (next == helper) { OK(NO, "the dead helper's pid is not kept"); break; }
+    }
+    char msg[160];
+    snprintf(msg, sizeof msg,
+             "the render after an idle helper is killed succeeds first time (%d of %d)",
+             recovered, rounds);
+    OK(recovered == rounds, msg);
+    [src release];
+}
+
+// Four pages, /Rotate 0, 90, 180 and 270, each with a crop box whose origin is
+// (100, 50) rather than (0, 0). The content stream draws a black 50 pt square at
+// the crop box's corner and an annotation's appearance stream draws a red 30 pt
+// one further in, so where each lands says which transform drew it.
+//
+// Hand-built for the same reason as Tests/make_annot_fixture.py -- CoreGraphics
+// cannot author an appearance stream -- and built here rather than by the
+// Makefile so this check cannot be skipped by a fixture that was never made.
+static NSData *PlacedAnnotationFixture(void)
+{
+    NSMutableArray *objs = [NSMutableArray array];   // object n is at index n-1
+    [objs addObject:@"<< /Type /Catalog /Pages 2 0 R >>"];
+    [objs addObject:@"<< /Type /Pages /Kids [3 0 R 6 0 R 9 0 R 12 0 R] /Count 4 >>"];
+    NSString *ink = @"0 g 100 50 50 50 re f";
+    NSString *ap  = @"1 0 0 rg 0 0 30 30 re f";
+    int rotations[4] = { 0, 90, 180, 270 }, i;
+    for (i = 0; i < 4; i++) {
+        int page = 3 + 3 * i;
+        [objs addObject:[NSString stringWithFormat:
+            @"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 500 250] "
+             "/CropBox [100 50 500 250] /Rotate %d /Contents %d 0 R "
+             "/Resources << >> /Annots [%d 0 R] >>", rotations[i], page + 1, page + 2]];
+        [objs addObject:[NSString stringWithFormat:
+            @"<< /Length %lu >>\nstream\n%@\nendstream", (unsigned long)[ink length], ink]];
+        [objs addObject:[NSString stringWithFormat:
+            @"<< /Type /Annot /Subtype /Square /Rect [400 170 430 200] /F 4 "
+             "/AP << /N %d 0 R >> >>", 15 + i]];
+    }
+    for (i = 0; i < 4; i++)
+        [objs addObject:[NSString stringWithFormat:
+            @"<< /Type /XObject /Subtype /Form /BBox [0 0 30 30] /Resources << >> "
+             "/Length %lu >>\nstream\n%@\nendstream", (unsigned long)[ap length], ap]];
+
+    NSMutableString *pdf = [NSMutableString stringWithString:@"%PDF-1.4\n"];
+    NSMutableArray *offsets = [NSMutableArray array];
+    NSUInteger n;
+    for (n = 0; n < [objs count]; n++) {
+        [offsets addObject:[NSNumber numberWithUnsignedInteger:[pdf length]]];
+        [pdf appendFormat:@"%lu 0 obj\n%@\nendobj\n", (unsigned long)(n + 1),
+                          [objs objectAtIndex:n]];
+    }
+    NSUInteger xref = [pdf length];
+    [pdf appendFormat:@"xref\n0 %lu\n0000000000 65535 f \n", (unsigned long)([objs count] + 1)];
+    for (n = 0; n < [offsets count]; n++)
+        [pdf appendFormat:@"%010lu 00000 n \n",
+                          (unsigned long)[[offsets objectAtIndex:n] unsignedIntegerValue]];
+    [pdf appendFormat:@"trailer\n<< /Size %lu /Root 1 0 R >>\nstartxref\n%lu\n%%%%EOF\n",
+                      (unsigned long)([objs count] + 1), (unsigned long)xref];
+    return [pdf dataUsingEncoding:NSASCIIStringEncoding];
+}
+
+typedef struct { double x, y; long n; } PVInkBlob;
+
+// Where the black ink and the red ink each landed, as centroids in image
+// coordinates (y = 0 at the top), with how many pixels of each there were.
+static void FindInk(CGImageRef img, PVInkBlob *black, PVInkBlob *red)
+{
+    memset(black, 0, sizeof *black);
+    memset(red, 0, sizeof *red);
+    size_t w = CGImageGetWidth(img), h = CGImageGetHeight(img), stride = w * 4;
+    uint32_t *buf = (uint32_t *)calloc(h, stride);
+    if (!buf) return;
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef c = CGBitmapContextCreate(buf, w, h, 8, stride, cs,
+        (CGBitmapInfo)kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Host);
+    CGColorSpaceRelease(cs);
+    if (c) {
+        CGContextDrawImage(c, CGRectMake(0, 0, w, h), img);
+        size_t x, y;
+        for (y = 0; y < h; y++)
+            for (x = 0; x < w; x++) {
+                uint32_t p = buf[y * w + x];
+                unsigned r = (p >> 16) & 255, g = (p >> 8) & 255, b = p & 255;
+                if (r < 40 && g < 40 && b < 40) { black->x += x; black->y += y; black->n++; }
+                if (r > 200 && g < 60 && b < 60) { red->x += x; red->y += y; red->n++; }
+            }
+        CGContextRelease(c);
+    }
+    free(buf);
+    if (black->n) { black->x /= black->n; black->y /= black->n; }
+    if (red->n)   { red->x /= red->n;     red->y /= red->n; }
+}
+
+// An annotated page is drawn by PDFKit, which applies the page's /Rotate and
+// moves its crop box to the origin by itself. The context it was handed already
+// had both, so every annotated page that was rotated, or cropped anywhere but at
+// (0, 0), was moved and turned twice: off the bitmap, or onto the wrong side of
+// it. The single-page fixture above has neither, which is why it passed.
+//
+// The content-stream square has to land exactly where the ordinary Quartz path
+// puts it -- the expected centroids below are that path's, the same geometry
+// TestRotation checks -- and the annotation's square has to be drawn at all and
+// in the corresponding place.
+static void TestAnnotationPlacement(void)
+{
+    printf("\n[annotation placement — rotated pages and offset crop boxes]\n");
+    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:
+        [NSString stringWithFormat:@"pvsuite-annot-placed-%d.pdf", (int)getpid()]];
+    if (![PlacedAnnotationFixture() writeToFile:path atomically:YES]) {
+        OK(NO, "placed-annotation fixture written");
+        return;
+    }
+    NSError *err = nil;
+    PVPDFSource *src = [[PVPDFSource alloc] initWithURL:[NSURL fileURLWithPath:path]
+                                                  error:&err];
+    if (!src) {
+        OK(NO, "placed-annotation fixture opened");
+        [[NSFileManager defaultManager] removeItemAtPath:path error:NULL];
+        return;
+    }
+    OK([src pageCount] == 4, "placed-annotation fixture has 4 pages");
+
+    struct { int rot; CGSize size; double bx, by, rx, ry; } expect[] = {
+        {   0, { 400, 200 },  24.5, 174.5, 314.5,  64.5 },
+        {  90, { 200, 400 },  24.5,  24.5, 134.5, 314.5 },
+        { 180, { 400, 200 }, 374.5,  24.5,  84.5, 134.5 },
+        { 270, { 200, 400 }, 174.5, 374.5,  64.5,  84.5 },
+    };
+    int i;
+    for (i = 0; i < 4 && (NSUInteger)i < [src pageCount]; i++) {
+        CGSize sz = [src pointSizeOfPage:(NSUInteger)i];
+        char msg[200];
+        snprintf(msg, sizeof msg, "/Rotate %d with an offset crop box measures %.0fx%.0f",
+                 expect[i].rot, sz.width, sz.height);
+        OK(fabs(sz.width - expect[i].size.width) < 0.5 &&
+           fabs(sz.height - expect[i].size.height) < 0.5, msg);
+
+        CGImageRef im = [src createImageForPage:(NSUInteger)i pixelSize:expect[i].size];
+        if (!im) { OK(NO, "placed annotated page rendered"); continue; }
+        PVInkBlob black, red;
+        FindInk(im, &black, &red);
+        CGImageRelease(im);
+
+        snprintf(msg, sizeof msg,
+                 "/Rotate %d: the page's own content lands where Quartz puts it "
+                 "(%ld px at %.1f,%.1f; want 2500 at %.1f,%.1f)",
+                 expect[i].rot, black.n, black.x, black.y, expect[i].bx, expect[i].by);
+        OK(black.n > 2250 && black.n < 2750 &&
+           fabs(black.x - expect[i].bx) < 2.0 && fabs(black.y - expect[i].by) < 2.0, msg);
+        snprintf(msg, sizeof msg,
+                 "/Rotate %d: and the annotation is drawn beside it "
+                 "(%ld px at %.1f,%.1f; want 900 at %.1f,%.1f)",
+                 expect[i].rot, red.n, red.x, red.y, expect[i].rx, expect[i].ry);
+        OK(red.n > 810 && red.n < 990 &&
+           fabs(red.x - expect[i].rx) < 2.0 && fabs(red.y - expect[i].ry) < 2.0, msg);
+    }
+    [src release];
+    [[NSFileManager defaultManager] removeItemAtPath:path error:NULL];
+}
+
 static void TestRotation(NSString *path)
 {
     printf("\n[page rotation — /Rotate 0, 90, 180, 270]\n");
@@ -2550,18 +2746,24 @@ static void TestOversizedPageGeometry(void)
 // the class already, and the test has no business reaching around them.
 @interface PVAppDelegate (PVTestHooks)
 - (void)saveOpenDocumentState;
+- (void)saveAllOpenDocuments;
 - (void)stopObservingNotifications;
 @end
 
 // Counts the saves instead of performing them, so the test is about which
 // notification centre the delegate listened to and not about the disk.
+//
+// `censuses` counts the other kind of save: the one that also emits the
+// rasterisation census, which belongs to the end of a run and nowhere else.
 @interface PVSleepProbeDelegate : PVAppDelegate {
 @public
     NSUInteger saves;
+    NSUInteger censuses;
 }
 @end
 @implementation PVSleepProbeDelegate
 - (void)saveOpenDocumentState { saves++; }
+- (void)saveAllOpenDocuments  { censuses++; [self saveOpenDocumentState]; }
 @end
 
 // Sleep is a save point. See ENGINEERING.md section 10.
@@ -2593,6 +2795,20 @@ static void TestSleepSavesReadingPosition(void)
     OK(d->saves == before,
        "the default centre is not where that notification lives");
 
+    // Sleeping is a save point and not the end of a run, so it writes the
+    // reading position without the census.
+    OK(d->censuses == 0, "sleep does not emit the end-of-run census");
+
+    // Neither is switching to another application. Deactivation used to take
+    // the census path, so every Cmd-Tab put a partial census on stderr and
+    // rewrote PVStatsPath with a partial total.
+    before = d->saves;
+    NSUInteger censusesBefore = d->censuses;
+    [d applicationDidResignActive:[NSNotification notificationWithName:
+        NSApplicationDidResignActiveNotification object:nil]];
+    OK(d->saves == before + 1, "switching away from Postview writes the reading position");
+    OK(d->censuses == censusesBefore, "and does not emit the end-of-run census");
+
     // And the way out. The workspace centre holds observers unsafely, so a
     // delegate that unregistered from only the default centre would leave a
     // freed pointer behind to be messaged at the next sleep.
@@ -2601,7 +2817,112 @@ static void TestSleepSavesReadingPosition(void)
     [workspace postNotificationName:NSWorkspaceWillSleepNotification object:nil];
     OK(d->saves == before, "a torn-down delegate no longer hears about sleep");
 
+    // Quitting is the end of the run, and the one place the census belongs.
+    censusesBefore = d->censuses;
+    [d applicationWillTerminate:[NSNotification notificationWithName:
+        NSApplicationWillTerminateNotification object:nil]];
+    OK(d->censuses == censusesBefore + 1, "quitting emits the census, once");
+
     [d release];
+}
+
+// The document history and the disk, both made to say what this test needs.
+//
+// The history cannot be written from a bare test binary (see [1d] in the UI
+// suite), so -recentDocumentURLs is answered from gFakeRecents for the length of
+// the test. And a network share that has stopped answering cannot be summoned
+// on demand, so -fileExistsAtPath: is made to take PV_SLOW_STAT_SECONDS for any
+// path under gSlowPrefix -- which is what a stat on a dead mount looks like from
+// the thread that made it, minus the part where it never comes back.
+#define PV_SLOW_STAT_SECONDS 0.8
+static NSArray  *gFakeRecents    = nil;
+static NSString *gSlowPrefix     = nil;
+static IMP       gRealFileExists = NULL;
+
+static NSArray *PVFakeRecentDocumentURLs(id self, SEL _cmd)
+{
+    (void)self; (void)_cmd;
+    return gFakeRecents;
+}
+
+static BOOL PVSlowFileExists(id self, SEL _cmd, NSString *path)
+{
+    if (gSlowPrefix && [path hasPrefix:gSlowPrefix])
+        usleep((useconds_t)(PV_SLOW_STAT_SECONDS * 1e6));
+    return ((BOOL (*)(id, SEL, NSString *))gRealFileExists)(self, _cmd, path);
+}
+
+// The empty state checks every recent document against the disk, and it used
+// to do it on the main thread, at launch and on every click of the Dock icon. A
+// stat on a share that has stopped answering blocks rather than fails, so one
+// recent PDF on a sleeping NAS beachballed the app before it had a window.
+static void TestRecentsDoNotHoldTheMainThread(void)
+{
+    printf("\n[the recent-documents check never holds the main thread]\n");
+
+    NSString *dir  = NSTemporaryDirectory();
+    NSString *pid  = [NSString stringWithFormat:@"%d", (int)getpid()];
+    NSString *real = [dir stringByAppendingPathComponent:
+                      [NSString stringWithFormat:@"pvsuite-recent-%@-a.pdf", pid]];
+    NSString *late = [dir stringByAppendingPathComponent:
+                      [NSString stringWithFormat:@"pvsuite-recent-%@-b.pdf", pid]];
+    NSString *gone = [dir stringByAppendingPathComponent:
+                      [NSString stringWithFormat:@"pvsuite-recent-%@-gone.pdf", pid]];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    [@"%PDF" writeToFile:real atomically:YES encoding:NSASCIIStringEncoding error:NULL];
+    [@"%PDF" writeToFile:late atomically:YES encoding:NSASCIIStringEncoding error:NULL];
+    [fm removeItemAtPath:gone error:NULL];
+
+    Method recents = class_getInstanceMethod([NSDocumentController class],
+                                             @selector(recentDocumentURLs));
+    Method exists  = class_getInstanceMethod([NSFileManager class],
+                                             @selector(fileExistsAtPath:));
+    if (!recents || !exists) { OK(NO, "the history and the disk can be stood in for"); return; }
+    IMP realRecents = method_setImplementation(recents, (IMP)PVFakeRecentDocumentURLs);
+    gRealFileExists = method_setImplementation(exists, (IMP)PVSlowFileExists);
+
+    PVWelcomeWindowController *welcome = [PVWelcomeWindowController sharedController];
+    NSArray *shown;
+
+    // The ordinary case: the disk answers inside the wait, so the list is
+    // settled by the time -reloadRecents returns, exactly as it always was.
+    gFakeRecents = [[NSArray alloc] initWithObjects:
+        [NSURL fileURLWithPath:gone], [NSURL fileURLWithPath:real], nil];
+    [welcome reloadRecents];
+    shown = [welcome valueForKey:@"_recents"];
+    OK([shown count] == 1 && [[[shown objectAtIndex:0] path] isEqualToString:real],
+       "a missing file is dropped and the rest are listed before the window shows");
+
+    // A disk that does not answer. The main thread is let go at the wait...
+    [gFakeRecents release];
+    gFakeRecents = [[NSArray alloc] initWithObjects:[NSURL fileURLWithPath:late], nil];
+    gSlowPrefix  = [late copy];
+    double t0 = PVMonotonicSeconds();
+    [welcome reloadRecents];
+    double held = PVMonotonicSeconds() - t0;
+    char msg[160];
+    snprintf(msg, sizeof msg,
+             "a stat that will not answer holds the main thread only for the wait "
+             "(%.2f s, against a %.1f s stat)", held, PV_SLOW_STAT_SECONDS);
+    OK(held < PV_SLOW_STAT_SECONDS / 2, msg);
+    shown = [welcome valueForKey:@"_recents"];
+    OK([shown count] == 1 && [[[shown objectAtIndex:0] path] isEqualToString:real],
+       "and until it does, the list on screen is the one that was there");
+
+    // ...and the answer arrives on its own once the check comes back.
+    Pump(PV_SLOW_STAT_SECONDS + 0.7);
+    shown = [welcome valueForKey:@"_recents"];
+    OK([shown count] == 1 && [[[shown objectAtIndex:0] path] isEqualToString:late],
+       "the list is brought up to date when the check finishes");
+
+    method_setImplementation(exists, gRealFileExists);
+    method_setImplementation(recents, realRecents);
+    [gSlowPrefix release];  gSlowPrefix  = nil;
+    [gFakeRecents release]; gFakeRecents = nil;
+    // Back to what the real history says, so nothing after this sees the fake.
+    [welcome reloadRecents];
+    [fm removeItemAtPath:real error:NULL];
+    [fm removeItemAtPath:late error:NULL];
 }
 
 static void TestRunningLocation(void)
@@ -4111,6 +4432,7 @@ static int RunUnit(int argc, const char *argv[])
         TestSliverPageRatioBound();
         TestRunningLocation();
         TestSleepSavesReadingPosition();
+        TestRecentsDoNotHoldTheMainThread();
         TestRenderSuppressionPolicy();
         TestRamTierInvariants();
         TestResidentCensus();
@@ -4122,12 +4444,16 @@ static int RunUnit(int argc, const char *argv[])
         TestCostAwareEviction();
         TestInFlightFullCap(src, url);
         TestTwoLaneFullCap(src, url);
+        TestDeadHelperReplacedBeforeRender(url);
         TestArrowScrollStep();
         TestRowPairing();
         TestSmoothScrollPolicy();
         TestScenarioReplay();
         if (argc > 2) TestRotation([NSString stringWithUTF8String:argv[2]]);
         if (argc > 3) TestAnnotations([NSString stringWithUTF8String:argv[3]]);
+        // Self-contained: it writes its own fixture, so it runs whatever was
+        // passed above.
+        TestAnnotationPlacement();
         // Last, because REALPDF is optional: an empty expansion must not shift
         // a fixture that is always generated into somebody else's slot.
         if (argc > 4) TestArbitrary([NSString stringWithUTF8String:argv[4]]);
@@ -4421,63 +4747,55 @@ static int RunUI(int argc, const char *argv[])
         printf("\n[1] default view, fit width\n");
         Snap([wc window], [out stringByAppendingPathComponent:@"01-default.png"]);
 
-        // Toolbar centring, checked at two very different window widths. This
-        // is the regression that showed up as "the toolbar is not centred on an
-        // iMac": with a plain trailing flexible space the controls drifted
-        // further right the wider the window got.
-        printf("\n[1b] the toolbar keeps its shape as the window widens\n");
+        // The two controls, checked at very different window widths. They
+        // used to be NSToolbar items, and this block asked the toolbar for
+        // them; the toolbar went when they moved into the title bar (commit
+        // 4dae0a9), the block did not, and from then on it could only fail.
+        // What it was pinning still holds and is asked of where the controls
+        // now live: the view that owns the close, minimise and zoom buttons.
+        printf("\n[1b] the title-bar controls keep their shape as the window widens\n");
         {
-            // Checked on the LIVE toolbar rather than on freshly built items,
-            // because what is being pinned is how AppKit lays them out -- which
-            // is the part that has changed repeatedly between 10.9 and now, and
-            // the part that produced the clipped zoom control on Mavericks.
             CGFloat widths[] = { 700, 900, 1900 };
             unsigned wi;
             for (wi = 0; wi < sizeof(widths)/sizeof(*widths); wi++) {
-                NSRect f = [[wc window] frame];
+                NSWindow *w = [wc window];
+                NSRect f = [w frame];
                 f.size.width = widths[wi];
-                [[wc window] setFrame:f display:YES];
+                [w setFrame:f display:YES];
                 Pump(0.4);
 
-                NSArray *items = [[[wc window] toolbar] items];
-                NSView *sidebar = nil, *zoom = nil;
-                NSUInteger k;
-                for (k = 0; k < [items count]; k++) {
-                    NSToolbarItem *it = [items objectAtIndex:k];
-                    if ([[it itemIdentifier] isEqualToString:@"PVToolbarSidebar"]) sidebar = [it view];
-                    if ([[it itemIdentifier] isEqualToString:@"PVToolbarZoom"])    zoom    = [it view];
-                }
-                char msg[160];
-                if (!sidebar || !zoom || ![sidebar window] || ![zoom window]) {
+                NSSegmentedControl *sidebar = [wc valueForKey:@"_titleBarSidebar"];
+                NSSegmentedControl *zoom    = [wc valueForKey:@"_titleBarZoom"];
+                NSView *chrome = [[w standardWindowButton:NSWindowCloseButton] superview];
+                char msg[200];
+                if (!sidebar || !zoom || [sidebar window] != w || [zoom window] != w ||
+                    [sidebar superview] != chrome || [zoom superview] != chrome ||
+                    [sidebar isHidden] || [zoom isHidden]) {
                     snprintf(msg, sizeof msg,
-                             "both toolbar controls are on screen at %.0f pt wide", widths[wi]);
+                             "both controls are in the title bar at %.0f pt wide", widths[wi]);
                     OK(NO, msg);
                     continue;
                 }
 
                 NSRect sr = [sidebar convertRect:[sidebar bounds] toView:nil];
                 NSRect zr = [zoom    convertRect:[zoom    bounds] toView:nil];
-                CGFloat windowW = NSWidth([[[wc window] contentView] bounds]);
+                CGFloat windowW   = NSWidth([w frame]);
+                CGFloat barBottom = NSMaxY([[w contentView] frame]);
+                CGFloat barTop    = NSHeight([w frame]);
+                NSButton *lights  = [w standardWindowButton:NSWindowZoomButton];
+                CGFloat lightsEnd = lights ? NSMaxX([lights convertRect:[lights bounds] toView:nil]) : 0;
 
-                // Both fully inside the window, and not on top of each other.
-                //
-                // Deliberately not "leading" or "trailing": which edge they sit
-                // at is the system's own convention and differs by release --
-                // 10.9 packs them left with the title on its own row, macOS 11
-                // and later reserve the leading region for the title and lay
-                // them out trailing. Asserting one of those would be asserting
-                // against the platform on the other. What must hold on every
-                // release is that they are on screen, whole, and separate.
+                // Whole, inside the title bar, clear of the window buttons, and
+                // not on top of each other.
                 snprintf(msg, sizeof msg,
-                         "both controls are wholly inside the window at %.0f pt wide "
-                         "(sidebar %.0f..%.0f, zoom %.0f..%.0f, window %.0f)",
-                         widths[wi], NSMinX(sr), NSMaxX(sr), NSMinX(zr), NSMaxX(zr), windowW);
-                // The couple of points of slack between the two is AppKit's own
-                // item spacing: the boxes abut and the bezels sit inset within
-                // them, so their frames touch by a point or two without the
-                // controls ever overlapping on screen.
-                OK(NSMinX(sr) >= -0.5 && NSMaxX(zr) <= windowW + 0.5 &&
-                   NSMinX(zr) >= NSMaxX(sr) - 4.0, msg);
+                         "both controls are wholly inside the title bar at %.0f pt wide "
+                         "(sidebar %.0f..%.0f, zoom %.0f..%.0f, window %.0f, bar %.0f..%.0f)",
+                         widths[wi], NSMinX(sr), NSMaxX(sr), NSMinX(zr), NSMaxX(zr), windowW,
+                         barBottom, barTop);
+                OK(NSMinX(sr) >= lightsEnd - 0.5 && NSMaxX(zr) <= windowW + 0.5 &&
+                   NSMinX(zr) >= NSMaxX(sr) - 0.5 &&
+                   NSMinY(sr) >= barBottom - 0.5 && NSMaxY(sr) <= barTop + 0.5 &&
+                   NSMinY(zr) >= barBottom - 0.5 && NSMaxY(zr) <= barTop + 0.5, msg);
 
                 // Same height, same vertical centre: they have to read as one
                 // group, which they did not when they were built from
@@ -4488,33 +4806,24 @@ static int RunUI(int argc, const char *argv[])
                 OK(fabs(NSHeight(sr) - NSHeight(zr)) < 1.0 &&
                    fabs(NSMidY(sr) - NSMidY(zr)) < 1.0, msg);
 
-                // Equal wrapper views are not enough.  Mavericks gives a
-                // textured NSButton and a textured NSSegmentedControl
-                // different native bezel heights inside those wrappers.  The
-                // thumbnail control intentionally uses the same one-segment
-                // segmented control as +/- so the pixels, not just the boxes,
-                // stay aligned on that release.
-                NSArray *ssubs = [sidebar subviews];
-                NSArray *zsubs = [zoom subviews];
-                NSView *scontrol = ([ssubs count] > 0) ? [ssubs objectAtIndex:0] : nil;
-                NSView *zcontrol = ([zsubs count] > 0) ? [zsubs objectAtIndex:0] : nil;
+                // Mavericks gives a textured NSButton and a textured
+                // NSSegmentedControl different native bezel heights, so the
+                // thumbnail control is a one-segment segmented control like the
+                // +/- pair, and the pixels line up and not just the boxes.
                 snprintf(msg, sizeof msg,
-                         "the thumbnail and +/- use equal-height segmented controls at %.0f pt wide",
+                         "the thumbnail and +/- are segmented controls of one height at %.0f pt wide",
                          widths[wi]);
-                OK([scontrol isKindOfClass:[NSSegmentedControl class]] &&
-                   [zcontrol isKindOfClass:[NSSegmentedControl class]] &&
-                   fabs(NSHeight([scontrol frame]) - NSHeight([zcontrol frame])) < 0.01,
-                   msg);
+                OK([sidebar isKindOfClass:[NSSegmentedControl class]] &&
+                   [zoom isKindOfClass:[NSSegmentedControl class]] &&
+                   fabs(NSHeight([sidebar frame]) - NSHeight([zoom frame])) < 0.01, msg);
 
-                // And neither is clipped by the item that holds it: the zoom
-                // control used to be given 74 points for two 36-point segments,
-                // leaving nothing for the bezel and cutting the outer edge off
-                // both magnifiers.  (zsubs is the one fetched above.)
-                snprintf(msg, sizeof msg, "the zoom control is not clipped at %.0f pt wide",
+                // And neither is clipped: a frame narrower than the bezel the
+                // control needs is what flattened the right-hand edge of both
+                // on Mavericks.
+                snprintf(msg, sizeof msg, "neither control is clipped at %.0f pt wide",
                          widths[wi]);
-                OK([zsubs count] > 0 &&
-                   NSMaxX([(NSView *)[zsubs objectAtIndex:0] frame]) <= NSWidth([zoom bounds]) + 0.01,
-                   msg);
+                OK(NSWidth([sidebar frame]) + 0.01 >= [[sidebar cell] cellSize].width &&
+                   NSWidth([zoom frame])    + 0.01 >= [[zoom cell] cellSize].width, msg);
             }
         }
         [[wc window] setFrame:NSMakeRect(120, 120, 900, 760) display:YES];
@@ -6984,43 +7293,40 @@ static int RunUI(int argc, const char *argv[])
                (actual & NSApplicationPresentationAutoHideToolbar) != 0,
                "full screen detaches and hides the toolbar until the top-edge reveal");
 
-            NSArray *ids = [wc2 toolbarDefaultItemIdentifiers:[[wc2 window] toolbar]];
-            OK([ids count] == 2, "the toolbar is down to two items");
+            // The two controls that replaced the toolbar, asked of where they
+            // live now -- this asked the toolbar delegate for its items, and
+            // went on doing so after commit 4dae0a9 removed both, which raised
+            // an unrecognised selector here and ended the suite at [7].
+            NSWindow *w2 = [wc2 window];
+            NSSegmentedControl *sidebarC = [wc2 valueForKey:@"_titleBarSidebar"];
+            NSSegmentedControl *zoomC    = [wc2 valueForKey:@"_titleBarZoom"];
+            NSView *chrome2 = [[w2 standardWindowButton:NSWindowCloseButton] superview];
+            OK(sidebarC && zoomC && [sidebarC superview] == chrome2 && [zoomC superview] == chrome2,
+               "the window's two controls sit in its title bar, beside the window buttons");
+            OK(fabs(NSHeight([sidebarC frame]) - NSHeight([zoomC frame])) < 0.01 &&
+               [sidebarC isKindOfClass:[NSSegmentedControl class]] &&
+               [zoomC isKindOfClass:[NSSegmentedControl class]],
+               "they are equal-height segmented controls, as on Mavericks they must be");
+            OK(NSWidth([sidebarC frame]) + 0.01 >= [[sidebarC cell] cellSize].width &&
+               NSWidth([zoomC frame])    + 0.01 >= [[zoomC cell] cellSize].width,
+               "neither control is clipped by its own frame");
 
-            // Every item the same height, and none of them clipped: the zoom
-            // control used to be pinned to 74 points for two 36-point segments,
-            // which left nothing for the bezel and cut the outer edge off both
-            // magnifiers on Mavericks.
-            BOOL sameHeight = YES, fits = YES, matchingControls = YES;
-            CGFloat firstH = -1;
-            CGFloat firstControlH = -1;
-            NSUInteger ii;
-            for (ii = 0; ii < [ids count]; ii++) {
-                NSToolbarItem *it = [wc2 toolbar:[[wc2 window] toolbar]
-                           itemForItemIdentifier:[ids objectAtIndex:ii]
-                       willBeInsertedIntoToolbar:YES];
-                NSView *v = [it view];
-                if (!v) continue;          // the flexible space has no view
-                if (fabs([v frame].size.height - [it minSize].height) > 0.01) sameHeight = NO;
-                if (firstH < 0) firstH = [v frame].size.height;
-                else if (fabs([v frame].size.height - firstH) > 0.01) sameHeight = NO;
-                // The control inside must fit the box it was given, or it is
-                // being clipped.
-                NSArray *subs = [v subviews];
-                if ([subs count] > 0) {
-                    NSRect cf = [(NSView *)[subs objectAtIndex:0] frame];
-                    if (![(NSView *)[subs objectAtIndex:0] isKindOfClass:[NSSegmentedControl class]])
-                        matchingControls = NO;
-                    if (firstControlH < 0) firstControlH = cf.size.height;
-                    else if (fabs(cf.size.height - firstControlH) > 0.01) matchingControls = NO;
-                    if (NSMaxX(cf) > NSWidth([v frame]) + 0.01 ||
-                        NSMaxY(cf) > NSHeight([v frame]) + 0.01 ||
-                        NSMinX(cf) < -0.01 || NSMinY(cf) < -0.01) fits = NO;
-                }
-            }
-            OK(sameHeight, "every toolbar item is the same height");
-            OK(matchingControls, "toolbar children are equal-height segmented controls on Mavericks");
-            OK(fits, "no toolbar control is clipped by the item that holds it");
+            // Full screen has no title bar, so they are put away for it -- and
+            // put back however the transition ends, including the one that was
+            // announced and then refused, which has no exit to restore them.
+            NSNotification *fs = [NSNotification
+                notificationWithName:NSWindowWillEnterFullScreenNotification object:w2];
+            [wc2 windowWillEnterFullScreen:fs];
+            OK([sidebarC isHidden] && [zoomC isHidden],
+               "the controls are hidden on the way into full screen");
+            [wc2 windowDidExitFullScreen:[NSNotification
+                notificationWithName:NSWindowDidExitFullScreenNotification object:w2]];
+            OK(![sidebarC isHidden] && ![zoomC isHidden],
+               "and shown again on the way out");
+            [wc2 windowWillEnterFullScreen:fs];
+            [wc2 windowDidFailToEnterFullScreen:w2];
+            OK(![sidebarC isHidden] && ![zoomC isHidden],
+               "and shown again when full screen is refused after being announced");
 
             [[wc2 window] performClose:nil];
             Pump(0.5);

@@ -58,18 +58,28 @@ int PVPageRotation(CGPDFPageRef page)
     return rot;
 }
 
-CGAffineTransform PVPageDrawingTransform(CGRect box, int rotation,
-                                         size_t width, size_t height)
+// Content space -> upright display space, with the display box's lower-left
+// corner at the origin: the crop box moved to the origin, then turned by
+// /Rotate. `outW` and `outH` receive the display box's size. NO when the box
+// has no usable area.
+//
+// The first two steps of PVPageDrawingTransform, split out because they are
+// also exactly what PDFKit's -drawWithBox: applies for itself. The annotation
+// path has to be able to take them back off the context before it hands it
+// over, or the page is moved and turned twice -- see PVRenderPDFPageToBuffer.
+static BOOL PVPageContentToDisplay(CGRect box, int rotation, CGAffineTransform *out,
+                                   double *outW, double *outH)
 {
+    // The origin is deliberately not checked here: a non-finite one makes a
+    // non-finite transform, which the render path refuses as a draw failure,
+    // exactly as it did before this was split out.
     double bw = (double)box.size.width;
     double bh = (double)box.size.height;
-    if (!isfinite(bw) || !isfinite(bh) || !(bw > 0) || !(bh > 0) ||
-        width == 0 || height == 0)
-        return CGAffineTransformIdentity;
+    if (!isfinite(bw) || !isfinite(bh) || !(bw > 0) || !(bh > 0))
+        return NO;
 
-    // Content space -> upright display space, with the display corner at the
-    // origin. /Rotate is clockwise as presented, and Quartz's y axis points up,
-    // which is why 90 and 270 are not each other's transposes here.
+    // /Rotate is clockwise as presented, and Quartz's y axis points up, which
+    // is why 90 and 270 are not each other's transposes here.
     CGAffineTransform rotate;
     double dw, dh;
     switch (rotation) {
@@ -90,6 +100,21 @@ CGAffineTransform PVPageDrawingTransform(CGRect box, int rotation,
             dw = bw; dh = bh;
             break;
     }
+    if (out) *out = CGAffineTransformConcat(
+        CGAffineTransformMakeTranslation(-box.origin.x, -box.origin.y), rotate);
+    if (outW) *outW = dw;
+    if (outH) *outH = dh;
+    return YES;
+}
+
+CGAffineTransform PVPageDrawingTransform(CGRect box, int rotation,
+                                         size_t width, size_t height)
+{
+    CGAffineTransform toDisplay;
+    double dw = 0, dh = 0;
+    if (width == 0 || height == 0 ||
+        !PVPageContentToDisplay(box, rotation, &toDisplay, &dw, &dh))
+        return CGAffineTransformIdentity;
 
     // Aspect-preserving fit, centred. The caller sizes its bitmap from the same
     // geometry, so the letterbox is normally zero and only ever absorbs the
@@ -104,9 +129,7 @@ CGAffineTransform PVPageDrawingTransform(CGRect box, int rotation,
 
     // Written in application order: move the crop box to the origin, rotate it,
     // scale it, then centre it.
-    CGAffineTransform t =
-        CGAffineTransformMakeTranslation(-box.origin.x, -box.origin.y);
-    t = CGAffineTransformConcat(t, rotate);
+    CGAffineTransform t = toDisplay;
     t = CGAffineTransformConcat(t, CGAffineTransformMakeScale(scale, scale));
     t = CGAffineTransformConcat(t, CGAffineTransformMakeTranslation(tx, ty));
     return t;
@@ -302,8 +325,9 @@ PVRenderCoreResult PVRenderPDFPageToBuffer(CGPDFDocumentRef document,
 
         // One rectangle, used twice. See PVPageDrawingTransform.
         CGRect box = PVSafeCropBox(page);
+        int rotation = PVPageRotation(page);
         CGAffineTransform transform =
-            PVPageDrawingTransform(box, PVPageRotation(page), width, height);
+            PVPageDrawingTransform(box, rotation, width, height);
         if (PVFiniteTransformCore(transform)) {
             CGContextConcatCTM(context, transform);
             CGContextClipToRect(context, box);
@@ -319,13 +343,50 @@ PVRenderCoreResult PVRenderPDFPageToBuffer(CGPDFDocumentRef document,
              * from `drawn` is the only signal that a page went out silently
              * without its annotations. */
             BOOL drewWithPDFKit = NO;
+            CGAffineTransform toDisplay;
             if (gAnnotationDrawHook != NULL &&
-                PVPageNeedsAnnotationDraw(page, (size_t)zeroBasedPage)) {
+                PVPageNeedsAnnotationDraw(page, (size_t)zeroBasedPage) &&
+                PVPageContentToDisplay(box, rotation, &toDisplay, NULL, NULL)) {
                 gAnnotStats.needed++;
+                /* PDFKit is handed DISPLAY space, not content space.
+                 *
+                 * -[PDFPage drawWithBox:] moves the crop box to the origin and
+                 * turns the page by its /Rotate itself, which is the first two
+                 * steps of the transform already on this context -- so drawing
+                 * through it here applied both of them twice. Measured on
+                 * fixtures that carry their ink in an annotation: only a page
+                 * with no rotation and a crop box at (0,0) came out right. Any
+                 * /Rotate, or any crop box with an origin -- both ordinary in
+                 * scanned and in cropped documents -- put the page off the
+                 * bitmap or on the wrong side of it, blank or half-drawn, which
+                 * is the failure this path was added to prevent.
+                 *
+                 * Taking the two steps back off leaves the scale and the
+                 * centring, which is display space; PDFKit then puts its own
+                 * back, once. The inverse is exact -- a translation and a
+                 * quarter turn -- and the clip above was fixed in device space
+                 * when it was set, so it is not moved by this. Bracketed, so
+                 * the fallback below draws in content space whatever the hook
+                 * did to the state. */
+                CGContextSaveGState(context);
+                CGContextConcatCTM(context, CGAffineTransformInvert(toDisplay));
                 drewWithPDFKit = gAnnotationDrawHook((size_t)zeroBasedPage + 1,
                                                      box, context);
-                if (drewWithPDFKit) gAnnotStats.drawn++;
-                else                gAnnotStats.declined++;
+                CGContextRestoreGState(context);
+                if (drewWithPDFKit) {
+                    gAnnotStats.drawn++;
+                } else {
+                    gAnnotStats.declined++;
+                    /* A hook that gave up partway -- an exception out of PDFKit
+                     * -- may have painted some of the page already, and the
+                     * Quartz draw below would land on top of it: transparency
+                     * composed twice, content doubled where the two disagree.
+                     * The page is put back to white first. Only the crop box,
+                     * because that is the clip, and the clip is all anything
+                     * could have touched. The fill colour is white again: the
+                     * restore above put back the state that had it. */
+                    CGContextFillRect(context, box);
+                }
             }
             if (!drewWithPDFKit) CGContextDrawPDFPage(context, page);
 

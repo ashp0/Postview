@@ -510,7 +510,15 @@ static NSString *PVFnKey(unichar c)
 
 // Flushing on deactivate rather than on a timer means the reading position is
 // safe on disk without any periodic disk writes while you read.
-- (void)applicationDidResignActive:(NSNotification *)note { [self saveAllOpenDocuments]; }
+//
+// The reading position only, exactly as the sleep hook writes it. This used to
+// be -saveAllOpenDocuments, which also emits the rasterisation census -- and
+// the census is the one thing that must stay on the termination path, for the
+// reason -saveOpenDocumentState gives: it describes a whole run, so emitting it
+// on every Cmd-Tab put a partial census on stderr per switch and rewrote
+// PVStatsPath with a partial total each time, which a harness that is killed
+// rather than quit then reads as the run's answer.
+- (void)applicationDidResignActive:(NSNotification *)note { [self saveOpenDocumentState]; }
 - (void)applicationWillTerminate:(NSNotification *)note
 {
     [self saveAllOpenDocuments];

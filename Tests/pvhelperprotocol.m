@@ -30,6 +30,12 @@
 #include <signal.h>
 #include <unistd.h>
 
+// Matched against the whole line, not one field. `comm` is the executable's
+// full path, and in a tree whose path has a space in it -- this repository's
+// own, "Mavericks Projects" -- the path splits across fields: the field that
+// was tested never named the helper, so the probe killed nothing, the liar
+// was never reached in render mode, and every render-phase mode failed.
+//
 // A source renders through the helper it opened with, so reaching the RENDER
 // conversation at all means taking that one away first. See pvbadhelper.m.
 static int KillMyHelpers(void)
@@ -37,7 +43,7 @@ static int KillMyHelpers(void)
     char cmd[256];
     snprintf(cmd, sizeof cmd,
              "/bin/ps -axo ppid=,pid=,comm= | "
-             "/usr/bin/awk '$1==%d && $3 ~ /Helper/ {print $2}'", (int)getpid());
+             "/usr/bin/awk '$1==%d && $0 ~ /Helper/ {print $2}'", (int)getpid());
     FILE *p = popen(cmd, "r");
     if (!p) return 0;
     char line[64]; int killed = 0;
@@ -143,20 +149,28 @@ int main(int argc, const char *argv[])
                 // Render lies live in the RENDER conversation, and getting
                 // there takes TWO steps, not one.
                 //
-                // Killing the helper is not enough: -ensureRenderHelper: tests
-                // `_helperPid > 0` and a freshly killed helper still satisfies
-                // it, so the next render fails on the stale descriptors without
-                // ever spawning a replacement -- the "recovery costs exactly one
-                // failed render" behaviour pvhelperkill measures. That failure
-                // is a PROTOCOL failure, which is also what a lying helper
-                // produces, so an earlier version of this test saw the right
-                // answer for entirely the wrong reason and reported twelve
-                // passes without the liar being executed once. The trace file
-                // said so: not one invocation in render mode.
+                // Killing the helper is not always enough on its own. Before
+                // 2026-10-02 it never was: -ensureRenderHelper: only tested
+                // `_helperPid > 0`, a freshly killed helper still satisfied it,
+                // and the next render failed on the stale descriptors without
+                // spawning a replacement. That failure is a PROTOCOL failure,
+                // which is also what a lying helper produces, so an earlier
+                // version of this test saw the right answer for entirely the
+                // wrong reason and reported twelve passes without the liar
+                // being executed once. The trace file said so: not one
+                // invocation in render mode.
                 //
-                // So: kill, spend the doomed render deliberately, and only then
-                // ask the question. The render below is the first one that can
-                // reach a helper spawned in RENDER mode.
+                // -ensureRenderHelper: now reaps a helper that has died and
+                // starts a replacement before sending anything. But a SIGKILL
+                // lands asynchronously, so a helper still dying when the next
+                // render arrives is handed the command anyway, and fails it the
+                // same way.
+                //
+                // So: kill, spend one render deliberately, and only then ask
+                // the question. Whichever way that race goes, the spent render
+                // absorbs it -- it fails on the dying helper, or it is lied to
+                // by a first liar the viewer then kills -- and the render below
+                // is answered by a helper spawned in RENDER mode.
                 if (mode >= 6) {
                     KillMyHelpers();
                     usleep(150000);

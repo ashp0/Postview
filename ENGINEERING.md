@@ -1521,3 +1521,153 @@ scheduler work, on the same machine:
 That is the motion gate and the dwell throttle doing exactly what §1 ranks
 first. It is a measurement of Postview against its own past, not against
 Preview, and it is the one number in this run that needs no caveat.
+
+---
+
+## 14. The stability pass, 2026-10-02
+
+A pass over the whole tree for crashes, determinism and cost, against `2546649`.
+Most of it found nothing to change, and §14.6 says why. Seven changes were made
+to the program -- five pinned by tests that fail against `2546649`, one true by
+construction, one a data race nothing could observe -- and two repairs to the
+test harness, which had stopped measuring what it claimed to (§14.7, §14.8).
+
+### 14.1 Annotated pages that were rotated or cropped came out blank
+
+**Measured. Fixed.** The PDFKit path added in `71f5103` handed PDFKit a context
+already carrying the page's full transform, but `-[PDFPage drawWithBox:]` moves
+the crop box to the origin and applies `/Rotate` itself. Both were applied twice,
+and the hook then translated by the crop box's origin a third time. Rendered
+side by side against the ordinary Quartz path, on eight fixtures (`/Rotate` 0,
+90, 180, 270, each with a crop box at (0,0) and at (100,50)), only the one with
+no rotation and a crop box at (0,0) — the shape of `annot.pdf`, which is why its
+test passed — put the content where Quartz does. The other seven were blank,
+half-drawn, or drawn on the wrong side of the bitmap.
+
+`PVRenderPDFPageToBuffer` now takes the crop-box move and the rotation back off
+the context (`PVPageContentToDisplay`, the first two steps of
+`PVPageDrawingTransform`, inverted exactly) before calling the hook, and the
+hook no longer translates. All eight agree with Quartz to the pixel.
+`TestAnnotationPlacement` renders a four-page rotated, offset-crop fixture
+through the real helper and pins both the content's and the annotation's
+centroids.
+
+### 14.2 An exception out of PDFKit left two state stacks one deep
+
+**Fixed by construction; not reproduced.** An exception from `-drawWithBox:`
+unwound past both restores in the hook, leaving the caller's CG state one CTM
+deep — so the Quartz fallback drew in the wrong place — and the thread's
+`NSGraphicsContext` stack one entry deep with a context wrapping a bitmap that
+is unmapped moments later still current. The restores are in `@finally` now,
+the caller brackets the hook with its own save/restore, and a hook that gave up
+partway has its page repainted white before the fallback draws over it.
+
+### 14.3 A helper that died while idle cost one failed page
+
+**Measured. Fixed.** The decision §8.4 of the audit log left open. A helper's
+pid and pipes outlive it, so `-ensureRenderHelper:` handed the next command to a
+dead process; the render failed as a protocol error and the page sat blank
+through a 0.25 s backoff. One `waitpid(WNOHANG)` per render now reaps it first —
+one syscall against a render measured in milliseconds — and the pid is dropped
+before `-stopRenderHelper` could signal it, since a reaped pid can already name
+another process. `TestDeadHelperReplacedBeforeRender`: five idle kills, five
+first-time successes (none at `2546649`). What it does not change: a render
+that follows the kill within microseconds still meets a helper that is
+still dying, and takes the existing one-failure path -- `make helperkill`
+arm A reads "0 needed no retry" at both commits, because that is the race it
+provokes.
+
+### 14.4 The empty state could hang the launch on a dead share
+
+**Fixed; the hang itself is simulated, not reproduced.** `-reloadRecents`
+stat'ed every recent document on the main thread, at launch and on every Dock
+click. A stat on a network share that has stopped answering blocks — for good on
+a hard NFS mount — which is exactly the failure the copier subprocess exists to
+keep away from the main thread, reached from the one other place the app reads
+a path it did not choose. The check now runs on a background queue; the main
+thread waits at most 0.15 s for it, so an ordinary launch shows the list as
+before, and a slow one shows the window and fills the list in when the check
+returns. `TestRecentsDoNotHoldTheMainThread` makes one stat take 0.8 s and
+measures the main thread held for 0.16 s.
+
+### 14.5 Smaller
+
+- **Deactivation emitted the census.** §10.4 says the census stays on the
+  termination path; `-applicationDidResignActive:` still called
+  `-saveAllOpenDocuments`, so every Cmd-Tab with `-PVStats YES` put a partial
+  census on stderr and rewrote `PVStatsPath` with a partial total. It writes the
+  reading position only now, as the sleep hook does. Asserted both ways.
+- **A refused full-screen transition hid the title-bar controls for good.**
+  `-windowWillEnterFullScreen:` hides them and only `-windowDidExitFullScreen:`
+  brought them back; a transition that is announced and then refused never
+  exits. `-windowDidFailToEnterFullScreen:` restores them.
+- **`PVHelperKeepsDiagnostics`** filled a static lazily, and documents are read
+  concurrently, so two opens could write it at once. `dispatch_once` now.
+
+### 14.6 What was read and left alone, and why
+
+`PVCommon`, `PVCostModel`, `PVImageCache`, `PVRenderQueue`, `PVStateStore`,
+`PVPageView`, `PVThumbStripView`, `PVDropView`, `PVDocument`, `main.m` and
+`PVRenderHelperMain` were read in full and not changed. The two audits recorded
+in `overnight_audit_log.md` had already covered the races, lifetimes and
+accounting these files are built around, under both sanitizers, and nothing in
+this pass contradicted them. Specifically considered and declined:
+
+- *`PVCurrentPowerSource` reads the wall clock.* Deliberate, §10.5: a monotonic
+  stamp would keep a pre-sleep AC answer alive after a wake.
+- *`-resetRenderFailures` memsets tables sized by page count.* Runs on zoom and
+  resize, never per frame; a few kilobytes for ordinary documents.
+- *`-evictExcept:` sorts the cache's keys.* Only when over budget, and the byte
+  budget bounds the entries to a few dozen.
+- *`PVClampPixelSize` can exceed its ceiling for aspect ratios past 16.7 M:1.*
+  Unreachable, and pinned by a test — audit log §10.
+- *The annotation path parses the document with PDFKit inside a render whose
+  viewer-side deadline is ~15 s for a thumbnail.* Measured here at 0.05–0.11 s
+  for 20,000 pages, backgrounded. **Unverified on 10.9**, whose PDFKit may be
+  less lazy; if a large annotated document ever times out on its first
+  annotated page there, this is where to look.
+
+### 14.7 The UI suite had stopped running at [7]
+
+`4dae0a9` moved the two controls from an `NSToolbar` into the title bar and left
+the suite asking the toolbar for them. [1b] failed three assertions at every
+width, and [7] sent `-toolbarDefaultItemIdentifiers:` to a controller that no
+longer implements it: an unrecognised selector, `Abort trap: 6`, and nothing
+after [7] has run since — including [8]'s document-lifecycle census.
+Both blocks now ask the same questions of the title-bar controls: whole and
+inside the title bar, clear of the window buttons, one height and baseline,
+segmented controls, not clipped; and [7] also checks they are hidden for full
+screen and restored on exit and on a refused entry.
+
+### 14.8 Three probes could not see a helper from this repository
+
+`pvhelperkill`, `pvhelperprotocol` and `pvfuzz` find their helpers by running
+`ps -o comm` and testing one awk field for the helper's name. `comm` is the
+executable's full path, and this repository lives under "Mavericks Projects":
+the path splits at the space and the tested field is
+`/Users/…/Mavericks`. Run in place, `helperkill` killed nothing and reported
+"40/40 recovered" with "0 kills delivered"; `helperprotocol` never reached the
+liar in render mode and failed all seven render-phase modes; `fuzz`'s "no helper
+is left running" could not fail. The overnight audit ran them from a copy at a
+path without a space, which is why its numbers stand. All three match the whole
+line now.
+
+Gates on this host, after every change above (`REQUIRE_SDK=any`; every source
+also compiles clean against the real 10.9 SDK):
+
+| gate | result |
+|---|---|
+| `make analyze` | OK |
+| `pvsuite unit` | **475 passed, 0 failed** (452 at `2546649`; the new file fails 13 times against `2546649`'s sources) |
+| `pvsuite ui` | **262 passed, 0 failed** (at `2546649`: 3 failed in [1b], then `Abort trap: 6` in [7] after 239) |
+| `pvsuite soak` (150 cycles) | 26 passed, 0 failed; 0.000 MB resident after teardown, +0.0026 MB/cycle settled |
+| `pvsuite stress` | 16 passed, 0 failed |
+| `pvsuite stress` + ThreadSanitizer | 16 passed, 0 failed, no reports |
+| `pvsuite stress` + Address/UB sanitizers | 16 passed, 0 failed, no reports |
+| leak census | no Postview-owned object leaked |
+| `pvsuite power` | 23 passed, 0 failed; idle document 0.22% of a core, 0 idle wakeups |
+| `make helperkill` | 127 checks, 0 failures (the same at `2546649`, run from a path without a space) |
+| `make helperprotocol` | 36 checks, 0 failures (likewise) |
+| `make fuzz` seeded with `annot.pdf` and a rotated, offset-crop annotated page | 369 and 348 checks, 0 failures |
+| `make verify REQUIRE_SDK=any` | OK |
+| showdown self-test | passed |
