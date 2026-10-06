@@ -3639,6 +3639,54 @@ static void TestArrowScrollStep(void)
     OK(ordered, "an arrow press is smaller than a Page Down at every window size");
 }
 
+// The page another app asks for in its open event. Syllabus sends it as an
+// Int32 under 'page' in keyAEPropData; anything else, or no page, must leave
+// an ordinary open exactly as it was.
+static NSAppleEventDescriptor *PVTestOpenEvent(NSAppleEventDescriptor *props, AEEventID eventID)
+{
+    NSAppleEventDescriptor *e = [NSAppleEventDescriptor appleEventWithEventClass:kCoreEventClass eventID:eventID
+                                    targetDescriptor:nil returnID:kAutoGenerateReturnID transactionID:kAnyTransactionID];
+    if (props) [e setParamDescriptor:props forKeyword:keyAEPropData];
+    return e;
+}
+
+static NSAppleEventDescriptor *PVTestPageRecord(NSAppleEventDescriptor *value)
+{
+    NSAppleEventDescriptor *rec = [NSAppleEventDescriptor recordDescriptor];
+    if (value) [rec setDescriptor:value forKeyword:'page'];
+    return rec;
+}
+
+static void TestRequestedPage(void)
+{
+    printf("\nThe page asked for in an open event\n");
+    OK(PVRequestedPageInOpenEvent(PVTestOpenEvent(PVTestPageRecord([NSAppleEventDescriptor descriptorWithInt32:80]),
+                                                  kAEOpenDocuments)) == 80,
+       "an Int32 'page' of 80 in keyAEPropData reads as page 80");
+    OK(PVRequestedPageInOpenEvent(PVTestOpenEvent(nil, kAEOpenDocuments)) == 0,
+       "an ordinary open, with no parameters, asks for no page");
+    OK(PVRequestedPageInOpenEvent(PVTestOpenEvent(PVTestPageRecord(nil), kAEOpenDocuments)) == 0,
+       "a parameter record without 'page' asks for no page");
+    OK(PVRequestedPageInOpenEvent(PVTestOpenEvent(PVTestPageRecord([NSAppleEventDescriptor descriptorWithInt32:0]),
+                                                  kAEOpenDocuments)) == 0,
+       "page 0 is no page");
+    OK(PVRequestedPageInOpenEvent(PVTestOpenEvent(PVTestPageRecord([NSAppleEventDescriptor descriptorWithInt32:-5]),
+                                                  kAEOpenDocuments)) == 0,
+       "a negative page is no page");
+    OK(PVRequestedPageInOpenEvent(PVTestOpenEvent(PVTestPageRecord([NSAppleEventDescriptor descriptorWithString:@"eighty"]),
+                                                  kAEOpenDocuments)) == 0,
+       "text that isn't a number is no page");
+    OK(PVRequestedPageInOpenEvent(PVTestOpenEvent(PVTestPageRecord([NSAppleEventDescriptor descriptorWithString:@"12"]),
+                                                  kAEOpenDocuments)) == 0,
+       "a number sent as text is no page either: only a number is");
+    OK(PVRequestedPageInOpenEvent(PVTestOpenEvent([NSAppleEventDescriptor descriptorWithInt32:80], kAEOpenDocuments)) == 0,
+       "keyAEPropData that isn't a record is ignored, not dereferenced");
+    OK(PVRequestedPageInOpenEvent(PVTestOpenEvent(PVTestPageRecord([NSAppleEventDescriptor descriptorWithInt32:80]),
+                                                  kAEPrintDocuments)) == 0,
+       "a print event never asks for a page");
+    OK(PVRequestedPageInOpenEvent(nil) == 0, "no current event (opened from the Open panel) asks for no page");
+}
+
 // The pairing rule, as arithmetic, over every shape a document can have.
 //
 // This is the rule three call sites used to state for themselves, and the one
@@ -4433,6 +4481,7 @@ static int RunUnit(int argc, const char *argv[])
         TestRunningLocation();
         TestSleepSavesReadingPosition();
         TestRecentsDoNotHoldTheMainThread();
+        TestRequestedPage();
         TestRenderSuppressionPolicy();
         TestRamTierInvariants();
         TestResidentCensus();

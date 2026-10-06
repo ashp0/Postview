@@ -2540,6 +2540,19 @@ static double PVTransientBackoff(unsigned attempts)
     [self updateVisibleContent];
 }
 
+- (void)setInitialPageNumber:(NSInteger)oneBased
+{
+    NSUInteger pageCount = [_source pageCount];
+    if (_didInitialLayout || pageCount == 0 || oneBased < 1) return;
+    NSUInteger target = (NSUInteger)(oneBased - 1);
+    if (target >= pageCount) target = pageCount - 1;
+    // -showWindow: lays out at the restore position, with the express lane
+    // for its page: the asked-for page gets both, as an opened document's
+    // remembered page would.
+    _restorePage = target;
+    _restoreFraction = 0;
+}
+
 - (IBAction)goToPageDialog:(id)sender
 {
     // A sheet needs something to hang from. -window is declared nullable and

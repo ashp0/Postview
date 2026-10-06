@@ -142,6 +142,14 @@ position on that page, the same zoom, and the same window size. That is stored
 in `~/Library/Application Support/Postview/DocumentState.plist`, keyed by file
 path, for the 400 most recently opened documents.
 
+Another app can open a document at a particular page instead: it sends the page
+with its open event, as a positive Int32 under the key `'page'` in the event's
+`keyAEPropData` record. With `NSWorkspace` that is a record descriptor passed as
+`additionalEventParamDescriptor` (LaunchServices calls it `passThruParams`).
+Syllabus, the study planner, opens every section of the course notes this way.
+A document that isn't open yet appears at that page; one that is open already
+turns to it. An open with no page, from Finder or the Dock, is unchanged.
+
 ---
 
 ## Why scrolling is smooth

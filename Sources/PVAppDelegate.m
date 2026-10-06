@@ -410,6 +410,54 @@ static NSString *PVFnKey(unichar c)
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)app { return NO; }
 
+// Opening documents from Finder, the Dock or another app.
+//
+// AppKit does all of this itself when the delegate doesn't; it is spelled out
+// here for one reason: the open event may name a page (see
+// PVRequestedPageInOpenEvent), and only while it is being handled is that
+// event still the current one. Without a page this is AppKit's own path:
+// each document opens and shows where it was last read. With one, a document
+// that isn't open yet is built without being shown, told its page, then
+// shown, so its first frame is already the page asked for; one that is open
+// already turns to it. Errors are presented and the event answered as
+// AppKit's handler would.
+static void PVShowDocumentAtPage(NSDocument *doc, NSInteger page, BOOL wasOpen)
+{
+    if ([[doc windowControllers] count] == 0) [doc makeWindowControllers];
+    for (NSWindowController *wc in [doc windowControllers]) {
+        if (![wc isKindOfClass:[PVWindowController class]]) continue;
+        if (wasOpen) [(PVWindowController *)wc goToPageNumber:page];
+        else [(PVWindowController *)wc setInitialPageNumber:page];
+    }
+    [doc showWindows];
+}
+
+- (void)application:(NSApplication *)app openFiles:(NSArray *)filenames
+{
+    NSInteger page = PVRequestedPageInOpenEvent([[NSAppleEventManager sharedAppleEventManager] currentAppleEvent]);
+    NSDocumentController *dc = [NSDocumentController sharedDocumentController];
+    __block NSUInteger pending = [filenames count];
+    __block BOOL failed = NO;
+    if (pending == 0) {
+        [app replyToOpenOrPrint:NSApplicationDelegateReplySuccess];
+        return;
+    }
+    for (NSString *path in filenames) {
+        [dc openDocumentWithContentsOfURL:[NSURL fileURLWithPath:path] display:(page == 0)
+                        completionHandler:^(NSDocument *doc, BOOL wasOpen, NSError *error) {
+            if (doc == nil) {
+                failed = YES;
+                BOOL cancelled = [[error domain] isEqualToString:NSCocoaErrorDomain] && [error code] == NSUserCancelledError;
+                if (error && !cancelled) [dc presentError:error];
+            } else if (page > 0) {
+                PVShowDocumentAtPage(doc, page, wasOpen);
+            }
+            if (--pending == 0)
+                [app replyToOpenOrPrint:failed ? NSApplicationDelegateReplyFailure : NSApplicationDelegateReplySuccess];
+        }];
+    }
+}
+
 // Launching from the icon opens the empty state and nothing else. Previously
 // this put an Open panel on screen unprompted; combined with AppKit's window
 // restoration, a launch could also silently reopen whatever document happened
