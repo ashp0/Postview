@@ -41,6 +41,12 @@
     // control left in the chrome would outlive it.
     NSSegmentedControl *_titleBarSidebar;
     NSSegmentedControl *_titleBarZoom;
+    // The way back to a marked place. Present in the chrome for the life of
+    // the window and hidden until there is a mark to return to, rather than
+    // added and removed: a control that comes and goes has to be re-installed,
+    // re-sized and re-placed each time, and this way the only thing that
+    // changes when the reader marks a place is one BOOL.
+    NSSegmentedControl *_titleBarReturn;
 
     PVZoomMode        _zoomMode;
     CGFloat           _zoom;
@@ -163,6 +169,45 @@
     CGFloat           _restoreFraction;
     BOOL              _restoreSidebar;
 
+    // Somewhere to come back to, so that going to look at something else is a
+    // trip rather than a departure.
+    //
+    // Session-only, and deliberately not written to the state store. The
+    // position the store keeps is where you were when you closed the file,
+    // which is a fact about the document; a mark is a fact about what you are
+    // doing right now, and one restored a week later would offer to return the
+    // reader to a place they have no memory of choosing.
+    BOOL              _haveMark;
+    NSUInteger        _markPage;
+    CGFloat           _markFraction;
+
+    // The same place recorded twice: exactly, and in a form that survives.
+    //
+    // (page, fraction) is this app's currency for a reading position because
+    // it means "this far into that page", which is still true at another zoom
+    // or in a spread -- it is what -relayoutKeepingPage:fraction: preserves and
+    // what the state store writes down. What it is not is EXACT.
+    // -scrollToPage:fraction: re-centres the document horizontally, backs off
+    // by half a page gap at the top of a page, and rounds to whole points, so a
+    // mark set and returned to with nothing touched in between would land near
+    // where the reader was standing rather than on it.
+    //
+    // The clip origin is exact, and means nothing the moment the geometry
+    // moves: it is a point in a coordinate space whose size is a function of
+    // the zoom, the number of pages in a row and the width of the window. So
+    // both are kept, along with enough of that geometry to say whether the
+    // point still refers to the place it was taken from. Unchanged geometry
+    // returns the reader to the point; a changed one falls back to the pair,
+    // which is the exact case the pair exists for. See -returnToMarkedPlace:.
+    NSPoint           _markOrigin;
+    NSSize            _markFrameSize;
+    NSUInteger        _markColumns;
+    BOOL              _markCover;
+    // Whether _markOrigin is a real position or the zero it was reset to. A
+    // flag rather than a sentinel value, because every NSPoint is a position
+    // some document could legitimately be scrolled to.
+    BOOL              _markOriginUsable;
+
     // The one page, if any, whose render is currently worth paying raised-QoS
     // energy for: the page the user is looking at while it is still blank.
     // NSNotFound when no such page exists, which is almost always. Cleared as
@@ -277,4 +322,6 @@
 - (IBAction)goToPreviousPage:(id)sender;
 - (IBAction)goToFirstPage:(id)sender;
 - (IBAction)goToLastPage:(id)sender;
+- (IBAction)markPlace:(id)sender;
+- (IBAction)returnToMarkedPlace:(id)sender;
 @end

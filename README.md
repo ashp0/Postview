@@ -48,6 +48,7 @@ does not quietly take the association away from Preview on its own.
 | Go to page number | **⌥⌘G** |
 | Next / previous page | **⌘↓** / **⌘↑** |
 | First / last page | **⌘Home** / **⌘End** |
+| Keep your place while you look elsewhere | **⌥⌘M** to mark it, **⌥⌘R** or the **Return** button to come back |
 | Two pages side by side | **⌘3** |
 | Two pages with a cover page | **⌘4** |
 | Show or hide thumbnails | **⌥⌘2**, or the toolbar button |
@@ -57,6 +58,29 @@ does not quietly take the association away from Preview on its own.
 Which page you are on is in the window title, the way Preview has it, rather
 than in a text field in the toolbar. The toolbar is two buttons: thumbnails,
 and zoom.
+
+**Marking a place** (**Go ▸ Mark Place**, **⌥⌘M**) writes down where you are
+standing so that going to look at something else is a trip rather than a
+departure. A **Return** button appears in the title bar next to the zoom
+control; press it, or **⌥⌘R**, and you are put back on the spot you left —
+exactly, down to the fraction of a point and the sideways position, not merely
+back on the same page. In between you can move by any means the app offers:
+scroll, flick, drag, the thumbnail strip, Go to Page, the arrow keys.
+
+The mark is not used up. Coming back leaves it where it is, so the same trip
+can be made again; choosing **Mark Place Here Instead** moves it, and closing
+the document forgets it. It is deliberately not saved between sessions — where
+you were when you closed a file is a fact about the document and Postview does
+remember that, but a mark is about what you are doing right now, and offering
+to return you to one a week later would be offering a place you have no memory
+of choosing.
+
+If you zoom or resize while you are away, the exact point stops existing: the
+document is a different size and the coordinate no longer refers to anything.
+Returning then puts you at the same distance into the same page, which is the
+same thing the app already does to hold your position across a zoom. The button
+is in the title bar, so it is not available in full screen — **⌥⌘R** is, and so
+is the Go menu.
 
 **Two pages side by side** (**⌘3**) is for wide displays, which is where a
 single column of one page wastes most of the glass. Pages pair up the way a

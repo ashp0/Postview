@@ -110,6 +110,24 @@ static NSString *PVFnKey(unichar c)
     [goMenu addItem:[NSMenuItem separatorItem]];
     PVAdd(goMenu, @"Go to Page…", @selector(goToPageDialog:), @"g",
           NSCommandKeyMask | NSAlternateKeyMask);
+    [goMenu addItem:[NSMenuItem separatorItem]];
+    // Keeping your place while you go and look at something else.
+    //
+    // The pair below the separator is one feature read in the order it is
+    // used: mark where you are, wander off by any means the app offers, come
+    // back. They sit in Go because that is the menu about where in the document
+    // you are, and last because they are the only items here that do not move
+    // the reader anywhere by themselves.
+    //
+    // ⌥⌘ to match Go to Page, which is the other item in this menu that is a
+    // deliberate act rather than a page turn. Plain ⌘M is Minimize and ⌘R is
+    // free but too close to a reload for something that moves the document.
+    // -validateMenuItem: retitles the first when a mark exists and disables the
+    // second while there is nowhere to return to.
+    PVAdd(goMenu, @"Mark Place", @selector(markPlace:), @"m",
+          NSCommandKeyMask | NSAlternateKeyMask);
+    PVAdd(goMenu, @"Return to Marked Place", @selector(returnToMarkedPlace:), @"r",
+          NSCommandKeyMask | NSAlternateKeyMask);
     [goItem setSubmenu:goMenu];
     [mainMenu addItem:goItem];
 

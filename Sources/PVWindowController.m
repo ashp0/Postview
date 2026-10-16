@@ -147,6 +147,7 @@ static BOOL PVPageOverlapsColumn(NSRect page, NSRect viewport)
     _restorePage     = 0;
     _restoreFraction = 0.0;
     _restoreSidebar  = NO;
+    _haveMark        = NO;
     _displayedPage   = NSNotFound;
     _expressPage     = NSNotFound;
     _lastDirection   = 1;
@@ -390,6 +391,7 @@ static BOOL PVPageOverlapsColumn(NSRect page, NSRect viewport)
     [_splitView release];
     [_titleBarSidebar release];
     [_titleBarZoom release];
+    [_titleBarReturn release];
     [_pageView release];
     [_scrollView release];
     [_pageQueue release];
@@ -530,6 +532,24 @@ static BOOL PVPageOverlapsColumn(NSRect page, NSRect viewport)
 // a delta of exactly zero on the notification it causes, which is what it is.
 - (void)scrollClipTo:(NSPoint)p
 {
+    [self scrollClipTo:p rounded:YES];
+}
+
+// The same move, with the rounding made optional.
+//
+// Rounding is right for every scroll that is computed: a page origin plus a
+// fraction of a row lands on a fractional point for arithmetic reasons rather
+// than for any reason the reader would recognise, and putting the document on a
+// whole point keeps its text on the pixel grid at 1x.
+//
+// It is wrong for exactly one caller. A marked place is a position the reader
+// was already looking at, and they may have arrived at it on a trackpad --
+// AppKit scrolls a gesture to fractional offsets, so half a point is an
+// ordinary thing for a marked origin to carry, and on a Retina display half a
+// point is a pixel. Rounding on the way back would move the reader off the spot
+// they marked in order to restore them to it. See -returnToMarkedPlace:.
+- (void)scrollClipTo:(NSPoint)p rounded:(BOOL)rounded
+{
     NSClipView *clip = [_scrollView contentView];
     if (!clip) return;
     // A deliberate placement of the document overrules an animated scroll that
@@ -545,7 +565,8 @@ static BOOL PVPageOverlapsColumn(NSRect page, NSRect viewport)
     // Page, a thumbnail, the anchor a pinch has to hold still), and a chosen
     // position is not something an earlier keystroke gets to finish overriding.
     [_pageView cancelScrollAnimation];
-    [clip scrollToPoint:NSMakePoint(floor(p.x + 0.5), floor(p.y + 0.5))];
+    if (rounded) p = NSMakePoint(floor(p.x + 0.5), floor(p.y + 0.5));
+    [clip scrollToPoint:p];
     [_scrollView reflectScrolledClipView:clip];
     _lastScrollY = NSMinY([clip documentVisibleRect]);
 }
@@ -2659,6 +2680,158 @@ static double PVTransientBackoff(unsigned attempts)
 - (IBAction)goToFirstPage:(id)sender { [self goToPageNumber:1]; }
 - (IBAction)goToLastPage:(id)sender  { [self goToPageNumber:(NSInteger)[_source pageCount]]; }
 
+#pragma mark - Marking a place
+
+// A place to come back to, so that going to look at something else is a trip
+// rather than a departure.
+//
+// "Mark Place" writes down where the reader is standing. After that they can go
+// anywhere by any means the app offers -- scroll, flick, drag, the thumbnail
+// strip, Go to Page, the arrow keys -- and one press of Return puts them back
+// on the spot they left. Nothing else in the app touches the mark, which is the
+// whole point: what makes an excursion temporary is that the way back does not
+// move while you are away.
+//
+// The mark SURVIVES the return, so the trip can be made again. The alternative
+// -- consuming it, and taking the button away the moment it is used -- reads
+// tidier and is worse to use: the second look at the same footnote is exactly
+// as likely as the first, and a reader who has just been returned somewhere is
+// the last person who should have to re-mark it. It is moved by marking again
+// and released with the document, and it is never in the way: the button is not
+// in the title bar at all until there is somewhere for it to go.
+
+// A point the clip view can actually be put at.
+//
+// -scrollClipTo: hands its argument straight to the clip view, which constrains
+// out-of-range values itself -- so this is not what keeps AppKit safe. It is
+// what keeps the app's own bookkeeping honest: -scrollClipTo: records
+// _lastScrollY from where the clip ENDED UP, and every caller of it that has
+// clamped first gets a scroll whose reported travel is the travel that
+// happened. Non-finite coordinates are the case AppKit would not sort out --
+// a NaN survives -[NSClipView scrollToPoint:] and poisons the direction and
+// speed estimates that read the bounds back afterwards.
+- (NSPoint)clampedScrollPoint:(NSPoint)p
+{
+    NSClipView *clip = [_scrollView contentView];
+    if (!clip || !_pageView) return NSZeroPoint;
+    if (!isfinite(p.x)) p.x = 0;
+    if (!isfinite(p.y)) p.y = 0;
+
+    NSSize doc = [_pageView frame].size;
+    NSSize vp  = [clip bounds].size;
+    CGFloat maxX = doc.width  - vp.width;
+    CGFloat maxY = doc.height - vp.height;
+    // A document no bigger than the window has exactly one scroll position on
+    // that axis, and it is zero. Written as a negated greater-than so a size
+    // that has arrived as NaN lands here too, rather than comparing false
+    // against every branch and leaving the coordinate unclamped.
+    if (!(maxX > 0)) maxX = 0;
+    if (!(maxY > 0)) maxY = 0;
+
+    if (p.x < 0) p.x = 0; else if (p.x > maxX) p.x = maxX;
+    if (p.y < 0) p.y = 0; else if (p.y > maxY) p.y = maxY;
+    return p;
+}
+
+// Does the recorded clip origin still name the place it was taken from?
+//
+// The document's own size is the summary of every input to the geometry -- the
+// zoom, how many pages share a row, and how wide the window is -- so two
+// layouts that produce the same size put the same point in the same place,
+// whichever route they took there. The column count and the cover flag are
+// compared as well rather than trusted to show up in the size, because they
+// need not: a spread at half the zoom of a single column is the same document
+// width with the pages arranged differently underneath it.
+//
+// A NO here is not a failure. It is the ordinary answer after a zoom or a
+// resize, and it is what hands the return over to (page, fraction), which is
+// the currency that stays meaningful across exactly those changes.
+- (BOOL)markedPointStillNamesTheSamePlace
+{
+    if (!_haveMark || !_markOriginUsable || !_pageView) return NO;
+    if (_columns != _markColumns) return NO;
+    if ((_cover ? YES : NO) != _markCover) return NO;
+
+    NSSize now = [_pageView frame].size;
+    if (!isfinite(now.width) || !isfinite(now.height)) return NO;
+    return (fabs(now.width  - _markFrameSize.width)  < 0.5 &&
+            fabs(now.height - _markFrameSize.height) < 0.5);
+}
+
+- (IBAction)markPlace:(id)sender
+{
+    (void)sender;
+    NSClipView *clip = [_scrollView contentView];
+    // Before the first layout there is no geometry to measure and during
+    // teardown there is no window to hold the button, so there is nothing to
+    // record. Any earlier mark is left exactly as it was: being unable to write
+    // down a new place is not a reason to forget the old one.
+    if (_closing || !clip || !_pageView || !_didInitialLayout) return;
+    if ([_source pageCount] == 0) return;
+
+    CGFloat fraction = 0;
+    NSUInteger page  = [self currentPageWithFraction:&fraction];
+    if (!isfinite(fraction)) fraction = 0;
+
+    NSPoint origin   = [clip documentVisibleRect].origin;
+    NSSize frameSize = [_pageView frame].size;
+    // A geometry that has arrived non-finite cannot produce a point worth
+    // returning to, and recording one would arm a button whose only job is to
+    // put the reader somewhere arbitrary. The coarse half of the mark is still
+    // good -- it is derived from the page table, not from the clip -- so the
+    // exact half is simply dropped and the return uses the pair.
+    BOOL exact = (isfinite(origin.x) && isfinite(origin.y) &&
+                  isfinite(frameSize.width) && isfinite(frameSize.height));
+
+    _markPage         = page;
+    _markFraction     = fraction;
+    _markOrigin       = exact ? origin : NSZeroPoint;
+    _markFrameSize    = exact ? frameSize : NSZeroSize;
+    _markColumns      = _columns;
+    _markCover        = _cover ? YES : NO;
+    _markOriginUsable = exact;
+    _haveMark         = YES;
+
+    [self updateReturnControl];
+}
+
+- (IBAction)returnToMarkedPlace:(id)sender
+{
+    (void)sender;
+    // A key equivalent reaches an action whether or not -validateMenuItem:
+    // would have enabled the item, and the button can be clicked in the moment
+    // between the window closing and the chrome being emptied. Both are the
+    // same answer as the menu's, stated again where it is load-bearing.
+    if (_closing || !_haveMark || !_pageView) return;
+    NSUInteger pages = [_source pageCount];
+    if (pages == 0) return;
+    // The page count cannot change under an open window -- one document, one
+    // source, parsed once -- so this clamp has nothing to correct today. It
+    // costs one comparison and it is what stops a mark from ever indexing a
+    // page table it outlived.
+    NSUInteger page = (_markPage < pages) ? _markPage : pages - 1;
+
+    // The same bookkeeping every other deliberate jump does. The reader is
+    // watching one particular spot, which after an excursion is usually no
+    // longer cached, and the live-scroll coalescing state describes a viewport
+    // that is about to stop being where it says it is.
+    if (![_pageCache hasAnyImageForPage:page] && ![self pageIsUnrenderable:page])
+        _expressPage = page;
+    _haveRequestState = NO;
+    [self noteUserActivity];
+
+    if ([self markedPointStillNamesTheSamePlace])
+        [self scrollClipTo:[self clampedScrollPoint:_markOrigin] rounded:NO];
+    else
+        [self scrollToPage:page fraction:_markFraction];
+
+    [self updateVisibleContent];
+    // The reader clicked a button in the chrome, which took first responder
+    // with it; the keyboard belongs to the document they were just returned to.
+    // Same closing move as the Go to Page sheet, for the same reason.
+    [[self window] makeFirstResponder:_pageView];
+}
+
 - (BOOL)validateMenuItem:(NSMenuItem *)item
 {
     SEL action = [item action];
@@ -2691,6 +2864,19 @@ static double PVTransientBackoff(unsigned attempts)
         return [self firstPageOfRowOffsetBy:1] != NSNotFound;
     if (action == @selector(goToPreviousPage:))
         return [self firstPageOfRowOffsetBy:-1] != NSNotFound;
+    if (action == @selector(markPlace:)) {
+        // Retitled once a mark exists, because the second press does something
+        // the first did not: it abandons a place the reader chose. A check mark
+        // would say "a mark exists" and leave them to work out that choosing it
+        // again moves it -- and there is nothing here to uncheck, since the way
+        // to be rid of a mark is to put it somewhere better.
+        [item setTitle:_haveMark ? @"Mark Place Here Instead" : @"Mark Place"];
+        // Nothing to stand on before the first layout: -markPlace: would
+        // measure a viewport that has not been positioned yet.
+        return _didInitialLayout && !_closing && [_source pageCount] > 0;
+    }
+    if (action == @selector(returnToMarkedPlace:))
+        return _haveMark && !_closing;
     if (action == @selector(zoomIn:))  return _zoom < PV_MAX_ZOOM - 0.001;
     if (action == @selector(zoomOut:)) return _zoom > PV_MIN_ZOOM + 0.001;
     return YES;
@@ -2776,6 +2962,56 @@ static void PVSizeTitleBarControl(NSSegmentedControl *c)
     return seg;
 }
 
+// The way back, built exactly like the other two so it reads as one of them.
+//
+// A segmented control rather than an NSButton for the reason -newSidebarControl
+// gives -- a textured button bezel is taller on Mavericks and would not line up
+// -- and a label rather than an image because there is no icon for this and a
+// label is already the fallback the other two carry for a missing asset. It is
+// worded the same as the menu item it duplicates, so the button in the chrome
+// and the item in the Go menu are visibly the same command.
+//
+// The segment width is cleared first. -newTitleBarSegmentsWithCount: sizes its
+// segments for an icon, and an explicit width is one -sizeToFit honours: left
+// as it came, the label would be drawn into a box built for a 12-point glyph
+// and truncated to nothing.
+- (NSSegmentedControl *)newReturnControl
+{
+    NSSegmentedControl *b = [self newTitleBarSegmentsWithCount:1];
+    [b setWidth:0 forSegment:0];
+    [b setLabel:@"Return" forSegment:0];
+    [b setTarget:self];
+    [b setAction:@selector(returnToMarkedPlace:)];
+    [b setToolTip:@"Return to the place you marked"];
+    // Hidden until there is a mark. Installed either way, so that marking a
+    // place shows a control that is already built and already placed.
+    [b setHidden:YES];
+    PVSizeTitleBarControl(b);
+    return b;
+}
+
+// Whether there is a title bar for these controls to be in.
+//
+// Asked of the window rather than tracked in a flag of our own, which cannot
+// then disagree with the window it describes. Full screen is the case that
+// matters and it is not ours to observe reliably -- AppKit can take a window
+// in and out of it without this controller being the one who asked.
+- (BOOL)hasTitleBar
+{
+    NSWindow *w = [self window];
+    if (!w) return NO;
+    return ([w styleMask] & NSFullScreenWindowMask) == 0;
+}
+
+// The button is present exactly when it has somewhere to send the reader and
+// somewhere to be drawn. The second half is not cosmetic: see
+// -windowWillEnterFullScreen: for what a visible control does over a clip view
+// that copies on scroll.
+- (void)updateReturnControl
+{
+    [_titleBarReturn setHidden:!(_haveMark && [self hasTitleBar])];
+}
+
 - (void)installTitleBarControls
 {
     NSWindow *window = [self window];
@@ -2788,10 +3024,15 @@ static void PVSizeTitleBarControl(NSSegmentedControl *c)
 
     if (!_titleBarSidebar) _titleBarSidebar = [self newSidebarControl];
     if (!_titleBarZoom)    _titleBarZoom    = [self newZoomControl];
+    if (!_titleBarReturn)  _titleBarReturn  = [self newReturnControl];
     if (!_titleBarSidebar || !_titleBarZoom) return;
 
     [chrome addSubview:_titleBarSidebar];
     [chrome addSubview:_titleBarZoom];
+    // Only if it was built. This is the one control the window can do without:
+    // the Go menu carries the same command with a key equivalent, so a failed
+    // allocation here costs a convenience rather than the feature.
+    if (_titleBarReturn) [chrome addSubview:_titleBarReturn];
     [self layoutTitleBarControls];
 }
 
@@ -2828,10 +3069,21 @@ static void PVSizeTitleBarControl(NSSegmentedControl *c)
     z.origin.y = r.origin.y;
     [_titleBarZoom setFrame:z];
 
+    // Placed whether or not it is showing, and last, so that the two controls
+    // that are always there never move: a button that appears when a place is
+    // marked must not shove the sidebar and zoom controls along with it.
+    if (_titleBarReturn) {
+        NSRect b = [_titleBarReturn frame];
+        b.origin.x = NSMaxX(z) + 8.0;
+        b.origin.y = r.origin.y;
+        [_titleBarReturn setFrame:b];
+    }
+
     // Fixed distance from the top and the left: the title bar does not move
     // relative to either when the window is resized, so neither should these.
     [_titleBarSidebar setAutoresizingMask:(NSViewMaxXMargin | NSViewMinYMargin)];
     [_titleBarZoom    setAutoresizingMask:(NSViewMaxXMargin | NSViewMinYMargin)];
+    [_titleBarReturn  setAutoresizingMask:(NSViewMaxXMargin | NSViewMinYMargin)];
 }
 
 // Full screen has no title bar, so there is nowhere for these to be.
@@ -2850,6 +3102,7 @@ static void PVSizeTitleBarControl(NSSegmentedControl *c)
     (void)note;
     [_titleBarSidebar setHidden:YES];
     [_titleBarZoom    setHidden:YES];
+    [_titleBarReturn  setHidden:YES];
 }
 
 - (void)windowDidExitFullScreen:(NSNotification *)note
@@ -2860,6 +3113,12 @@ static void PVSizeTitleBarControl(NSSegmentedControl *c)
     // The frame changed twice on the way out and the title bar's height is
     // measured from it, so the position is recomputed rather than trusted.
     [self layoutTitleBarControls];
+    // Not an unconditional -setHidden:NO like the other two. This one is hidden
+    // for two different reasons -- there was no title bar, and there is no mark
+    // -- and only the first of them has just stopped being true. A reader who
+    // entered full screen with nothing marked must not come out of it to a
+    // button that would do nothing.
+    [self updateReturnControl];
 }
 
 // Taken off the window at teardown, for the reason -teardownReferences gives
@@ -2870,8 +3129,10 @@ static void PVSizeTitleBarControl(NSSegmentedControl *c)
 {
     [_titleBarSidebar setTarget:nil];
     [_titleBarZoom    setTarget:nil];
+    [_titleBarReturn  setTarget:nil];
     [_titleBarSidebar removeFromSuperview];
     [_titleBarZoom    removeFromSuperview];
+    [_titleBarReturn  removeFromSuperview];
 }
 
 - (IBAction)zoomSegmentChanged:(id)sender
