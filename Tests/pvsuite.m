@@ -4600,6 +4600,8 @@ static void PVInstallRequestCounter(void)
 - (void)clipBoundsChanged:(NSNotification *)note;
 - (void)scrollToPage:(NSUInteger)page fraction:(CGFloat)fraction;
 - (void)scrollClipTo:(NSPoint)p;
+- (void)scrollClipTo:(NSPoint)p rounded:(BOOL)rounded;
+- (BOOL)markedPointStillNamesTheSamePlace;
 - (void)pageViewWillMagnify:(PVPageView *)v atPoint:(NSPoint)p;
 - (void)pageView:(PVPageView *)v magnifyBy:(CGFloat)factor;
 - (void)pageViewDidMagnify:(PVPageView *)v;
@@ -7275,6 +7277,187 @@ static int RunUI(int argc, const char *argv[])
             PumpUntil(^{ return [(PVRenderQueue *)[wc valueForKey:@"_pageQueue"] isIdle]; }, 60.0);
         }
 
+        printf("\n[5k] marking a place, going somewhere else, and coming back\n");
+        {
+            // The claim is "the EXACT position", so most of this is asserted as
+            // bit equality rather than within a tolerance. A mark that returns
+            // the reader to nearly where they were is the same feature with its
+            // one promise broken.
+            NSScrollView *sv   = [wc valueForKey:@"_scrollView"];
+            NSClipView   *clip = [sv contentView];
+            NSSegmentedControl *back = [wc valueForKey:@"_titleBarReturn"];
+
+            NSMenuItem *markItem = [[[NSMenuItem alloc]
+                initWithTitle:@"Mark Place" action:@selector(markPlace:)
+                keyEquivalent:@""] autorelease];
+            NSMenuItem *backItem = [[[NSMenuItem alloc]
+                initWithTitle:@"Return to Marked Place"
+                       action:@selector(returnToMarkedPlace:)
+                keyEquivalent:@""] autorelease];
+
+            OK(back != nil, "the return button exists in the title bar");
+            OK(back == nil || [back isHidden],
+               "...and is not shown while there is nowhere to return to");
+            // Everything below drives the action directly, which proves the
+            // action and proves nothing about the button. This is the wiring.
+            OK([back target] == wc && [back action] == @selector(returnToMarkedPlace:),
+               "the button is wired to the same command as the menu item");
+
+            // The geometry of the three controls, which is what the old
+            // toolbar-item test used to pin and no longer can: the label is
+            // sized by -sizeToFit, and a segment left at the icon width it was
+            // built with would draw "Return" into a box made for a 12-point
+            // glyph.
+            {
+                NSSegmentedControl *sb = [wc valueForKey:@"_titleBarSidebar"];
+                NSSegmentedControl *zm = [wc valueForKey:@"_titleBarZoom"];
+                printf("  title bar: sidebar %.0f  zoom %.0f  return %.0f pt wide\n",
+                       NSWidth([sb frame]), NSWidth([zm frame]), NSWidth([back frame]));
+                OK(NSWidth([back frame]) > NSWidth([zm frame]) / 2.0,
+                   "the return button is wide enough for its label, not the icon box");
+                OK(fabs(NSHeight([back frame]) - NSHeight([zm frame])) < 0.01,
+                   "...and is exactly as tall as the controls beside it");
+                OK(!NSIntersectsRect([back frame], [zm frame]) &&
+                   !NSIntersectsRect([zm frame], [sb frame]),
+                   "no two title bar controls overlap");
+                // At the narrowest window the app will allow, all three still
+                // have to fit in the chrome beside the traffic lights.
+                NSRect saved = [[wc window] frame];
+                NSRect narrow = saved;
+                narrow.size.width = [[wc window] contentMinSize].width;
+                [[wc window] setFrame:narrow display:YES];
+                Pump(0.3);
+                OK(NSMaxX([back frame]) <= NSWidth([[back superview] bounds]) + 0.01,
+                   "the whole set fits at the narrowest window the app allows");
+                [[wc window] setFrame:saved display:YES];
+                Pump(0.3);
+            }
+            OK(![wc validateMenuItem:backItem],
+               "Return to Marked Place is disabled until a place is marked");
+            // The action must survive being invoked anyway: a key equivalent
+            // reaches it whatever validation would have said.
+            [wc returnToMarkedPlace:nil];
+            Pump(0.05);
+            OK(YES, "returning with nothing marked does nothing rather than crashing");
+
+            // A fractional starting offset on purpose. This is where the old
+            // rounding in -scrollClipTo: would have bitten, and it is the offset
+            // a trackpad actually leaves behind.
+            [wc goToPageNumber:12];
+            Pump(0.2);
+            [wc scrollClipTo:NSMakePoint(NSMinX([clip documentVisibleRect]),
+                                         NSMinY([clip documentVisibleRect]) + 40.25)
+                     rounded:NO];
+            Pump(0.2);
+            NSPoint home = [clip documentVisibleRect].origin;
+            OK(NSMinY([clip documentVisibleRect]) != floor(NSMinY([clip documentVisibleRect])),
+               "the reader is standing on a fractional offset, as a gesture leaves them");
+
+            [wc markPlace:nil];
+            Pump(0.05);
+            OK([[wc valueForKey:@"_haveMark"] boolValue], "the place is marked");
+            OK(back == nil || ![back isHidden],
+               "marking a place puts the return button in the title bar");
+            OK([wc validateMenuItem:backItem],
+               "...and enables Return to Marked Place");
+            [wc validateMenuItem:markItem];
+            OK([[markItem title] isEqualToString:@"Mark Place Here Instead"],
+               "...and the mark item says that choosing it again moves the mark");
+
+            // Go and look at something else, by three different routes, so the
+            // way back cannot be an artefact of any one of them.
+            [wc goToPageNumber:48];
+            Pump(0.2);
+            [wc scrollClipTo:NSMakePoint(0, NSMinY([clip documentVisibleRect]) + 300)];
+            [wc clipBoundsChanged:nil];
+            [wc goToFirstPage:nil];
+            Pump(0.3);
+            OK(!NSEqualPoints([clip documentVisibleRect].origin, home),
+               "the excursion actually moved the document");
+
+            [wc returnToMarkedPlace:nil];
+            Pump(0.3);
+            OK(NSEqualPoints([clip documentVisibleRect].origin, home),
+               "returning lands on the exact point the place was marked at");
+
+            // The mark is not consumed: the same trip has to be repeatable,
+            // which is the difference between a marked place and an undo.
+            OK([[wc valueForKey:@"_haveMark"] boolValue],
+               "the mark survives being used");
+            [wc goToLastPage:nil];
+            Pump(0.3);
+            [wc returnToMarkedPlace:nil];
+            Pump(0.3);
+            OK(NSEqualPoints([clip documentVisibleRect].origin, home),
+               "...so the second trip lands on the same point as the first");
+
+            // Sideways. (page, fraction) has no horizontal term at all and
+            // -scrollToPage:fraction: re-centres the document, so a mark that
+            // only carried the pair would silently lose this.
+            [wc toggleTwoPageView:nil];
+            [wc zoomActualSize:nil];
+            Pump(0.4);
+            CGFloat overhang = NSWidth([[sv documentView] frame]) - NSWidth([clip bounds]);
+            if (overhang > 4) {
+                [wc scrollClipTo:NSMakePoint(overhang, NSMinY([clip documentVisibleRect]))];
+                Pump(0.2);
+                NSPoint side = [clip documentVisibleRect].origin;
+                [wc markPlace:nil];
+                [wc goToFirstPage:nil];
+                Pump(0.3);
+                [wc returnToMarkedPlace:nil];
+                Pump(0.3);
+                OK(NSEqualPoints([clip documentVisibleRect].origin, side),
+                   "a place marked off to one side comes back with its x intact");
+            } else {
+                OK(NO, "the spread is wide enough to scroll sideways");
+            }
+
+            // A zoom invalidates the point but not the place. The pair is what
+            // is left, and it is exactly the currency the rest of the app uses
+            // to hold a reading position across a relayout.
+            [wc toggleTwoPageView:nil];
+            [wc zoomFitWidth:nil];
+            Pump(0.4);
+            [wc goToPageNumber:23];
+            Pump(0.3);
+            [wc scrollClipTo:NSMakePoint(NSMinX([clip documentVisibleRect]),
+                                         NSMinY([clip documentVisibleRect]) + 90)];
+            Pump(0.2);
+            [wc markPlace:nil];
+            CGFloat markedFrac = 0;
+            NSUInteger markedPage = [wc currentPageWithFraction:&markedFrac];
+
+            [wc zoomIn:nil];
+            [wc zoomIn:nil];
+            Pump(0.5);
+            OK(![wc markedPointStillNamesTheSamePlace],
+               "after a zoom the marked point no longer names the place it was taken from");
+            [wc goToFirstPage:nil];
+            Pump(0.3);
+            [wc returnToMarkedPlace:nil];
+            Pump(0.4);
+            CGFloat gotFrac = 0;
+            NSUInteger gotPage = [wc currentPageWithFraction:&gotFrac];
+            OK(gotPage == markedPage,
+               "returning after a zoom still lands on the marked page");
+            OK(fabs(gotFrac - markedFrac) < 0.02,
+               "...at the same distance into it, which is all the geometry left to mean");
+
+            // Nothing here may put the viewport outside its own document.
+            NSRect vis = [clip documentVisibleRect];
+            OK(NSMinX(vis) >= -0.01 && NSMinY(vis) >= -0.01 &&
+               NSMaxX(vis) <= NSWidth([[sv documentView] frame]) + 0.01 &&
+               NSMaxY(vis) <= NSHeight([[sv documentView] frame]) + 0.01,
+               "every return leaves the viewport inside the document");
+
+            // Put back exactly what [5j] left behind, which is what [6] reads
+            // off the disk after the close below.
+            [wc zoomFitWidth:nil];
+            [wc goToPageNumber:37];
+            PumpUntil(^{ return [(PVRenderQueue *)[wc valueForKey:@"_pageQueue"] isIdle]; }, 60.0);
+        }
+
         // Close the window the way the user would, then read back what was saved.
         [[wc window] performClose:nil];
         Pump(1.0);
@@ -8160,7 +8343,7 @@ static void StressControllerEvents(NSURL *url, int rounds)
     int i;
     for (i = 0; i < rounds; i++) {
         @autoreleasepool {
-            switch (Rnd() % 10) {
+            switch (Rnd() % 12) {
                 case 0: [wc goToPageNumber:(NSInteger)(Rnd() % (unsigned)pages) + 1]; break;
                 case 1: [wc zoomIn:nil];  break;
                 case 2: [wc zoomOut:nil]; break;
@@ -8179,6 +8362,15 @@ static void StressControllerEvents(NSURL *url, int rounds)
                         [wc didEndLiveScroll:nil]; break;
                 case 8: [wc showSidebar]; break;
                 case 9: [wc hideSidebar]; break;
+                // A marked place and the trip back to it, thrown in among the
+                // relayouts, the cache flushes and the pressure events. The
+                // mark records a geometry and the return reads it back, and
+                // everything else in this switch exists to change that geometry
+                // underneath it -- which is the whole question: a stale mark
+                // must fall back to (page, fraction), never index a page table
+                // it outlived or scroll the clip somewhere it cannot go.
+                case 10: [wc markPlace:nil]; break;
+                case 11: [wc returnToMarkedPlace:nil]; break;
             }
             // Most rounds do not pump at all, so events pile onto a queue that
             // is still working through the previous round's set.

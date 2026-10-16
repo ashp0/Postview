@@ -1522,6 +1522,120 @@ That is the motion gate and the dwell throttle doing exactly what §1 ranks
 first. It is a measurement of Postview against its own past, not against
 Preview, and it is the one number in this run that needs no caveat.
 
+## 14. Keeping your place while you look somewhere else
+
+Added 2026-09-05. `Go ▸ Mark Place`, ⌥⌘M, with a **Return** button in the title
+bar and ⌥⌘R beside it. Session-only, per window.
+
+The reader marks where they are, goes and looks at something else by whatever
+means they like, and presses one button to be put back. What makes the excursion
+temporary is that the way back does not move while they are away, so nothing
+else in the app touches the mark: it is set when they ask, moved when they ask
+again, and released with the document.
+
+### 14.1 "Exact" is the whole feature, and the app's own currency is not exact
+
+Postview holds a reading position as `(page, fraction-into-row)`. That is the
+right currency for everything that already used it — it means *this far into
+that page*, which is still true at another zoom, in a spread, or in a window of
+a different width, and it is what `-relayoutKeepingPage:fraction:` preserves and
+what the state store writes down.
+
+It is not a position. Handing the pair back through `-scrollToPage:fraction:`
+re-centres the document horizontally, backs off by half a page gap at the top of
+a page, and rounds to a whole point. A mark that carried only the pair would put
+the reader *near* where they were standing — same page, plausible offset, and
+the sideways position silently discarded. On a spread zoomed past the width of
+the window that is not a rounding difference, it is a different part of the
+page.
+
+So the mark records the clip origin as well, which is exact and means nothing the
+moment the geometry moves: it is a point in a coordinate space whose size is a
+function of the zoom, the column count and the window width. Both are kept,
+along with the document size, the column count and the cover flag the point was
+taken under. Unchanged geometry returns the reader to the point; changed
+geometry falls back to the pair, which is the exact case the pair is good at.
+The fingerprint is the document's own size because that is the summary of every
+input to the geometry, plus the column count and cover flag separately — a
+spread at half the zoom of a single column is the same document width with the
+pages arranged differently underneath it.
+
+### 14.2 The rounding in `-scrollClipTo:` had to become optional
+
+`-scrollClipTo:` floors its target to a whole point, and that is right for every
+scroll that is *computed*: a page origin plus a fraction of a row lands on a
+fractional point for arithmetic reasons rather than for any reason the reader
+would recognise, and a whole point keeps text on the pixel grid at 1x.
+
+It is wrong for exactly one caller. AppKit scrolls a gesture to fractional
+offsets, so half a point is an ordinary thing for a marked origin to carry, and
+on a Retina display half a point is a pixel. Rounding on the way back would move
+the reader off the spot they marked in order to restore them to it. The method
+now takes a `rounded:` flag and the return is the only caller that passes `NO`;
+everything else reaches the unchanged behaviour through the one-argument name.
+
+### 14.3 The mark is not consumed
+
+Returning leaves the mark where it is. Consuming it — taking the button away the
+moment it is used — reads tidier and is worse to use: the second look at the
+same footnote is exactly as likely as the first, and a reader who has just been
+returned somewhere is the last person who should have to re-mark it. The menu
+item retitles to **Mark Place Here Instead** once a mark exists, because the
+second press does something the first did not — it abandons a place the reader
+chose — and a check mark would state that a mark exists while leaving them to
+work out that choosing it again moves it.
+
+### 14.4 The button is in the title bar, and that is why it is absent in full screen
+
+A third textured segmented control beside the sidebar and zoom controls (§ the
+title bar controls), built the same way and for the same Mavericks reason: a
+textured `NSButton` bezel is taller than a textured `NSSegmentedControl` bezel,
+so a button beside a segmented control is a button that does not line up with
+it. It is installed for the life of the window and hidden until there is a mark,
+so marking a place changes one `BOOL` rather than installing, sizing and placing
+a control.
+
+It is hidden in full screen for the reason the other two are, which is not
+cosmetic: with the title bar gone a control left in the chrome sits directly over
+the document, and the clip view under it copies on scroll, so every scroll blits
+its pixels along with the page and leaves another copy behind. Coming *out* of
+full screen is therefore not a plain `-setHidden:NO` for this one — it is hidden
+for two different reasons and only one of them has stopped being true. ⌥⌘R and
+the Go menu both work in full screen, which is where the command actually lives.
+
+### 14.5 What it cannot do wrong
+
+The mark is four numbers and a flag; it starts no work, holds no object, and
+schedules nothing. The return does what every other deliberate jump does — clear
+the coalescing state, take the express lane if the page it is heading for is
+blank, scroll, rebuild the wanted set.
+
+- Returning with nothing marked, or after the window has begun closing, is a
+  no-op. Both are stated in the action as well as in `-validateMenuItem:`,
+  because a key equivalent reaches an action whether or not validation would
+  have enabled the item.
+- Marking before the first layout records nothing and, importantly, forgets
+  nothing: being unable to write down a new place is not a reason to lose the
+  old one.
+- A non-finite geometry drops the exact half of the mark and keeps the coarse
+  half, so the button is never armed with a point that cannot be scrolled to.
+- The restored point is clamped to the document before it is used. AppKit would
+  constrain it anyway; the clamp is what keeps `_lastScrollY` honest, since
+  `-scrollClipTo:` records where the clip *landed* and every caller that clamps
+  first produces a notification whose reported travel is the travel that
+  happened (§12).
+- The page index is clamped against the live page count. Nothing can change it
+  under an open window today; it costs one comparison and it is what stops a
+  mark from ever indexing a page table it outlived.
+
+`pvsuite ui` § [5k] asserts the round trip as bit equality on the clip origin —
+including from a fractional starting offset, and including the sideways position
+a spread can hold — that the mark survives its own use, that a zoom demotes the
+point to the pair and the pair still lands on the same page at the same fraction,
+and that no return leaves the viewport outside the document. `pvsuite stress`
+puts both actions into the interleaved event storm, among the relayouts, cache
+flushes, occlusion changes and memory-pressure events whose whole purpose is to
+change the geometry underneath a mark that has already been taken.
 ---
 
 ## 14. The stability pass, 2026-10-02
