@@ -284,7 +284,8 @@ PVRenderCoreResult PVRenderPDFPageToBuffer(CGPDFDocumentRef document,
                             size_t width,
                             size_t height,
                             void *buffer,
-                            size_t bytesPerRow)
+                            size_t bytesPerRow,
+                            CGColorSpaceRef colorSpace)
 {
     if (!document || !buffer || width == 0 || height == 0)
         return PVRenderCoreInvalidPage;
@@ -304,12 +305,15 @@ PVRenderCoreResult PVRenderPDFPageToBuffer(CGPDFDocumentRef document,
     // The two allocations below are the reason this function stopped returning
     // a BOOL. Neither says anything about the page: both are Quartz declining
     // to hand out memory, which is the definition of worth-trying-again.
-    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
-    if (!colorSpace) return PVRenderCoreTransientResource;
+    if (colorSpace && (CGColorSpaceGetModel(colorSpace) != kCGColorSpaceModelRGB ||
+                       CGColorSpaceGetNumberOfComponents(colorSpace) != 3))
+        colorSpace = NULL;
+    CGColorSpaceRef space = colorSpace ? CGColorSpaceRetain(colorSpace)
+                                       : CGColorSpaceCreateDeviceRGB();
+    if (!space) return PVRenderCoreTransientResource;
     CGContextRef context = CGBitmapContextCreate(buffer, width, height, 8,
-        bytesPerRow, colorSpace,
-        (CGBitmapInfo)kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Host);
-    CGColorSpaceRelease(colorSpace);
+        bytesPerRow, space, PV_PAGE_BITMAP_INFO);
+    CGColorSpaceRelease(space);
     if (!context) return PVRenderCoreTransientResource;
 
     PVRenderCoreResult result = PVRenderCoreDrawFailure;

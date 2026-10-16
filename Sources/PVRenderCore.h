@@ -140,13 +140,28 @@ typedef BOOL (*PVAnnotationDrawHook)(size_t oneBasedPage,
                                      CGContextRef context);
 void PVSetAnnotationDrawHook(PVAnnotationDrawHook hook);
 
-/* Render one page into caller-owned, zeroed-or-writable 32-bit host-order RGB. */
+/* The pixel format of every page bitmap, in the helper that draws it and the
+ * viewer that wraps it: premultiplied ARGB in host order, which is the window
+ * backing store's own format, with alpha 255 throughout because the page is
+ * filled with opaque white before anything is drawn on it.
+ *
+ * It was "none, skip first" -- the same bytes with the alpha byte declared
+ * meaningless -- and that made Quartz rewrite the alpha of every pixel it blitted
+ * (CGSConvertRGBX8888toRGBA8888) before it could composite them. Measured with
+ * Instruments on the 10.9 MacBook once the colour match was gone: 37% of the
+ * viewer's CPU while reading, on the main thread and the vImage workers. */
+#define PV_PAGE_BITMAP_INFO \
+    ((CGBitmapInfo)kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Host)
+
+/* Render one page into caller-owned, zeroed-or-writable 32-bit host-order RGB,
+ * in `colorSpace` (an RGB space; NULL means device RGB). */
 PVRenderCoreResult PVRenderPDFPageToBuffer(CGPDFDocumentRef document,
                             NSUInteger zeroBasedPage,
                             CGSize naturalSize,
                             size_t width,
                             size_t height,
                             void *buffer,
-                            size_t bytesPerRow);
+                            size_t bytesPerRow,
+                            CGColorSpaceRef colorSpace);
 
 #endif

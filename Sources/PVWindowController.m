@@ -408,6 +408,9 @@ static BOOL PVPageOverlapsColumn(NSRect page, NSRect viewport)
 // page rectangle in the right place, with its render in flight.
 - (void)showWindow:(id)sender
 {
+    // Before the first request, so the opening page is rendered for the display
+    // it will be shown on rather than colour-matched on every draw after it.
+    PVUpdateRenderColorProfileForWindow([self window]);
     if (!_didInitialLayout) {
         _didInitialLayout = YES;
         if (_restoreSidebar) [self showSidebar];
@@ -1934,6 +1937,24 @@ static double PVTransientBackoff(unsigned attempts)
 // window notifications here need, because their selectors deliberately differ
 // from the delegate names -- registered this handler twice, so every resize
 // ran the whole exact pass two times over.
+// The render colour space follows the window the reader is using. A window in
+// the background that changes screen does not take it from the main one; it
+// gets its turn when it becomes main.
+- (void)windowDidBecomeMain:(NSNotification *)note
+{
+    PVUpdateRenderColorProfileForWindow([self window]);
+}
+
+- (void)windowDidChangeScreen:(NSNotification *)note
+{
+    if ([[self window] isMainWindow]) PVUpdateRenderColorProfileForWindow([self window]);
+}
+
+- (void)windowDidChangeScreenProfile:(NSNotification *)note
+{
+    if ([[self window] isMainWindow]) PVUpdateRenderColorProfileForWindow([self window]);
+}
+
 - (void)windowDidEndLiveResize:(NSNotification *)note
 {
     if (_closing || !_didInitialLayout) return;

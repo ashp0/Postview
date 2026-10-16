@@ -159,6 +159,18 @@ int main(int argc, const char *argv[])
             off += (size_t)n;
         }
         if (eof) _exit(0);
+        // The colour profile that follows the command, drained so the next
+        // command is read from a message boundary.
+        {
+            uint32_t left = cmd.colorProfileLength;
+            char sink[4096];
+            while (left > 0) {
+                ssize_t n = read(STDIN_FILENO, sink, left < sizeof sink ? left : sizeof sink);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) _exit(0);
+                left -= (uint32_t)n;
+            }
+        }
 
         switch (mode) {
             case BadRenderSilent:

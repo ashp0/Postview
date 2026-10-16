@@ -143,6 +143,112 @@ static BOOL PVReceiveCommand(int socket, PVRenderCommand *command, int *outFD)
     return YES;
 }
 
+// The colour space the command's page is to be drawn in: the ICC profile that
+// follows the command on the socket. See PV_MAX_COLOR_PROFILE_BYTES.
+//
+// The last profile and the space made from it are kept, because the viewer sends
+// the same profile with every command and building a CGColorSpace from ICC data
+// is a parse, while comparing a few kilobytes is not. `*outSpace` is borrowed,
+// NULL meaning device RGB, and stays valid until the next call.
+//
+// Returns NO only when the channel is unusable -- a length past the bound or a
+// short read -- which the caller answers as it answers a malformed command.
+static BOOL PVReceiveColorProfile(int socket, uint32_t length,
+                                  CGColorSpaceRef *outSpace)
+{
+    static void           *sLastProfile = NULL;
+    static uint32_t        sLastLength  = 0;
+    static CGColorSpaceRef sLastSpace   = NULL;
+
+    *outSpace = NULL;
+    if (length == 0) return YES;
+    if (length > PV_MAX_COLOR_PROFILE_BYTES) return NO;
+
+    void *bytes = malloc(length);
+    if (!bytes) return NO;
+    size_t offset = 0;
+    while (offset < length) {
+        ssize_t n = read(socket, (char *)bytes + offset, length - offset);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { free(bytes); return NO; }
+        offset += (size_t)n;
+    }
+
+    if (sLastProfile && sLastLength == length &&
+        memcmp(sLastProfile, bytes, length) == 0) {
+        free(bytes);
+        *outSpace = sLastSpace;
+        return YES;
+    }
+
+    // A profile Quartz will not build, or one that is not RGB, is drawn in
+    // device RGB: the page is still right, only its blit is the slow one.
+    CFDataRef data = CFDataCreate(NULL, (const UInt8 *)bytes, (CFIndex)length);
+    CGColorSpaceRef space = data ? CGColorSpaceCreateWithICCProfile(data) : NULL;
+    if (data) CFRelease(data);
+    if (space && (CGColorSpaceGetModel(space) != kCGColorSpaceModelRGB ||
+                  CGColorSpaceGetNumberOfComponents(space) != 3)) {
+        CGColorSpaceRelease(space);
+        space = NULL;
+    }
+
+    free(sLastProfile);
+    if (sLastSpace) CGColorSpaceRelease(sLastSpace);
+    sLastProfile = bytes;
+    sLastLength  = length;
+    sLastSpace   = space;
+    *outSpace = space;
+    return YES;
+}
+
+// Pooled page buffers this helper keeps mapped between commands, by the
+// viewer's id for them. See PVPageBuffer in PVPDFSource.m: a buffer mapped once
+// and kept costs its page faults once, where a fresh mapping per command paid
+// them on every page -- most of this process's time while reading.
+//
+// Bounded, least recently used first out. A slot holds its segment's memory
+// alive after the viewer has let the buffer go, so the bound is also the most
+// this process can keep that nobody is using.
+#define PV_HELPER_BUFFER_SLOTS 8
+
+typedef struct {
+    uint64_t id;
+    void    *map;
+    size_t   length;
+    uint64_t used;
+} PVKeptBuffer;
+
+static PVKeptBuffer sPVKept[PV_HELPER_BUFFER_SLOTS];
+static uint64_t     sPVKeptClock;
+
+// The kept read-write mapping of buffer `id`, made from `fd` (whose segment is
+// `length` bytes) if this process has not seen it, or MAP_FAILED. A mapping
+// shorter than `needed` is not one to draw into.
+static void *PVMapKeptBuffer(uint64_t id, int fd, size_t length, size_t needed)
+{
+    unsigned i, victim = 0;
+    for (i = 0; i < PV_HELPER_BUFFER_SLOTS; i++) {
+        if (sPVKept[i].map && sPVKept[i].id == id) {
+            if (sPVKept[i].length < needed) return MAP_FAILED;
+            sPVKept[i].used = ++sPVKeptClock;
+            return sPVKept[i].map;
+        }
+    }
+    if (length < needed) return MAP_FAILED;
+    void *map = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) return MAP_FAILED;
+    for (i = 0; i < PV_HELPER_BUFFER_SLOTS; i++) {
+        if (!sPVKept[i].map) { victim = i; break; }
+        if (sPVKept[i].used < sPVKept[victim].used) victim = i;
+    }
+    if (sPVKept[victim].map) munmap(sPVKept[victim].map, sPVKept[victim].length);
+    sPVKept[victim].id = id;
+    sPVKept[victim].map = map;
+    sPVKept[victim].length = length;
+    sPVKept[victim].used = ++sPVKeptClock;
+    return map;
+}
+
 // Die when the viewer does.
 //
 // Pipe EOF is the ordinary way this process learns it is no longer wanted, and
@@ -540,6 +646,12 @@ int main(int argc, const char *argv[])
             PVRenderCommand command;
             int sharedFD = -1;
             if (!PVReceiveCommand(STDIN_FILENO, &command, &sharedFD)) break;
+            CGColorSpaceRef colorSpace = NULL;
+            if (!PVReceiveColorProfile(STDIN_FILENO, command.colorProfileLength,
+                                       &colorSpace)) {
+                if (sharedFD >= 0) close(sharedFD);
+                break;
+            }
 
             PVRenderReply reply;
             memset(&reply, 0, sizeof(reply));
@@ -579,9 +691,12 @@ int main(int argc, const char *argv[])
                     BOOL sized = (fstat(sharedFD, &info) == 0 &&
                                   info.st_size >= 0 &&
                                   (uint64_t)info.st_size >= (uint64_t)bytes);
-                    void *map = sized ? mmap(NULL, bytes, PROT_READ | PROT_WRITE,
-                                             MAP_SHARED, sharedFD, 0)
-                                      : MAP_FAILED;
+                    BOOL kept = (command.bufferId != 0);
+                    void *map = !sized ? MAP_FAILED
+                              : kept   ? PVMapKeptBuffer(command.bufferId, sharedFD,
+                                                         (size_t)info.st_size, bytes)
+                                       : mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+                                              MAP_SHARED, sharedFD, 0);
                     int mapErrno = errno;
                     // Nothing to unlink. The viewer dropped the name before it
                     // ever sent this descriptor, so the object already lives
@@ -598,7 +713,7 @@ int main(int argc, const char *argv[])
                             CGSizeMake((CGFloat)command.naturalWidth,
                                        (CGFloat)command.naturalHeight),
                             command.width, command.height, map,
-                            (size_t)command.bytesPerRow);
+                            (size_t)command.bytesPerRow, colorSpace);
                         alarm(0);
                         // Back to background before the reply is even written,
                         // so no work after this page can inherit the promotion.
@@ -608,7 +723,7 @@ int main(int argc, const char *argv[])
                         // viewer starts a fresh one, which begins backgrounded.
                         if (raised &&
                             setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG) != 0) {
-                            munmap(map, bytes);
+                            if (!kept) munmap(map, bytes);
                             close(sharedFD);
                             // Released even though the process is about to end,
                             // because the exit paths of this loop are the ones
@@ -619,7 +734,7 @@ int main(int argc, const char *argv[])
                             CGPDFDocumentRelease(document);
                             return 4;
                         }
-                        munmap(map, bytes);
+                        if (!kept) munmap(map, bytes);
                         // Each cause keeps its own errno across the pipe. The
                         // viewer's whole retry policy turns on the difference,
                         // and collapsing them here is what made a page that
