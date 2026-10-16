@@ -9,7 +9,7 @@
 // NAME in the command and would read the field the descriptor replaced. Neither
 // can be mixed with this one, so the number moves.
 #define PV_RENDER_PROTOCOL_MAGIC   ((uint32_t)0x50565231) /* PVR1 */
-#define PV_RENDER_PROTOCOL_VERSION ((uint32_t)3)
+#define PV_RENDER_PROTOCOL_VERSION ((uint32_t)4)
 
 // How the bitmap reaches the helper: as a descriptor, over the command socket,
 // in the SCM_RIGHTS control message attached to the command itself.
@@ -219,6 +219,22 @@ enum {
     PVRenderPriorityInteractive = 1
 };
 
+// The colour space a page is drawn in travels with the command, as the display's
+// ICC profile in `colorProfileLength` bytes immediately after the struct.
+//
+// Measured with Instruments on the 10.9 MacBook (2026-10-16): a device-RGB
+// bitmap drawn into a window is colour-matched to the display on every draw,
+// and Quartz does it by unpacking the WHOLE bitmap to 24-bit, running it
+// through ColorSync and repacking it -- for a 40 pt strip exposed by one arrow
+// press as much as for a full page. That was 54% of the viewer's CPU while
+// reading, more than the helper spent drawing the pages. Rendered into the
+// display's own space instead, the match happens once, here, and the blit is a
+// copy. The profile is sent with every command rather than once per helper so
+// that a bitmap and the colour space it is tagged with cannot come from two
+// different moments: a window that moves to another display gets correct
+// colours on every page, merely slower ones until the new renders land.
+#define PV_MAX_COLOR_PROFILE_BYTES ((uint32_t)(1u << 20))
+
 typedef struct {
     uint32_t magic;
     uint32_t version;
@@ -227,8 +243,9 @@ typedef struct {
     uint32_t width;
     uint32_t height;
     uint32_t priority;         /* one of the PVRenderPriority* values */
-    uint32_t reserved;
+    uint32_t colorProfileLength; /* ICC bytes that follow; 0 means device RGB */
     uint64_t bytesPerRow;
+    uint64_t bufferId;         /* nonzero: a pooled buffer the helper may keep mapped */
     double   naturalWidth;
     double   naturalHeight;
     // No shared-memory name. The bitmap arrives as the descriptor in this

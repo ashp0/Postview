@@ -1,4 +1,5 @@
 #import "PVCommon.h"
+#import "PVRenderProtocol.h"
 #import <mach/mach_time.h>
 #import <pthread.h>
 #import <string.h>
@@ -241,6 +242,57 @@ double PVMaxRenderPixels(void)
 
 static double         sPVStats[PVStatCount];
 static pthread_mutex_t sPVStatsLock = PTHREAD_MUTEX_INITIALIZER;
+
+static pthread_mutex_t sPVColorLock = PTHREAD_MUTEX_INITIALIZER;
+static NSData         *sPVColorProfile;
+static CGColorSpaceRef sPVColorSpace;
+
+void PVSetRenderColorProfile(NSData *profile)
+{
+    if ([profile length] == 0 ||
+        [profile length] > PV_MAX_COLOR_PROFILE_BYTES) profile = nil;
+
+    pthread_mutex_lock(&sPVColorLock);
+    BOOL same = (profile == sPVColorProfile ||
+                 (profile && sPVColorProfile && [profile isEqualToData:sPVColorProfile]));
+    pthread_mutex_unlock(&sPVColorLock);
+    if (same) return;
+
+    CGColorSpaceRef space = profile
+        ? CGColorSpaceCreateWithICCProfile((CFDataRef)profile) : NULL;
+    if (space && (CGColorSpaceGetModel(space) != kCGColorSpaceModelRGB ||
+                  CGColorSpaceGetNumberOfComponents(space) != 3)) {
+        CGColorSpaceRelease(space);
+        space = NULL;
+    }
+    // A profile with no usable space is not sent either: the helper would only
+    // reach the same verdict and draw in device RGB, which nil already says.
+    NSData *copy = space ? [profile copy] : nil;
+
+    pthread_mutex_lock(&sPVColorLock);
+    NSData *oldProfile = sPVColorProfile;
+    CGColorSpaceRef oldSpace = sPVColorSpace;
+    sPVColorProfile = copy;
+    sPVColorSpace = space;
+    pthread_mutex_unlock(&sPVColorLock);
+    [oldProfile release];
+    if (oldSpace) CGColorSpaceRelease(oldSpace);
+}
+
+void PVCopyRenderColorProfile(NSData **outProfile, CGColorSpaceRef *outSpace)
+{
+    pthread_mutex_lock(&sPVColorLock);
+    *outProfile = [sPVColorProfile retain];
+    *outSpace = sPVColorSpace ? CGColorSpaceRetain(sPVColorSpace) : NULL;
+    pthread_mutex_unlock(&sPVColorLock);
+}
+
+void PVUpdateRenderColorProfileForWindow(NSWindow *window)
+{
+    NSScreen *screen = [window screen];
+    if (!screen) screen = [NSScreen mainScreen];
+    PVSetRenderColorProfile([[screen colorSpace] ICCProfileData]);
+}
 
 BOOL PVStatsEnabled(void)
 {
@@ -745,7 +797,42 @@ static void PVApplyPowerDefaultOnce(void)
     });
 }
 
+// AppKit's own smooth scrolling of a mouse wheel follows the same rule as the
+// arrow key (PVSmoothScrollForPower): animated on mains, a jump on battery.
+//
+// A wheel click is a line scroll, and AppKit animates it with a 60 Hz timer that
+// scrolls and redraws a strip on every frame -- measured with Instruments on the
+// 10.9 MacBook, the largest single thing left in the viewer once the page blit
+// was a copy. The wheel itself stays AppKit's -- -scrollWheel: is not
+// overridden anywhere, so momentum, elasticity and the scroller behave as they
+// do in every other app. What this does is answer the one question AppKit asks,
+// NSScrollAnimationEnabled, in the registration domain -- so a reader who has set that preference themselves,
+// either way, still gets what they chose. Trackpads send precise deltas and are
+// never animated, so they are unaffected.
+//
+// Updated whenever the answer to the power question changes, which is asked
+// several times a second while anything is moving.
+static void PVApplyWheelAnimation(PVPowerSource power)
+{
+    static int sApplied = -1;
+    BOOL animate = PVSmoothScrollForPower(power);
+    if (sApplied == (int)animate) return;
+    sApplied = (int)animate;
+    [[NSUserDefaults standardUserDefaults] registerDefaults:
+        [NSDictionary dictionaryWithObject:[NSNumber numberWithBool:animate]
+                                    forKey:@"NSScrollAnimationEnabled"]];
+}
+
+static PVPowerSource PVQueryPowerSource(void);
+
 PVPowerSource PVCurrentPowerSource(void)
+{
+    PVPowerSource power = PVQueryPowerSource();
+    PVApplyWheelAnimation(power);
+    return power;
+}
+
+static PVPowerSource PVQueryPowerSource(void)
 {
     PVApplyPowerDefaultOnce();
     if (sPVPowerOverrideOn) return sPVPowerOverride;

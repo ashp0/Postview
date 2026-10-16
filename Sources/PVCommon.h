@@ -796,6 +796,19 @@ typedef enum {
 // not go backwards.
 double PVMonotonicSeconds(void);
 
+// The colour space pages are rendered in: the profile of the display the reader
+// is looking at, so a page bitmap reaches the screen without being colour-matched
+// on every draw (PV_MAX_COLOR_PROFILE_BYTES says what that cost). Set from the
+// main thread whenever a document window changes screen or profile; read from
+// the render threads. nil, the initial state, means device RGB.
+void PVSetRenderColorProfile(NSData *profile);
+// The current profile and a colour space made from it, as one consistent pair,
+// both retained for the caller (release with -release / CGColorSpaceRelease).
+// Either may come back NULL; a NULL space means device RGB.
+void PVCopyRenderColorProfile(NSData **outProfile, CGColorSpaceRef *outSpace);
+// The profile for a window's current screen, or the main screen's.
+void PVUpdateRenderColorProfileForWindow(NSWindow *window);
+
 BOOL PVStatsEnabled(void);
 void PVStatAdd(PVStatKey key, double delta);
 // Record a maximum rather than a sum. The peak keys above are the only ones

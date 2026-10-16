@@ -667,18 +667,202 @@ static uint64_t PVNextSharedMemoryToken(void)
     return (uint64_t)__sync_add_and_fetch(&counter, 1);
 }
 
+typedef struct PVPageBuffer PVPageBuffer;
+static void PVReturnPageBuffer(PVPageBuffer *buffer);
+
 typedef struct {
     void *address;
     size_t length;
+    PVPageBuffer *buffer;      // returned to the pool rather than unmapped
 } PVSharedBitmap;
 
 static void PVReleaseSharedBitmap(void *info, const void *data, size_t size)
 {
     PVSharedBitmap *bitmap = (PVSharedBitmap *)info;
     if (bitmap) {
-        if (bitmap->address && bitmap->length)
+        if (bitmap->buffer)
+            PVReturnPageBuffer(bitmap->buffer);
+        else if (bitmap->address && bitmap->length)
             munmap(bitmap->address, bitmap->length);
         free(bitmap);
+    }
+}
+
+// A new shared-memory segment of `bytes`, already unnamed: its descriptor, with
+// the read-only mapping this process keeps in `*outMap` and the token that
+// named it in `*outToken`. -1, with `*failure` set, when there is none.
+static int PVCreateSharedSegment(size_t bytes, uint64_t *outToken, void **outMap,
+                                 PVRenderFailure *failure)
+{
+    // Both parts in hex and nothing else. A pid is at most 5 hex digits and the
+    // token at most 16, so the longest name this can produce is
+    // "/pv-" + 5 + "-" + 16 = 26 characters, comfortably inside
+    // PV_SHM_NAME_MAX for the life of the process. See PV_SHM_NAME_MAX for what
+    // went wrong when the name could outgrow it.
+    char name[PV_SHM_NAME_MAX + 1];
+    int sharedFD = -1;
+    unsigned attempt;
+    for (attempt = 0; attempt < 16; attempt++) {
+        *outToken = PVNextSharedMemoryToken();
+        int written = snprintf(name, sizeof(name), "/pv-%x-%llx",
+                               (unsigned)getpid(),
+                               (unsigned long long)*outToken);
+        // Stated rather than assumed. If the arithmetic above is ever wrong,
+        // this fails one render loudly instead of failing every render for the
+        // rest of the session in a way that looks like a blank document.
+        if (written < 0 || (size_t)written >= sizeof(name)) {
+            *failure = PVRenderFailureProtocol;
+            return -1;
+        }
+        sharedFD = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
+        if (sharedFD >= 0 || errno != EEXIST) break;
+    }
+    if (sharedFD < 0) { *failure = PVRenderFailureTransientResource; return -1; }
+    (void)fcntl(sharedFD, F_SETFD, FD_CLOEXEC);
+    if (ftruncate(sharedFD, (off_t)bytes) != 0) {
+        close(sharedFD); shm_unlink(name);
+        *failure = PVRenderFailureTransientResource;
+        return -1;
+    }
+
+    // The name is finished with the moment the object has a size, and it is
+    // dropped here rather than after the render for exactly that reason. From
+    // this point the object is reachable only through `sharedFD` and the
+    // mappings made from it, so there is no window in which a SIGKILL to either
+    // process can strand a named segment that nothing will ever unlink. See
+    // PV_RENDER_COMMAND_CARRIES_FD.
+    //
+    // Unchecked: the name was created O_EXCL a few lines above and belongs to
+    // this process, so the only way this fails is if it never existed, and the
+    // shm_open above already proved otherwise.
+    (void)shm_unlink(name);
+
+    // PROT_READ, and no memset.
+    //
+    // Both halves of that are the same decision. The viewer used to map the
+    // segment writable and zero every byte of it before handing the name over,
+    // which did two unwanted things: it made this process touch every page of a
+    // ~28 MB mapping, so a deferred backing-store failure raised SIGBUS HERE --
+    // in the process the helper exists to keep alive -- and it doubled the
+    // memory traffic of every full-resolution render for bytes the helper
+    // overwrites in full a moment later. PVRenderPDFPageToBuffer fills the whole
+    // bitmap with white before it draws, and ftruncate guarantees the row
+    // padding it does not reach is already zero.
+    //
+    // Read-only here also states the direction of the channel: the helper
+    // writes pixels, the viewer reads them, and neither needs the other's
+    // permission.
+    //
+    // sharedFD stays open past this mapping: it is what gets sent to the
+    // helper, and with the name already gone it is now the only way to name
+    // this object at all.
+    void *map = mmap(NULL, bytes, PROT_READ, MAP_SHARED, sharedFD, 0);
+    if (map == MAP_FAILED) {
+        close(sharedFD);
+        *failure = PVRenderFailureTransientResource;
+        return -1;
+    }
+    *outMap = map;
+    return sharedFD;
+}
+
+// Page buffers that outlive the page they were drawn for.
+//
+// A segment that is new to a process costs a page fault for every 4 KB of it the
+// first time that process touches it, and the helper touches all of it at once:
+// the white fill. Measured on the 10.9 MacBook, filling 26 MB costs 10.7 ms in a
+// fresh mapping and 3.0 ms in one that is already mapped and touched -- the rest
+// is the kernel zero-filling pages the fill then overwrites. It was ~45% of the
+// helper's samples while reading. Reusing a segment is not enough on its own: a
+// reused segment mapped afresh costs the same 11 ms, because the faults belong to
+// the mapping. So a buffer keeps its descriptor and this process's read-only
+// mapping for its whole life, the command names it (PVRenderCommand.bufferId),
+// and the helper keeps its own mapping of it between commands.
+//
+// A buffer is in use while a CGImage made from it is alive and in the pool once
+// that image is released; it is only ever handed to one render at a time, and
+// only after the image that last showed it is gone, so nothing reads it while
+// the helper writes. Only page-sized buffers are kept -- thumbnails and previews
+// are small enough that their faults do not matter, and keeping a descriptor
+// per thumbnail would walk a 300-page document into 10.9's 256-descriptor limit.
+//
+// The pool spends memory to save energy, deliberately: at most
+// PV_PAGE_BUFFER_POOL_COUNT buffers and PV_PAGE_BUFFER_POOL_BYTES held idle here,
+// plus whatever the helper still has mapped (PV_HELPER_BUFFER_SLOTS).
+#define PV_PAGE_BUFFER_MIN_BYTES   (4u * 1024u * 1024u)
+#define PV_PAGE_BUFFER_POOL_COUNT  6
+#define PV_PAGE_BUFFER_POOL_BYTES  (192u * 1024u * 1024u)
+
+struct PVPageBuffer {
+    uint64_t identifier;
+    int      fd;
+    void    *map;
+    size_t   length;
+    struct PVPageBuffer *next;
+};
+
+static pthread_mutex_t sPVPagePoolLock = PTHREAD_MUTEX_INITIALIZER;
+static PVPageBuffer   *sPVPagePool;          // most recently returned first
+static size_t          sPVPagePoolCount;
+static size_t          sPVPagePoolBytes;
+
+static void PVDestroyPageBuffer(PVPageBuffer *buffer)
+{
+    if (!buffer) return;
+    if (buffer->map && buffer->length) munmap(buffer->map, buffer->length);
+    if (buffer->fd >= 0) close(buffer->fd);
+    free(buffer);
+}
+
+// The best-fitting free buffer that holds `bytes` without wasting more than a
+// quarter of itself, or NULL. Page sizes repeat within a reading session, so an
+// exact fit is the usual case.
+static PVPageBuffer *PVTakePageBuffer(size_t bytes)
+{
+    pthread_mutex_lock(&sPVPagePoolLock);
+    PVPageBuffer **best = NULL, **link;
+    for (link = &sPVPagePool; *link; link = &(*link)->next) {
+        size_t length = (*link)->length;
+        if (length < bytes || length - bytes > length / 4) continue;
+        if (!best || length < (*best)->length) best = link;
+    }
+    PVPageBuffer *buffer = NULL;
+    if (best) {
+        buffer = *best;
+        *best = buffer->next;
+        buffer->next = NULL;
+        sPVPagePoolCount--;
+        sPVPagePoolBytes -= buffer->length;
+    }
+    pthread_mutex_unlock(&sPVPagePoolLock);
+    return buffer;
+}
+
+static void PVReturnPageBuffer(PVPageBuffer *buffer)
+{
+    PVPageBuffer *evicted = NULL;
+    pthread_mutex_lock(&sPVPagePoolLock);
+    buffer->next = sPVPagePool;
+    sPVPagePool = buffer;
+    sPVPagePoolCount++;
+    sPVPagePoolBytes += buffer->length;
+    // Over either bound, the least recently returned go first.
+    while (sPVPagePoolCount > PV_PAGE_BUFFER_POOL_COUNT ||
+           (sPVPagePoolBytes > PV_PAGE_BUFFER_POOL_BYTES && sPVPagePoolCount > 1)) {
+        PVPageBuffer **link = &sPVPagePool;
+        while ((*link)->next) link = &(*link)->next;
+        PVPageBuffer *last = *link;
+        *link = NULL;
+        sPVPagePoolCount--;
+        sPVPagePoolBytes -= last->length;
+        last->next = evicted;
+        evicted = last;
+    }
+    pthread_mutex_unlock(&sPVPagePoolLock);
+    while (evicted) {
+        PVPageBuffer *next = evicted->next;
+        PVDestroyPageBuffer(evicted);
+        evicted = next;
     }
 }
 
@@ -695,13 +879,21 @@ static void PVReleaseSharedBitmap(void *info, const void *data, size_t size)
 // write here does not mean "busy", it means something is wrong with the
 // channel -- and the caller's answer to that, killing the helper and starting
 // a fresh one, is the right answer to all of it.
+//
+// The colour profile, when there is one, follows the command in the same send
+// (PV_MAX_COLOR_PROFILE_BYTES). A stream socket may take a large profile in more
+// than one piece, so the tail is finished with ordinary writes: the descriptor
+// rode with the first byte, and what remains is only bytes.
 static BOOL PVSendCommandWithDescriptor(int socket,
                                         const PVRenderCommand *command,
-                                        int descriptor)
+                                        int descriptor,
+                                        NSData *profile)
 {
-    struct iovec item;
-    item.iov_base = (void *)command;
-    item.iov_len  = sizeof(*command);
+    struct iovec item[2];
+    item[0].iov_base = (void *)command;
+    item[0].iov_len  = sizeof(*command);
+    item[1].iov_base = (void *)[profile bytes];
+    item[1].iov_len  = command->colorProfileLength;
 
     // Aligned as a cmsghdr, and sized by a constant.
     //
@@ -725,8 +917,8 @@ static BOOL PVSendCommandWithDescriptor(int socket,
 
     struct msghdr message;
     memset(&message, 0, sizeof(message));
-    message.msg_iov        = &item;
-    message.msg_iovlen     = 1;
+    message.msg_iov        = item;
+    message.msg_iovlen     = command->colorProfileLength ? 2 : 1;
     message.msg_control    = control.bytes;
     message.msg_controllen = CMSG_SPACE(sizeof(int));
 
@@ -740,7 +932,19 @@ static BOOL PVSendCommandWithDescriptor(int socket,
     ssize_t sent;
     do { sent = sendmsg(socket, &message, 0); }
     while (sent < 0 && errno == EINTR);
-    return (sent == (ssize_t)sizeof(*command));
+    if (sent < (ssize_t)sizeof(*command)) return NO;
+
+    size_t total = sizeof(*command) + command->colorProfileLength;
+    size_t offset = (size_t)sent;
+    while (offset < total) {
+        size_t into = offset - sizeof(*command);
+        ssize_t n = write(socket, (const char *)[profile bytes] + into,
+                          command->colorProfileLength - into);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return NO;
+        offset += (size_t)n;
+    }
+    return YES;
 }
 
 // Read exactly `length` bytes, or give up at `deadline`.
@@ -1311,74 +1515,31 @@ static PVRenderFailure PVFailureForReplyStatus(int32_t status)
 
     if (![self ensureRenderHelper:failure]) return NULL;
 
-    // Both parts in hex and nothing else. A pid is at most 5 hex digits and the
-    // token at most 16, so the longest name this can produce is
-    // "/pv-" + 5 + "-" + 16 = 26 characters, comfortably inside
-    // PV_SHM_NAME_MAX for the life of the process. See PV_SHM_NAME_MAX for what
-    // went wrong when the name could outgrow it.
-    char name[PV_SHM_NAME_MAX + 1];
+    // A page buffer from the pool when a free one fits, so neither process
+    // pays for fresh pages; otherwise a new segment. See PVPageBuffer.
+    PVPageBuffer *buffer = (bytes >= PV_PAGE_BUFFER_MIN_BYTES)
+                         ? PVTakePageBuffer(bytes) : NULL;
     int sharedFD = -1;
-    unsigned attempt;
-    for (attempt = 0; attempt < 16; attempt++) {
-        _helperSequence = PVNextSharedMemoryToken();
-        int written = snprintf(name, sizeof(name), "/pv-%x-%llx",
-                               (unsigned)getpid(),
-                               (unsigned long long)_helperSequence);
-        // Stated rather than assumed. If the arithmetic above is ever wrong,
-        // this fails one render loudly instead of failing every render for the
-        // rest of the session in a way that looks like a blank document.
-        if (written < 0 || (size_t)written >= sizeof(name)) {
-            *failure = PVRenderFailureProtocol;
-            return NULL;
+    void *map = NULL;
+    uint64_t token = 0;
+    if (buffer) {
+        token = PVNextSharedMemoryToken();
+        sharedFD = buffer->fd;
+        map = buffer->map;
+    } else {
+        sharedFD = PVCreateSharedSegment(bytes, &token, &map, failure);
+        if (sharedFD < 0) return NULL;
+        if (bytes >= PV_PAGE_BUFFER_MIN_BYTES) {
+            buffer = (PVPageBuffer *)calloc(1, sizeof(PVPageBuffer));
+            if (buffer) {
+                buffer->identifier = token;
+                buffer->fd = sharedFD;
+                buffer->map = map;
+                buffer->length = bytes;
+            }
         }
-        sharedFD = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
-        if (sharedFD >= 0 || errno != EEXIST) break;
     }
-    if (sharedFD < 0) { *failure = PVRenderFailureTransientResource; return NULL; }
-    (void)fcntl(sharedFD, F_SETFD, FD_CLOEXEC);
-    if (ftruncate(sharedFD, (off_t)bytes) != 0) {
-        close(sharedFD); shm_unlink(name);
-        *failure = PVRenderFailureTransientResource;
-        return NULL;
-    }
-
-    // The name is finished with the moment the object has a size, and it is
-    // dropped here rather than after the render for exactly that reason. From
-    // this point the object is reachable only through `sharedFD` and the
-    // mappings made from it, so there is no window in which a SIGKILL to either
-    // process can strand a named segment that nothing will ever unlink. See
-    // PV_RENDER_COMMAND_CARRIES_FD.
-    //
-    // Unchecked: the name was created O_EXCL a few lines above and belongs to
-    // this process, so the only way this fails is if it never existed, and the
-    // shm_open above already proved otherwise.
-    (void)shm_unlink(name);
-
-    // PROT_READ, and no memset.
-    //
-    // Both halves of that are the same decision. The viewer used to map the
-    // segment writable and zero every byte of it before handing the name over,
-    // which did two unwanted things: it made this process touch every page of a
-    // ~28 MB mapping, so a deferred backing-store failure raised SIGBUS HERE --
-    // in the process the helper exists to keep alive -- and it doubled the
-    // memory traffic of every full-resolution render for bytes the helper
-    // overwrites in full a moment later. PVRenderPDFPageToBuffer fills the whole
-    // bitmap with white before it draws, and ftruncate guarantees the row
-    // padding it does not reach is already zero.
-    //
-    // Read-only here also states the direction of the channel: the helper
-    // writes pixels, the viewer reads them, and neither needs the other's
-    // permission.
-    //
-    // sharedFD stays open past this mapping: it is what gets sent to the
-    // helper, and with the name already gone it is now the only way to name
-    // this object at all.
-    void *map = mmap(NULL, bytes, PROT_READ, MAP_SHARED, sharedFD, 0);
-    if (map == MAP_FAILED) {
-        close(sharedFD);
-        *failure = PVRenderFailureTransientResource;
-        return NULL;
-    }
+    _helperSequence = token;
 
     PVResidentAdd(PVResidentRender, bytes);
 
@@ -1394,6 +1555,12 @@ static PVRenderFailure PVFailureForReplyStatus(int32_t status)
     CGImageRef image = NULL;
     BOOL handed = NO;
     BOOL retire = NO;
+    // One snapshot for the whole render: the profile the helper is told to draw
+    // in and the space the result is tagged with must be the same one, even if
+    // the window changes screen while the page is being drawn.
+    NSData *profile = nil;
+    CGColorSpaceRef profileSpace = NULL;
+    PVCopyRenderColorProfile(&profile, &profileSpace);
     @try {
         PVRenderCommand command;
         memset(&command, 0, sizeof(command));
@@ -1408,12 +1575,17 @@ static PVRenderFailure PVFailureForReplyStatus(int32_t status)
         command.bytesPerRow = bytesPerRow;
         command.naturalWidth = _sizes[index].width;
         command.naturalHeight = _sizes[index].height;
+        command.colorProfileLength = profileSpace ? (uint32_t)[profile length] : 0;
+        command.bufferId = buffer ? buffer->identifier : 0;
 
         // The descriptor goes with the command and is closed the instant it has
         // been sent. The helper holds its own copy from here; this process
         // keeps only the read-only mapping it already made.
-        BOOL wrote = PVSendCommandWithDescriptor(_helperIn, &command, sharedFD);
-        close(sharedFD);
+        BOOL wrote = PVSendCommandWithDescriptor(_helperIn, &command, sharedFD,
+                                                 profile);
+        // A pooled buffer keeps its descriptor: a helper started after this
+        // one has never seen the buffer and will need it sent again.
+        if (!buffer) close(sharedFD);
         sharedFD = -1;
         PVRenderReply reply;
         memset(&reply, 0, sizeof(reply));
@@ -1452,6 +1624,7 @@ static PVRenderFailure PVFailureForReplyStatus(int32_t status)
             if (bitmap) {
                 bitmap->address = map;
                 bitmap->length = bytes;
+                bitmap->buffer = buffer;
                 CGDataProviderRef provider = CGDataProviderCreateWithData(
                     bitmap, map, bytes, PVReleaseSharedBitmap);
                 if (!provider) {
@@ -1460,11 +1633,15 @@ static PVRenderFailure PVFailureForReplyStatus(int32_t status)
                     // From here the provider owns the mapping: releasing it
                     // runs PVReleaseSharedBitmap, so this frame must not.
                     handed = YES;
-                    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+                    CGColorSpaceRef colorSpace = profileSpace
+                        ? CGColorSpaceRetain(profileSpace)
+                        : CGColorSpaceCreateDeviceRGB();
                     if (colorSpace) {
                         image = CGImageCreate(width, height, 8, 32, bytesPerRow,
                             colorSpace,
-                            (CGBitmapInfo)kCGImageAlphaNoneSkipFirst |
+                            // PV_PAGE_BITMAP_INFO, spelled out because this
+                            // file does not include PVRenderCore.h.
+                            (CGBitmapInfo)kCGImageAlphaPremultipliedFirst |
                                 kCGBitmapByteOrder32Host,
                             provider, NULL, true, kCGRenderingIntentDefault);
                         CGColorSpaceRelease(colorSpace);
@@ -1487,9 +1664,17 @@ static PVRenderFailure PVFailureForReplyStatus(int32_t status)
         // No shm_unlink here any more: the name was dropped before the mapping
         // was made. Only the descriptor could still be open, and only if the
         // send never happened.
-        if (sharedFD >= 0) close(sharedFD);
+        if (sharedFD >= 0 && !buffer) close(sharedFD);
+        [profile release];
+        if (profileSpace) CGColorSpaceRelease(profileSpace);
         PVResidentSub(PVResidentRender, bytes);
-        if (!handed) munmap(map, bytes);
+        // A failed render's buffer is dropped, not pooled: the helper that was
+        // writing it has been killed, but there is nothing to gain from
+        // keeping the one buffer a misbehaving render touched last.
+        if (!handed) {
+            if (buffer) PVDestroyPageBuffer(buffer);
+            else        munmap(map, bytes);
+        }
         if (retire) [self stopRenderHelper];
     }
     return image;
