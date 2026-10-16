@@ -308,6 +308,10 @@
 - (id)initWithSource:(PVPDFSource *)source url:(NSURL *)url;
 - (void)saveState;
 - (void)goToPageNumber:(NSInteger)oneBasedPage;
+// Where a window that hasn't been shown yet starts, instead of the page it
+// was last read at: the page an open event asked for. Clamped to the
+// document; ignored once the window is up, when -goToPageNumber: is the way.
+- (void)setInitialPageNumber:(NSInteger)oneBasedPage;
 
 - (IBAction)toggleSidebar:(id)sender;
 - (IBAction)toggleTwoPageView:(id)sender;

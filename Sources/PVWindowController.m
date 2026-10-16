@@ -2561,6 +2561,19 @@ static double PVTransientBackoff(unsigned attempts)
     [self updateVisibleContent];
 }
 
+- (void)setInitialPageNumber:(NSInteger)oneBased
+{
+    NSUInteger pageCount = [_source pageCount];
+    if (_didInitialLayout || pageCount == 0 || oneBased < 1) return;
+    NSUInteger target = (NSUInteger)(oneBased - 1);
+    if (target >= pageCount) target = pageCount - 1;
+    // -showWindow: lays out at the restore position, with the express lane
+    // for its page: the asked-for page gets both, as an opened document's
+    // remembered page would.
+    _restorePage = target;
+    _restoreFraction = 0;
+}
+
 - (IBAction)goToPageDialog:(id)sender
 {
     // A sheet needs something to hang from. -window is declared nullable and
@@ -3108,6 +3121,23 @@ static void PVSizeTitleBarControl(NSSegmentedControl *c)
 - (void)windowDidExitFullScreen:(NSNotification *)note
 {
     (void)note;
+    [self showTitleBarControls];
+}
+
+// The transition into full screen can be refused after it has been announced,
+// and then -windowDidExitFullScreen: never comes: there was no full screen to
+// leave. The controls were hidden on the announcement, so without this they
+// stayed hidden for the rest of the window's life -- a title bar with no way to
+// reach the sidebar or the zoom from it -- over a window still in its ordinary
+// frame. The window never left the title bar, so this is the same restore.
+- (void)windowDidFailToEnterFullScreen:(NSWindow *)window
+{
+    (void)window;
+    [self showTitleBarControls];
+}
+
+- (void)showTitleBarControls
+{
     [_titleBarSidebar setHidden:NO];
     [_titleBarZoom    setHidden:NO];
     // The frame changed twice on the way out and the title bar's height is

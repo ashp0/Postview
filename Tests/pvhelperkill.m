@@ -38,13 +38,19 @@ static void CHECK(int cond, const char *what, const char *detail)
     if (!cond) { gFailures++; printf("  FAIL  %s : %s\n", what, detail ? detail : ""); }
 }
 
+// Matched against the whole line, not one field. `comm` is the executable's
+// full path, and in a tree whose path has a space in it -- this repository's
+// own, "Mavericks Projects" -- the path splits across fields: the field that
+// was tested never named the helper, so the probe killed nothing and then
+// reported that the viewer had recovered every time.
+//
 // The pids of every PostviewRenderHelper this process is the parent of.
 static int MyHelpers(pid_t *out, int max)
 {
     char cmd[256];
     snprintf(cmd, sizeof cmd,
              "/bin/ps -axo ppid=,pid=,comm= | "
-             "/usr/bin/awk '$1==%d && $3 ~ /PostviewRenderHelper/ {print $2}'",
+             "/usr/bin/awk '$1==%d && $0 ~ /PostviewRenderHelper/ {print $2}'",
              (int)getpid());
     FILE *p = popen(cmd, "r");
     if (!p) return 0;

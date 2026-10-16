@@ -51,13 +51,13 @@ does not quietly take the association away from Preview on its own.
 | Keep your place while you look elsewhere | **⌥⌘M** to mark it, **⌥⌘R** or the **Return** button to come back |
 | Two pages side by side | **⌘3** |
 | Two pages with a cover page | **⌘4** |
-| Show or hide thumbnails | **⌥⌘2**, or the toolbar button |
+| Show or hide thumbnails | **⌥⌘2**, or the thumbnails button in the title bar |
 | Full screen | **⌃⌘F** |
 | Open another PDF | drop it anywhere on the window, or **⌘O** |
 
 Which page you are on is in the window title, the way Preview has it, rather
-than in a text field in the toolbar. The toolbar is two buttons: thumbnails,
-and zoom.
+than in a text field in a toolbar. There is no toolbar: its two buttons,
+thumbnails and zoom, sit in the title bar beside the window's own buttons.
 
 **Marking a place** (**Go ▸ Mark Place**, **⌥⌘M**) writes down where you are
 standing so that going to look at something else is a trip rather than a
@@ -165,6 +165,14 @@ Close a document and reopen it later and it returns to the same page, the same
 position on that page, the same zoom, and the same window size. That is stored
 in `~/Library/Application Support/Postview/DocumentState.plist`, keyed by file
 path, for the 400 most recently opened documents.
+
+Another app can open a document at a particular page instead: it sends the page
+with its open event, as a positive Int32 under the key `'page'` in the event's
+`keyAEPropData` record. With `NSWorkspace` that is a record descriptor passed as
+`additionalEventParamDescriptor` (LaunchServices calls it `passThruParams`).
+Syllabus, the study planner, opens every section of the course notes this way.
+A document that isn't open yet appears at that page; one that is open already
+turns to it. An open with no page, from Finder or the Dock, is unchanged.
 
 ---
 
@@ -849,7 +857,7 @@ need a Mavericks machine to build it.
 make            # build Postview.app
 make verify     # confirm the binary is Mavericks-loadable
 make test       # headless checks of layout, cache, render queue, persistence
-make uitest     # drive a real window; toolbar, gestures, drag-and-drop, screenshots
+make uitest     # drive a real window; title-bar controls, gestures, drag-and-drop, screenshots
 make soak       # repeat the whole document lifecycle and assert nothing accumulates
 make stress     # the same objects under contention: every event, queue busy
 make power      # what all of it costs: CPU, processor wakeups, battery draw
@@ -1032,9 +1040,15 @@ takes the document title out of the title bar.
 The widths come from `-sizeToFit`, not from constants. The zoom control used to
 be pinned to 74 points for two 36-point segments, which left nothing for the
 bezel and clipped the outer edge off both magnifiers — visible in the shipped
-build on Mavericks. `make uitest` checks, on the live toolbar at 700, 900 and
-1900 pt wide, that both controls are wholly inside the window, share a height and
-a baseline, and are not clipped by the item holding them.
+build on Mavericks.
+
+Since then the toolbar itself has gone: on a screen 800 points tall a second
+band of chrome for two buttons is space the page does not get, so the two
+controls now sit in the title bar beside the window buttons (and are put away in
+full screen, where there is no title bar). `make uitest` checks, at 700, 900 and
+1900 pt wide, that both are wholly inside the title bar and clear of the window
+buttons, share a height and a baseline, are segmented controls of one height,
+and are not clipped by their own frames.
 
 Pinch-to-zoom needed both of AppKit's gesture eras. Recognising the gesture is
 `-magnifyWithEvent:`; knowing when it has *finished* is the part that differs.

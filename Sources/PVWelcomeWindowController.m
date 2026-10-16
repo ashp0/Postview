@@ -116,7 +116,65 @@
 
 @end
 
+#pragma mark - Checking the history against the disk
+
+// How many recents are offered, and how many history entries are checked to
+// find them. The second bound exists because the checking is done for entries
+// that turn out to be missing too, and a history is the system's to size.
+#define PV_RECENTS_SHOWN    12
+#define PV_RECENTS_SCANNED  64
+
+// How long the main thread waits for the check before showing the window
+// without its answer. A local disk answers a dozen stats in well under a
+// millisecond, so this is only ever reached when something is not answering.
+#define PV_RECENTS_WAIT_SECONDS  0.15
+
+// One check of the history against the disk, run off the main thread. See
+// -reloadRecents for why.
+//
+// `candidates` is filled in before the check starts and `found` is read only
+// after it has finished -- across a semaphore or a main-queue dispatch, both of
+// which order the two -- so neither needs a lock.
+@interface PVRecentScan : NSObject {
+@public
+    NSArray        *candidates;    // file URLs with a path, newest first
+    NSMutableArray *found;         // the ones that still exist, newest first
+    unsigned long   generation;
+}
+- (void)run;
+@end
+
+@implementation PVRecentScan
+
+- (void)dealloc
+{
+    [candidates release];
+    [found release];
+    [super dealloc];
+}
+
+- (void)run
+{
+    @autoreleasepool {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSUInteger i, n = [candidates count];
+        for (i = 0; i < n && [found count] < PV_RECENTS_SHOWN; i++) {
+            NSURL *u = [candidates objectAtIndex:i];
+            // A file that has been moved or deleted since is still in the
+            // history. Offering it would open a panel of apology on click; it
+            // is dropped.
+            if ([fm fileExistsAtPath:[u path]]) [found addObject:u];
+        }
+    }
+}
+
+@end
+
 #pragma mark - Controller
+
+@interface PVWelcomeWindowController ()
+- (void)applyRecentScan:(PVRecentScan *)scan;
+@end
 
 @implementation PVWelcomeWindowController
 
@@ -234,25 +292,83 @@ static PVWelcomeWindowController *sShared = nil;
 // every open through the app, the Open Recent menu, and the system's own
 // document history are the same list. Keeping a second one here would be a
 // second thing to get out of step.
+//
+// Whether each entry still exists is asked OFF the main thread, and that is the
+// one thing about this list that is not cosmetic. The history names files on
+// whatever volume they were opened from, and a stat on a network share that has
+// stopped answering does not fail, it blocks: for as long as the client takes
+// to give up on the server, and on a hard NFS mount for good. This runs at
+// launch and on every click of the Dock icon, so one recent PDF on a NAS that
+// has gone to sleep was enough to beachball Postview before it had shown a
+// window -- the very failure PVPDFSource moved the document copy into a child
+// process to rule out (see PV_HELPER_MODE_COPY), arrived at from the one other
+// place the app reads a path it did not choose.
+//
+// The main thread waits PV_RECENTS_WAIT_SECONDS for the answer, so in every
+// ordinary case the window opens with the list exactly as it always did. Past
+// that it opens without, and the list appears when the check comes back; a
+// check that never comes back costs a parked background thread, not the app.
 - (void)reloadRecents
 {
-    [_recents removeAllObjects];
     NSArray *urls = [[NSDocumentController sharedDocumentController] recentDocumentURLs];
+    NSMutableArray *candidates = [NSMutableArray array];
     NSUInteger i, n = [urls count];
-    for (i = 0; i < n && [_recents count] < 12; i++) {
+    for (i = 0; i < n && [candidates count] < PV_RECENTS_SCANNED; i++) {
         // The history is the system's, not this app's, and it can hold entries
         // this app never wrote: a URL with no path, a reference to a volume
-        // that is gone. Every one of them is checked rather than assumed.
+        // that is gone. Every one of them is checked rather than assumed --
+        // the shape here, the existence on the scan.
         NSURL *u = [urls objectAtIndex:i];
         if (![u isKindOfClass:[NSURL class]] || ![u isFileURL]) continue;
-        NSString *path = [u path];
-        if ([path length] == 0) continue;
-        // A file that has been moved or deleted since is still in the history.
-        // Offering it would open a panel of apology on click; it is dropped.
-        if (![[NSFileManager defaultManager] fileExistsAtPath:path]) continue;
-        [_recents addObject:u];
+        if ([[u path] length] == 0) continue;
+        [candidates addObject:u];
     }
 
+    PVRecentScan *scan = [[[PVRecentScan alloc] init] autorelease];
+    scan->candidates = [candidates copy];
+    scan->found      = [[NSMutableArray alloc] init];
+    scan->generation = ++_recentsGeneration;
+
+    // Nothing to ask the disk about: settled here, with no thread involved.
+    if ([candidates count] == 0) {
+        [self applyRecentScan:scan];
+        return;
+    }
+
+    // The block retains the scan and this controller, which lives for the
+    // process, so the late delivery below always has both. The semaphore is
+    // retained for the block explicitly: whether a dispatch object is an
+    // Objective-C object a block retains depends on the SDK it is built with.
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    if (!done) {
+        // Nowhere to wait with. Checked inline, which is what this always did.
+        [scan run];
+        [self applyRecentScan:scan];
+        return;
+    }
+    dispatch_retain(done);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        [scan run];
+        dispatch_semaphore_signal(done);
+        dispatch_release(done);
+        dispatch_async(dispatch_get_main_queue(), ^{ [self applyRecentScan:scan]; });
+    });
+    if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW,
+            (int64_t)(PV_RECENTS_WAIT_SECONDS * (double)NSEC_PER_SEC))) == 0)
+        [self applyRecentScan:scan];
+    dispatch_release(done);
+}
+
+// Put a finished check on screen, if it is the newest one and is not there yet.
+// Reached twice for every check that finishes inside the wait -- once from the
+// wait and once from its own delivery -- and the second is a no-op.
+- (void)applyRecentScan:(PVRecentScan *)scan
+{
+    if (scan->generation != _recentsGeneration) return;   // superseded
+    if (scan->generation == _appliedGeneration) return;   // already shown
+    _appliedGeneration = scan->generation;
+
+    [_recents setArray:scan->found];
     BOOL empty = ([_recents count] == 0);
     [_recentScroll setHidden:empty];
     [(PVWelcomeView *)_dropView setCompact:empty];

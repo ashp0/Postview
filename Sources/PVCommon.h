@@ -432,6 +432,16 @@ BOOL PVBitmapIsPixelExact(CGSize have, CGSize want);
 // floor rather than a NaN that would propagate into -scrollToPoint:.
 CGFloat PVArrowScrollForViewportHeight(CGFloat viewportHeight);
 
+// The page another app asked for when it opened a document: a positive
+// integer under 'page' in the open event's keyAEPropData record, which is
+// where LaunchServices puts the extra parameters an opener passes along.
+// Syllabus, the study planner, sends one with every section of the notes it
+// links to. 0 when the event isn't an open event, carries no page, or carries
+// something that isn't a positive integer: the document then opens where it
+// was last read, exactly as an ordinary open does. Split out of the app
+// delegate so it can be asserted against events built in a test.
+NSInteger PVRequestedPageInOpenEvent(NSAppleEventDescriptor *event);
+
 // Where an eased scroll is, `t` of the way through it. Ease-out: the document
 // leaves at speed and arrives gently, which is the shape that reads as the
 // page settling rather than as the page being dragged.

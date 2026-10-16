@@ -992,6 +992,21 @@ CGFloat PVArrowScrollForViewportHeight(CGFloat viewportHeight)
     return step;
 }
 
+NSInteger PVRequestedPageInOpenEvent(NSAppleEventDescriptor *event)
+{
+    if (event == nil) return 0;
+    if ([event eventClass] != kCoreEventClass || [event eventID] != kAEOpenDocuments) return 0;
+    NSAppleEventDescriptor *props = [event paramDescriptorForKeyword:keyAEPropData];
+    if (props == nil || [props descriptorType] != typeAERecord) return 0;
+    NSAppleEventDescriptor *page = [props descriptorForKeyword:'page'];
+    // Coerced, so a number sent as any integer type reads; text, a list or a
+    // fraction doesn't coerce, and is no page at all.
+    NSAppleEventDescriptor *n = [page coerceToDescriptorType:typeSInt32];
+    if (n == nil) return 0;
+    SInt32 v = [n int32Value];
+    return v > 0 ? (NSInteger)v : 0;
+}
+
 BOOL PVSmoothScrollForPower(PVPowerSource power)
 {
     return (power == PVPowerAC);

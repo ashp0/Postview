@@ -20,6 +20,12 @@
     // NSDocumentController owns the list, this holds what is currently on
     // screen from it.
     NSMutableArray *_recents;
+    // Which check of the history against the disk is the current one, and
+    // which was last put on screen. The check runs off the main thread (see
+    // -reloadRecents), so an older one can finish after a newer one started,
+    // and the same one can be offered twice; both are refused by these.
+    unsigned long   _recentsGeneration;
+    unsigned long   _appliedGeneration;
 }
 + (PVWelcomeWindowController *)sharedController;
 + (void)showWelcome;

@@ -126,7 +126,14 @@ PVAnnotationStats PVAnnotationStatsSnapshot(void);
  * installs this; in the application it stays NULL and nothing changes.
  *
  * Returns YES having drawn the whole page, annotations included. NO means it
- * drew nothing and the caller should fall back to CGContextDrawPDFPage.
+ * drew nothing usable and the caller should fall back to CGContextDrawPDFPage;
+ * the caller repaints the page white first, in case it drew some of it.
+ *
+ * The context's user space is the page's upright DISPLAY space -- measured from
+ * the lower-left corner of the page as it is seen, after /Rotate -- and not its
+ * content space, because that is what -[PDFPage drawWithBox:] expects: it moves
+ * the crop box to the origin and applies the rotation itself. `box` is the crop
+ * box, for reference only.
  */
 typedef BOOL (*PVAnnotationDrawHook)(size_t oneBasedPage,
                                      CGRect box,

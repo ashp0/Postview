@@ -137,7 +137,20 @@ static BOOL PVDrawPageWithAnnotations(size_t oneBasedPage,
         PV_MSGSEND(id (*)(id, SEL, void *, BOOL));
     #undef PV_MSGSEND
 
+    /* `box` is not used to place anything. The caller hands over a context in
+     * the page's upright display space, and PDFKit moves the crop box to the
+     * origin and applies /Rotate itself -- see PVRenderPDFPageToBuffer. This
+     * used to translate by -origin on top of that, which pushed every page with
+     * an offset crop box off the bitmap. */
+    (void)box;
+
     BOOL drew = NO;
+    /* What has been pushed and must be popped, however this ends. An exception
+     * out of -drawWithBox: used to unwind straight past both restores, leaving
+     * the caller's context one CTM deeper -- so the fallback draw landed in the
+     * wrong place -- and this thread's NSGraphicsContext stack one entry deeper,
+     * with a context wrapping a bitmap about to be unmapped still current. */
+    BOOL savedNS = NO, savedCG = NO;
     NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
     @try {
         /* Parsed on the first annotated page and kept; see PVAnnotationDocument.
@@ -153,30 +166,27 @@ static BOOL PVDrawPageWithAnnotations(size_t oneBasedPage,
                             (void *)context, NO);
                 if (gc) {
                     msgSend(gNSGraphicsContext, @selector(saveGraphicsState));
+                    savedNS = YES;
                     msgSendObj(gNSGraphicsContext,
                                @selector(setCurrentContext:), gc);
 
-                    /* PDFKit draws in page space with the box's origin at the
-                     * origin, exactly as CGContextDrawPDFPage does, so the
-                     * caller's transform already places it correctly and the
-                     * only thing left is the box offset. */
                     CGContextSaveGState(context);
-                    CGContextTranslateCTM(context, -box.origin.x, -box.origin.y);
+                    savedCG = YES;
                     msgSendInt(page, @selector(drawWithBox:),
                                (NSInteger)PVPDFDisplayBoxCropBox);
-                    CGContextRestoreGState(context);
-
-                    msgSend(gNSGraphicsContext, @selector(restoreGraphicsState));
                     drew = YES;
                 }
             }
         }
     } @catch (id exception) {
-        /* A malformed page is a fact about the document, and the caller's
-         * CoreGraphics render is still in the buffer. Losing the annotations is
-         * strictly better than losing the page. */
+        /* A malformed page is a fact about the document. The caller still owes
+         * the page its CoreGraphics render, and makes it on a NO: losing the
+         * annotations is strictly better than losing the page. */
         drew = NO;
     } @finally {
+        /* In the reverse of the order they were taken. */
+        if (savedCG) CGContextRestoreGState(context);
+        if (savedNS) msgSend(gNSGraphicsContext, @selector(restoreGraphicsState));
         [pool drain];
     }
     return drew;
